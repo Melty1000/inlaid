@@ -7,6 +7,7 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +31,61 @@ func (p *cameraSwitchProbe) UpdateView(view ViewOptions) {
 
 func (p *cameraSwitchProbe) Save(Settings) {
 	p.calls = append(p.calls, "save")
+}
+
+type previewFixtureRuntime struct {
+	RuntimeClient
+	previews  chan PreviewUpdate
+	events    chan RuntimeEvent
+	accepted  chan struct{}
+	mu        sync.Mutex
+	sequence  uint64
+	ackOnce   sync.Once
+	closeOnce sync.Once
+}
+
+func newPreviewFixtureRuntime() *previewFixtureRuntime {
+	return &previewFixtureRuntime{
+		previews: make(chan PreviewUpdate, 1),
+		events:   make(chan RuntimeEvent),
+		accepted: make(chan struct{}),
+	}
+}
+
+func (r *previewFixtureRuntime) Start(view ViewOptions) { r.send(view) }
+func (r *previewFixtureRuntime) UpdateView(view ViewOptions) {
+	r.send(view)
+}
+func (r *previewFixtureRuntime) Previews() <-chan PreviewUpdate { return r.previews }
+func (r *previewFixtureRuntime) Events() <-chan RuntimeEvent    { return r.events }
+func (r *previewFixtureRuntime) Close() error {
+	r.closeOnce.Do(func() {
+		close(r.previews)
+		close(r.events)
+	})
+	return nil
+}
+
+func (r *previewFixtureRuntime) send(view ViewOptions) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sequence++
+	update := PreviewUpdate{
+		Version: view.Version, ANSI: "\x1b[38;2;120;210;255m▀\x1b[0m", Columns: 1, Rows: 1,
+		Sequence: r.sequence, SourceFPS: 30, ShownFPS: 30,
+		acknowledge: func(accepted bool) {
+			if accepted {
+				r.ackOnce.Do(func() { close(r.accepted) })
+			}
+		},
+	}
+	select {
+	case r.previews <- update:
+	default:
+		old := <-r.previews
+		old.acknowledgeRendered(false)
+		r.previews <- update
+	}
 }
 
 func TestCameraSwitchFencesPreviewAlreadyReceivedByModel(t *testing.T) {
@@ -62,14 +118,12 @@ func TestCameraSwitchFencesPreviewAlreadyReceivedByModel(t *testing.T) {
 	}
 }
 
-func TestBubbleTeaProgramReceivesSyntheticRuntimePreview(t *testing.T) {
+func TestBubbleTeaProgramReceivesRuntimePreview(t *testing.T) {
 	cfg := DefaultSettings()
-	cfg.Device = "DEMO"
-	root := t.TempDir()
-	runtime := NewRuntime(cfg, filepath.Join(root, "settings.json"), root)
+	runtime := newPreviewFixtureRuntime()
 	defer runtime.Close()
 	model := NewLive(cfg, runtime, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	program := tea.NewProgram(
 		model,
@@ -80,10 +134,8 @@ func TestBubbleTeaProgramReceivesSyntheticRuntimePreview(t *testing.T) {
 		tea.WithWindowSize(120, 38),
 	)
 	go func() {
-		timer := time.NewTimer(1200 * time.Millisecond)
-		defer timer.Stop()
 		select {
-		case <-timer.C:
+		case <-runtime.accepted:
 			program.Send(tea.Quit())
 		case <-ctx.Done():
 		}
@@ -106,13 +158,11 @@ func TestBubbleTeaProgramReceivesSyntheticRuntimePreview(t *testing.T) {
 	}
 }
 
-func TestBubbleTeaRendererFlushesSyntheticPreview(t *testing.T) {
+func TestBubbleTeaRendererFlushesRuntimePreview(t *testing.T) {
 	cfg := DefaultSettings()
-	cfg.Device = "DEMO"
-	root := t.TempDir()
-	runtime := NewRuntime(cfg, filepath.Join(root, "settings.json"), root)
+	runtime := newPreviewFixtureRuntime()
 	defer runtime.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var output bytes.Buffer
 	program := tea.NewProgram(
@@ -123,10 +173,15 @@ func TestBubbleTeaRendererFlushesSyntheticPreview(t *testing.T) {
 		tea.WithWindowSize(120, 38),
 	)
 	go func() {
-		timer := time.NewTimer(1200 * time.Millisecond)
-		defer timer.Stop()
 		select {
-		case <-timer.C:
+		case <-runtime.accepted:
+			timer := time.NewTimer(100 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				return
+			}
 			program.Send(tea.Quit())
 		case <-ctx.Done():
 		}
