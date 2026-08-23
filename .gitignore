@@ -1,0 +1,18 @@
+.tools/
+bin/
+dist/
+*.exe
+*.test
+*.prof
+*.pprof
+coverage.out
+inlaid-settings.json
+# Compatibility file used by pre-Inlaid local installs.
+webcam-settings.json
+recordings/
+snapshots/
+exports/
+filters/*.[cC][uU][bB][eE]
+.references/
+.impeccable/
+*.tmp

@@ -1,0 +1,20 @@
+* text=auto
+
+.gitattributes text eol=lf
+.gitignore text eol=lf
+*.go text eol=lf
+*.md text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+
+*.exe binary
+*.zip binary
+*.png binary
+*.gif binary
+*.mp4 binary
+*.mkv binary
