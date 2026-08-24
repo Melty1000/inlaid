@@ -150,6 +150,10 @@ static NSDictionary<NSString *, NSString *> *InlaidColorProperties(int matrix) {
 @property(nonatomic, strong) dispatch_queue_t sessionQueue;
 @property(nonatomic, strong) dispatch_queue_t sampleQueue;
 @property(nonatomic, strong) dispatch_group_t callbackGroup;
+@property(nonatomic, strong) AVCaptureDeviceFormat *requiredFormat;
+@property(nonatomic) CMTime requiredMinimumFrameDuration;
+@property(nonatomic) CMTime requiredMaximumFrameDuration;
+@property(nonatomic) BOOL ownsDeviceConfigurationLock;
 @property(nonatomic) uintptr_t goHandle;
 @property(nonatomic) int configuredMatrix;
 @property(nonatomic) BOOL started;
@@ -161,6 +165,8 @@ static NSDictionary<NSString *, NSString *> *InlaidColorProperties(int matrix) {
 - (void)sendError:(NSString *)message temporary:(BOOL)temporary;
 - (void)installObservers;
 - (void)removeObservers;
+- (BOOL)matchesRequiredDeviceConfiguration;
+- (void)releaseDeviceConfigurationLock;
 
 @end
 
@@ -229,11 +235,8 @@ static NSDictionary<NSString *, NSString *> *InlaidColorProperties(int matrix) {
                                           queue:nil
                                      usingBlock:^(NSNotification *notification) {
         InlaidAVFCapture *strongSelf = weakSelf;
-        NSNumber *reason = notification.userInfo[AVCaptureSessionInterruptionReasonKey];
-        NSString *message = reason == nil
-            ? @"AVFoundation camera session was interrupted"
-            : [NSString stringWithFormat:@"AVFoundation camera session was interrupted (reason %@)", reason];
-        [strongSelf sendError:message temporary:YES];
+        (void)notification;
+        [strongSelf sendError:@"AVFoundation camera session was interrupted" temporary:YES];
     }];
     id disconnected = [center addObserverForName:AVCaptureDeviceWasDisconnectedNotification
                                            object:self.device
@@ -251,6 +254,20 @@ static NSDictionary<NSString *, NSString *> *InlaidColorProperties(int matrix) {
         [center removeObserver:token];
     }
     [self.observerTokens removeAllObjects];
+}
+
+- (BOOL)matchesRequiredDeviceConfiguration {
+    return self.device.activeFormat == self.requiredFormat &&
+        CMTimeCompare(self.device.activeVideoMinFrameDuration, self.requiredMinimumFrameDuration) == 0 &&
+        CMTimeCompare(self.device.activeVideoMaxFrameDuration, self.requiredMaximumFrameDuration) == 0;
+}
+
+- (void)releaseDeviceConfigurationLock {
+    if (!self.ownsDeviceConfigurationLock) {
+        return;
+    }
+    [self.device unlockForConfiguration];
+    self.ownsDeviceConfigurationLock = NO;
 }
 
 - (void)captureOutput:(AVCaptureOutput *)output
@@ -472,6 +489,7 @@ void *inlaid_avf_create(
         if (error_message != NULL) {
             *error_message = NULL;
         }
+        InlaidAVFCapture *capture = nil;
         @try {
             NSString *uniqueID = device_id == NULL ? @"" : [NSString stringWithUTF8String:device_id];
             AVCaptureDevice *device = InlaidExactDevice(uniqueID);
@@ -518,7 +536,7 @@ void *inlaid_avf_create(
                 }
                 return NULL;
             }
-            InlaidAVFCapture *capture = [[InlaidAVFCapture alloc] init];
+            capture = [[InlaidAVFCapture alloc] init];
             capture.goHandle = go_handle;
             capture.device = device;
             capture.input = input;
@@ -532,7 +550,6 @@ void *inlaid_avf_create(
             dispatch_sync(capture.sessionQueue, ^{
                 [capture.session beginConfiguration];
                 @try {
-                    capture.session.sessionPreset = AVCaptureSessionPresetInputPriority;
                     if (![capture.session canAddInput:input]) {
                         configurationError = InlaidCopyString(@"AVFoundation cannot add the selected camera input");
                         return;
@@ -544,20 +561,17 @@ void *inlaid_avf_create(
                         configurationError = InlaidError(@"configure AVFoundation camera", lockError);
                         return;
                     }
-                    @try {
-                        device.activeFormat = format;
-                        device.activeVideoMinFrameDuration = frameDuration;
-                        device.activeVideoMaxFrameDuration = allow_variable_frame_rate
-                            ? selectedRange.maxFrameDuration
-                            : frameDuration;
-                        CMTime expectedMaximum = allow_variable_frame_rate ? selectedRange.maxFrameDuration : frameDuration;
-                        if (device.activeFormat != format ||
-                            CMTimeCompare(device.activeVideoMinFrameDuration, frameDuration) != 0 ||
-                            CMTimeCompare(device.activeVideoMaxFrameDuration, expectedMaximum) != 0) {
-                            configurationError = InlaidCopyString(@"AVFoundation did not accept the selected camera format and frame cadence");
-                        }
-                    } @finally {
-                        [device unlockForConfiguration];
+                    capture.ownsDeviceConfigurationLock = YES;
+                    capture.requiredFormat = format;
+                    capture.requiredMinimumFrameDuration = frameDuration;
+                    capture.requiredMaximumFrameDuration = allow_variable_frame_rate
+                        ? selectedRange.maxFrameDuration
+                        : frameDuration;
+                    device.activeFormat = capture.requiredFormat;
+                    device.activeVideoMinFrameDuration = capture.requiredMinimumFrameDuration;
+                    device.activeVideoMaxFrameDuration = capture.requiredMaximumFrameDuration;
+                    if (![capture matchesRequiredDeviceConfiguration]) {
+                        configurationError = InlaidCopyString(@"AVFoundation did not accept the selected camera format and frame cadence");
                     }
                     if (configurationError != NULL) {
                         return;
@@ -586,6 +600,9 @@ void *inlaid_avf_create(
                     configurationError = InlaidException(@"configure AVFoundation capture session", exception);
                 } @finally {
                     [capture.session commitConfiguration];
+                    if (configurationError != NULL) {
+                        [capture releaseDeviceConfigurationLock];
+                    }
                 }
             });
             if (configurationError != NULL) {
@@ -599,6 +616,8 @@ void *inlaid_avf_create(
             }
             return (__bridge_retained void *)capture;
         } @catch (NSException *exception) {
+            [capture.output setSampleBufferDelegate:nil queue:NULL];
+            [capture releaseDeviceConfigurationLock];
             if (error_message != NULL) {
                 *error_message = InlaidException(@"create AVFoundation capture session", exception);
             }
@@ -620,10 +639,18 @@ char *inlaid_avf_start(void *capture_pointer) {
                 [capture acceptCallbacks];
                 [capture.session startRunning];
                 capture.started = capture.session.isRunning;
-                if (!capture.started) {
+                if (capture.started && ![capture matchesRequiredDeviceConfiguration]) {
+                    [capture rejectCallbacks];
+                    [capture.session stopRunning];
+                    [capture removeObservers];
+                    capture.started = NO;
+                    startError = InlaidCopyString(@"AVFoundation changed the selected camera format or frame cadence while starting");
+                } else if (!capture.started) {
                     [capture rejectCallbacks];
                     [capture removeObservers];
-                    startError = InlaidCopyString(@"AVFoundation capture session did not start");
+                    if (startError == NULL) {
+                        startError = InlaidCopyString(@"AVFoundation capture session did not start");
+                    }
                 }
             } @catch (NSException *exception) {
                 [capture rejectCallbacks];
@@ -651,8 +678,12 @@ int inlaid_avf_close(void *capture_pointer, int64_t timeout_milliseconds, char *
         __block BOOL callbacksDrained = NO;
         dispatch_async(capture.sessionQueue, ^{
             [capture.output setSampleBufferDelegate:nil queue:NULL];
-            if (capture.session.isRunning) {
-                [capture.session stopRunning];
+            @try {
+                if (capture.session.isRunning) {
+                    [capture.session stopRunning];
+                }
+            } @finally {
+                [capture releaseDeviceConfigurationLock];
             }
             dispatch_sync(capture.sampleQueue, ^{});
             [capture removeObservers];

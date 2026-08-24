@@ -98,8 +98,13 @@ func TestSettingsPathsReadLegacyButSaveAsInlaid(t *testing.T) {
 }
 
 func TestPackagedExecutableKeepsDataBesideItsInstall(t *testing.T) {
-	roots := settingsRoots(`C:\Users\Alice`, `E:\Apps\Inlaid\bin\inlaid.exe`)
-	want := []string{`E:\Apps\Inlaid`, `C:\Users\Alice`}
+	testRoot := t.TempDir()
+	installRoot := filepath.Join(testRoot, "Apps", "Inlaid")
+	cwd := filepath.Join(testRoot, "Users", "Alice")
+	executable := filepath.Join(installRoot, "bin", "inlaid")
+
+	roots := settingsRoots(cwd, executable)
+	want := []string{installRoot, cwd}
 	if !reflect.DeepEqual(roots, want) {
 		t.Fatalf("settingsRoots() = %#v, want %#v", roots, want)
 	}
