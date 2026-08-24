@@ -35,9 +35,12 @@ go test .\internal\capture .\internal\cellreduce
 $env:INLAID_LIVE_TEST = '1'
 $env:INLAID_TEST_DEVICE = 'Camera name shown by Inlaid'
 go test -v .\internal\dashboard -run 'TestRuntimeLiveCameraRecordAndSnapshot|TestBubbleTeaProgramReceivesLiveCameraPreview'
+
+$env:INLAID_LIVE_SOAK = '1'
+go test -timeout 15m -v .\internal\dashboard -run '^TestRuntimeLiveCameraRecordAndSnapshot$'
 ```
 
-Some Media Foundation lighting checks are specific to the Logitech C922. The optional three-minute capture soak also requires `INLAID_MF_CAPTURE_SOAK=1`; it is not part of routine development. Setting `INLAID_LIVE_SOAK=1` with `INLAID_LIVE_TEST=1` extends the dashboard recording check to ten minutes, measures retained heap and queue pressure, and decodes the resulting MP4, GIF, and PNG.
+Some Media Foundation lighting checks are specific to the Logitech C922. The optional three-minute capture soak also requires `INLAID_MF_CAPTURE_SOAK=1`; it is not part of routine development. The dashboard soak records for ten minutes, measures retained heap and queue pressure, and decodes the resulting MP4, GIF, and PNG. Its test timeout must exceed the recording duration; the documented command allows 15 minutes.
 
 Run the application through `START-INLAID.cmd` or start it from the terminal being tested. Record the launch method. Current source redirects a plain Explorer double-click of the raw Windows executable into Windows Terminal; manually running Inlaid inside legacy Console Host is not an accepted terminal test.
 

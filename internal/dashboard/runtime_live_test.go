@@ -136,6 +136,10 @@ func TestRuntimeLiveCameraRecordAndSnapshot(t *testing.T) {
 	if os.Getenv("INLAID_LIVE_TEST") != "1" {
 		t.Skip("set INLAID_LIVE_TEST=1 to exercise a connected camera")
 	}
+	soak := os.Getenv("INLAID_LIVE_SOAK") == "1"
+	if deadline, ok := t.Deadline(); soak && ok && time.Until(deadline) < 13*time.Minute {
+		t.Fatal("the ten-minute live soak needs go test -timeout 15m")
+	}
 	cfg := DefaultSettings()
 	cfg.Device = liveTestDevice(t)
 	root := t.TempDir()
@@ -185,7 +189,7 @@ func TestRuntimeLiveCameraRecordAndSnapshot(t *testing.T) {
 	waitForRuntimeEvent(t, runtime, 10*time.Second, RuntimeRecordingStarted)
 	recordingDuration := 2500 * time.Millisecond
 	exportTimeout := 20 * time.Second
-	if os.Getenv("INLAID_LIVE_SOAK") == "1" {
+	if soak {
 		recordingDuration = 10 * time.Minute
 		exportTimeout = 2 * time.Minute
 	}
