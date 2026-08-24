@@ -1,0 +1,139 @@
+name: Bug report
+description: Report a repeatable failure or regression in Inlaid
+title: "[Bug]: "
+labels:
+  - needs triage
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a public issue. Do not attach private camera output, recordings, credentials, device IDs, serial numbers, environment dumps, or files containing personal paths. Security vulnerabilities belong in a private security advisory.
+  - type: input
+    id: build
+    attributes:
+      label: Inlaid version or commit
+      description: Give the release tag or exact commit. If the build is modified, say so.
+      placeholder: v0.1.0-beta.1 or 5505639
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: How did you get Inlaid?
+      options:
+        - GitHub release ZIP
+        - Built from source
+        - Another distribution
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: Include the Windows or macOS version, or Linux distribution and version.
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+  - type: dropdown
+    id: architecture
+    attributes:
+      label: Architecture
+      options:
+        - x86_64 / amd64
+        - arm64 / aarch64
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal and version
+      placeholder: Windows Terminal 1.24
+    validations:
+      required: true
+  - type: input
+    id: shell
+    attributes:
+      label: Shell and version
+      description: If no shell started the executable, write "none".
+      placeholder: PowerShell 7.6.5
+    validations:
+      required: true
+  - type: dropdown
+    id: launch
+    attributes:
+      label: Launch method
+      options:
+        - START-INLAID.cmd
+        - Started inside an existing terminal
+        - Double-clicked the raw executable in a file manager
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: camera
+    attributes:
+      label: Camera
+      description: Give the public model name, or write "not camera-related". Do not include a serial number or stable device ID.
+      placeholder: Logitech C922
+    validations:
+      required: true
+  - type: input
+    id: camera_mode
+    attributes:
+      label: Camera mode
+      description: Give the actual size, FPS, and format shown by Inlaid, or write "unavailable".
+      placeholder: 1920x1080, 29.97 FPS, MJPEG
+    validations:
+      required: true
+  - type: input
+    id: grid
+    attributes:
+      label: Terminal grid and observed FPS
+      placeholder: 177x50 cells; source 29.97; shown 29.5
+    validations:
+      required: true
+  - type: textarea
+    id: recording
+    attributes:
+      label: Recording result
+      description: Include format and duration, or write "not tested".
+      placeholder: A 30-second MP4 saved; GIF was not tested.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start Inlaid...
+        2. Choose...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Actual result
+      description: Include exact visible error text. Remove personal paths and identifiers.
+    validations:
+      required: true
+  - type: textarea
+    id: support_report
+    attributes:
+      label: Optional local support report
+      description: Review the JSON before dragging it here. Attaching it makes it public immediately; Inlaid never uploads it for you.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Public-data check
+      options:
+        - label: I reviewed this issue and its attachments for private camera media, personal paths, identifiers, and credentials.
+          required: true

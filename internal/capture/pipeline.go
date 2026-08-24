@@ -1,4 +1,4 @@
-package mfcapture
+package capture
 
 import (
 	"context"
@@ -23,7 +23,7 @@ func IsTemporary(err error) bool {
 	return errors.As(err, &transient) && transient.Temporary()
 }
 
-// Session owns a packet source, decoder, and bounded latest-frame queue.
+// Session owns a native camera and its bounded latest-frame queue.
 type Session struct {
 	Frames <-chan *Frame
 	Errors <-chan error
@@ -35,9 +35,56 @@ type Session struct {
 	decoder      Decoder
 	cancel       context.CancelFunc
 	done         chan struct{}
-	closeOnce    sync.Once
+	closeTimeout time.Duration
+	cancelOnce   sync.Once
+	drainOnce    sync.Once
+	closeMu      sync.RWMutex
 	closeErr     error
 	stats        counters
+}
+
+type directRunner func(context.Context, *Session) error
+
+func startDirect(parent context.Context, cfg Config, mode Mode, run directRunner) (*Session, error) {
+	normalized, err := normalize(cfg, true)
+	if err != nil {
+		return nil, err
+	}
+	if !validCaptureMode(mode) {
+		return nil, errors.New("selected camera mode is invalid")
+	}
+	if run == nil {
+		return nil, errors.New("native camera runner is required")
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	frames := make(chan *Frame, normalized.QueueDepth)
+	errorsCh := make(chan error, 4)
+	session := &Session{
+		Frames: frames, Errors: errorsCh,
+		selectedMode: mode,
+		frames:       frames,
+		errors:       errorsCh,
+		cancel:       cancel,
+		done:         make(chan struct{}),
+		closeTimeout: normalized.CloseTimeout,
+	}
+	go session.runDirect(ctx, run)
+	return session, nil
+}
+
+func (s *Session) runDirect(ctx context.Context, run directRunner) {
+	defer close(s.done)
+	defer close(s.frames)
+	defer close(s.errors)
+	defer s.cancel()
+	err := run(ctx, s)
+	s.addCloseErr(err)
+	if err != nil && ctx.Err() == nil {
+		s.report(err)
+	}
 }
 
 // StartPipeline starts the source/decoder seam used by Open and deterministic
@@ -54,6 +101,9 @@ func StartPipeline(parent context.Context, cfg Config, source Source, decoder De
 	if decoder == nil {
 		return nil, errors.New("planar decoder is required")
 	}
+	if parent == nil {
+		parent = context.Background()
+	}
 	ctx, cancel := context.WithCancel(parent)
 	frames := make(chan *Frame, normalized.QueueDepth)
 	errorsCh := make(chan error, 4)
@@ -67,6 +117,7 @@ func StartPipeline(parent context.Context, cfg Config, source Source, decoder De
 		decoder:      decoder,
 		cancel:       cancel,
 		done:         make(chan struct{}),
+		closeTimeout: normalized.CloseTimeout,
 	}
 	go session.run(ctx, normalized)
 	return session, nil
@@ -77,16 +128,16 @@ func (s *Session) run(ctx context.Context, cfg Config) {
 	defer close(s.frames)
 	defer close(s.errors)
 	defer func() {
-		if err := s.decoder.Close(); err != nil {
-			s.report(fmt.Errorf("close decoder: %w", err))
-		}
-		if err := s.source.Close(); err != nil {
-			s.report(fmt.Errorf("close source: %w", err))
-		}
+		s.cancel()
+		s.closeComponents(cfg.CloseTimeout)
 	}()
 
-	packets := s.source.Packets()
+	packetStream := s.source.Packets()
+	packets := packetStream
 	sourceErrors := s.source.Errors()
+	decodeRequests := make(chan Packet)
+	decodeResults := make(chan decodeResult)
+	go runDecoder(ctx, s.decoder, decodeRequests, decodeResults)
 	watchdog := time.NewTimer(frameWatchdogTimeout(cfg.FPS, true))
 	defer watchdog.Stop()
 	consecutiveDecodeErrors := 0
@@ -122,11 +173,22 @@ func (s *Session) run(ctx context.Context, cfg Config) {
 				s.report(temporaryCaptureError{err: fmt.Errorf("native MJPEG packet length %d is outside 1..%d", len(packet.Data), cfg.MaxPacketBytes)})
 				continue
 			}
-			frame, err := s.decoder.Decode(ctx, packet)
-			// Decoder.Decode is synchronous with respect to Packet.Data. Native
-			// byte storage can be reused as soon as it returns, independently of
-			// the longer-lived planar Frame lease.
-			packet.Release()
+			select {
+			case decodeRequests <- packet:
+				packets = nil
+			case <-ctx.Done():
+				packet.Release()
+				return
+			}
+		case result := <-decodeResults:
+			packets = packetStream
+			frame, err := result.frame, result.err
+			if ctx.Err() != nil {
+				if frame != nil {
+					frame.Release()
+				}
+				return
+			}
 			if err != nil {
 				if ctx.Err() != nil {
 					return
@@ -158,6 +220,90 @@ func (s *Session) run(ctx context.Context, cfg Config) {
 			s.publishLatest(frame)
 		}
 	}
+}
+
+type decodeResult struct {
+	frame *Frame
+	err   error
+}
+
+func runDecoder(ctx context.Context, decoder Decoder, requests <-chan Packet, results chan<- decodeResult) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case packet := <-requests:
+			if ctx.Err() != nil {
+				packet.Release()
+				return
+			}
+			frame, err := decoder.Decode(ctx, packet)
+			packet.Release()
+			if ctx.Err() != nil {
+				if frame != nil {
+					frame.Release()
+				}
+				return
+			}
+			select {
+			case results <- decodeResult{frame: frame, err: err}:
+			case <-ctx.Done():
+				if frame != nil {
+					frame.Release()
+				}
+				return
+			}
+		}
+	}
+}
+
+type closeResult struct {
+	name string
+	err  error
+}
+
+func (s *Session) closeComponents(timeout time.Duration) {
+	results := make(chan closeResult, 2)
+	go func() { results <- closeResult{name: "decoder", err: s.decoder.Close()} }()
+	go func() { results <- closeResult{name: "source", err: s.source.Close()} }()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var closeErr error
+	for remaining := 2; remaining > 0; {
+		select {
+		case result := <-results:
+			remaining--
+			closeErr = joinCloseResult(closeErr, result)
+		case <-timer.C:
+			closeErr = resolveCloseDeadline(results, remaining, closeErr, timeout)
+			remaining = 0
+		}
+	}
+	s.addCloseErr(closeErr)
+	if closeErr != nil {
+		s.report(closeErr)
+	}
+}
+
+func resolveCloseDeadline(results <-chan closeResult, remaining int, closeErr error, timeout time.Duration) error {
+	for remaining > 0 {
+		select {
+		case result := <-results:
+			remaining--
+			closeErr = joinCloseResult(closeErr, result)
+		default:
+			return errors.Join(closeErr, fmt.Errorf("%w: camera shutdown exceeded %s", ErrShutdownUncertain, timeout))
+		}
+	}
+	return closeErr
+}
+
+func joinCloseResult(closeErr error, result closeResult) error {
+	if result.err == nil {
+		return closeErr
+	}
+	return errors.Join(closeErr, fmt.Errorf("close %s: %w", result.name, result.err))
 }
 
 // frameWatchdogTimeout is deliberately based on decoded frames, below every
@@ -206,7 +352,21 @@ func (s *Session) publishLatest(next *Frame) {
 	}
 }
 
+func (s *Session) acceptFrame(frame *Frame) {
+	if frame == nil {
+		return
+	}
+	sequence := s.stats.decoded.Add(1)
+	if frame.Sequence == 0 {
+		frame.Sequence = sequence
+	}
+	s.publishLatest(frame)
+}
+
 func (s *Session) report(err error) {
+	if IsTemporary(err) {
+		s.stats.temporaryErrors.Add(1)
+	}
 	publishBoundedError(s.errors, err)
 }
 
@@ -247,8 +407,7 @@ func (s *Session) Stats() Stats {
 	return stats
 }
 
-// Mode returns the native MJPEG geometry and exact rational frame rate chosen
-// for this session.
+// Mode returns the native geometry, format, and exact rational frame rate.
 func (s *Session) Mode() Mode {
 	if s == nil {
 		return Mode{}
@@ -256,22 +415,61 @@ func (s *Session) Mode() Mode {
 	return s.selectedMode
 }
 
-// Close cancels capture, flushes the native asynchronous reader through Source,
-// waits for ownership shutdown, and releases any still-queued pooled frames.
+// Close cancels capture and waits through the configured shutdown deadline.
+// Queued frames are released only after native ownership has ended.
 func (s *Session) Close() error {
 	if s == nil {
 		return nil
 	}
-	s.closeOnce.Do(func() {
+	s.cancelOnce.Do(func() {
 		s.cancel()
-		if err := s.source.Close(); err != nil {
-			s.closeErr = err
-		}
-		<-s.done
+		go s.drainAfterShutdown()
+	})
+	wait := sessionCloseWait(s.closeTimeout)
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-s.done:
+		s.drainFrames()
+	case <-timer.C:
+		s.addCloseErr(fmt.Errorf("%w: camera shutdown did not finish within %s", ErrShutdownUncertain, wait))
+	}
+	return s.getCloseErr()
+}
+
+func (s *Session) drainAfterShutdown() {
+	<-s.done
+	s.drainFrames()
+}
+
+func (s *Session) drainFrames() {
+	s.drainOnce.Do(func() {
 		for frame := range s.frames {
 			frame.Release()
 		}
 	})
+}
+
+func sessionCloseWait(componentTimeout time.Duration) time.Duration {
+	grace := max(componentTimeout/4, 100*time.Millisecond)
+	return componentTimeout + grace
+}
+
+func (s *Session) addCloseErr(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.closeMu.Lock()
+	s.closeErr = errors.Join(s.closeErr, err)
+	s.closeMu.Unlock()
+}
+
+func (s *Session) getCloseErr() error {
+	if s == nil {
+		return nil
+	}
+	s.closeMu.RLock()
+	defer s.closeMu.RUnlock()
 	return s.closeErr
 }
 

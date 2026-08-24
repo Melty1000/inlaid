@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -93,5 +94,30 @@ func TestSettingsPathsReadLegacyButSaveAsInlaid(t *testing.T) {
 	}
 	if save, load := settingsPathsForRoots([]string{root}); save != current || load != current {
 		t.Fatalf("current paths = save %q, load %q; want %q", save, load, current)
+	}
+}
+
+func TestPackagedExecutableKeepsDataBesideItsInstall(t *testing.T) {
+	testRoot := t.TempDir()
+	installRoot := filepath.Join(testRoot, "Apps", "Inlaid")
+	cwd := filepath.Join(testRoot, "Users", "Alice")
+	executable := filepath.Join(installRoot, "bin", "inlaid")
+
+	roots := settingsRoots(cwd, executable)
+	want := []string{installRoot, cwd}
+	if !reflect.DeepEqual(roots, want) {
+		t.Fatalf("settingsRoots() = %#v, want %#v", roots, want)
+	}
+}
+
+func TestPathEqualityFollowsHostCaseRules(t *testing.T) {
+	if !pathEqual("windows", `C:\Inlaid`, `c:\inlaid`) {
+		t.Fatal("Windows paths with case-only differences were treated as distinct")
+	}
+	if pathEqual("linux", "/opt/Inlaid", "/opt/inlaid") {
+		t.Fatal("Linux paths with case-only differences were treated as equal")
+	}
+	if pathEqual("darwin", "/Applications/Inlaid", "/Applications/inlaid") {
+		t.Fatal("macOS path comparison must preserve the mounted filesystem's spelling")
 	}
 }

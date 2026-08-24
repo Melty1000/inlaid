@@ -14,7 +14,6 @@ import (
 // PreviewSource produces the deterministic demo shown when no live runtime is
 // attached. Real camera frames arrive through Runtime previews.
 type PreviewSource interface {
-	Label() string
 	Frame(columns, rows int, sequence uint64, symbolName, quality string, fill, mirror bool) string
 }
 
@@ -26,8 +25,6 @@ type demoPreview struct {
 func newDemoPreview() PreviewSource {
 	return &demoPreview{}
 }
-
-func (d *demoPreview) Label() string { return "DEMO PREVIEW" }
 
 func (d *demoPreview) Frame(columns, rows int, sequence uint64, symbolName, quality string, fill, mirror bool) string {
 	columns = max(columns, 1)

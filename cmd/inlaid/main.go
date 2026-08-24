@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/Melty1000/inlaid/internal/dashboard"
+	"github.com/Melty1000/inlaid/internal/startup"
+	"github.com/Melty1000/inlaid/internal/supportreport"
 	"github.com/charmbracelet/colorprofile"
 )
 
@@ -19,6 +23,15 @@ import (
 var version = "dev"
 
 func main() {
+	relaunched, err := startup.RelaunchFromExplorer()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Inlaid:", err)
+		os.Exit(1)
+	}
+	if relaunched {
+		return
+	}
+
 	renderPreview := flag.String("render-preview", "", "render one deterministic page at WIDTHxHEIGHT")
 	settingsPath := flag.String("settings", "", "path to inlaid-settings.json")
 	showVersion := flag.Bool("version", false, "print the Inlaid version")
@@ -54,20 +67,36 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Inlaid:", err)
 		os.Exit(1)
 	}
-	runtime := dashboard.NewRuntime(settings, absoluteSettings, filepath.Dir(absoluteSettings))
-	model := dashboard.NewLive(settings, runtime, settingsErr)
+	appRuntime := dashboard.NewRuntimeWithBuild(settings, absoluteSettings, filepath.Dir(absoluteSettings), currentBuildFacts())
+	model := dashboard.NewLive(settings, appRuntime, settingsErr)
 	_, runErr := tea.NewProgram(model, uiProgramOptions()...).Run()
-	closeErr := runtime.Close()
+	closeErr := appRuntime.Close()
 	if err := errors.Join(runErr, closeErr); err != nil {
 		fmt.Fprintln(os.Stderr, "Inlaid:", err)
 		os.Exit(1)
 	}
 }
 
+func currentBuildFacts() supportreport.BuildFacts {
+	facts := supportreport.BuildFacts{Version: version}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return facts
+	}
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			facts.Revision = setting.Value
+		case "vcs.modified":
+			facts.Modified = setting.Value == "true"
+		}
+	}
+	return facts
+}
+
 func uiProgramOptions() []tea.ProgramOption {
-	// Inlaid runs inside Windows Terminal, which supports 24-bit color.
-	// Force the renderer profile so an unrelated parent-shell NO_COLOR or
-	// TERM=dumb setting cannot discard the RGB pairs in every camera cell.
+	// The camera image requires 24-bit foreground and background colors. Keep an
+	// unrelated parent-shell opt-out from discarding every RGB cell pair.
 	return []tea.ProgramOption{
 		tea.WithFPS(60),
 		tea.WithColorProfile(colorprofile.TrueColor),
@@ -91,18 +120,24 @@ func parseSize(value string) (int, int, error) {
 }
 
 func defaultSettingsPaths() (savePath, loadPath string) {
+	cwd, _ := os.Getwd()
+	executable, _ := os.Executable()
+	return settingsPathsForRoots(settingsRoots(cwd, executable))
+}
+
+func settingsRoots(cwd, executable string) []string {
 	roots := make([]string, 0, 2)
-	if cwd, err := os.Getwd(); err == nil {
+	executableDirectory := filepath.Dir(strings.TrimSpace(executable))
+	if strings.EqualFold(filepath.Base(executableDirectory), "bin") {
+		roots = append(roots, filepath.Dir(executableDirectory))
+	}
+	if cwd = strings.TrimSpace(cwd); cwd != "" && (len(roots) == 0 || !pathEqual(runtime.GOOS, roots[0], cwd)) {
 		roots = append(roots, cwd)
 	}
-	if executable, err := os.Executable(); err == nil {
-		root := filepath.Dir(filepath.Dir(executable))
-		if len(roots) == 0 || !strings.EqualFold(roots[0], root) {
-			roots = append(roots, root)
-		}
+	if len(roots) == 0 && executableDirectory != "." {
+		roots = append(roots, executableDirectory)
 	}
-
-	return settingsPathsForRoots(roots)
+	return roots
 }
 
 func settingsPathsForRoots(roots []string) (savePath, loadPath string) {
@@ -134,7 +169,7 @@ func compatibleSettingsLoadPath(savePath string) string {
 	if info, err := os.Stat(savePath); err == nil && !info.IsDir() {
 		return savePath
 	}
-	if !strings.EqualFold(filepath.Base(savePath), "inlaid-settings.json") {
+	if !pathEqual(runtime.GOOS, filepath.Base(savePath), "inlaid-settings.json") {
 		return savePath
 	}
 	legacy := filepath.Join(filepath.Dir(savePath), "webcam-settings.json")
@@ -142,4 +177,11 @@ func compatibleSettingsLoadPath(savePath string) string {
 		return legacy
 	}
 	return savePath
+}
+
+func pathEqual(goos, left, right string) bool {
+	if goos == "windows" {
+		return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
+	}
+	return filepath.Clean(left) == filepath.Clean(right)
 }

@@ -1,7 +1,6 @@
 [CmdletBinding()]
 param(
-    [switch]$Rebuild,
-    [switch]$TerminalHost
+    [switch]$Rebuild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,7 +11,6 @@ $SettingsPath = Join-Path $ProjectRoot 'inlaid-settings.json'
 $SetupScript = Join-Path $ProjectRoot 'scripts\setup.ps1'
 $MediaInstaller = Join-Path $ProjectRoot 'scripts\install-ffmpeg.ps1'
 $WindowTitle = 'Inlaid'
-$RelaunchMarker = 'INLAID_TERMINAL_RELAUNCHED'
 
 function ConvertTo-WindowsProcessArgument {
     param([AllowEmptyString()][string]$Argument)
@@ -72,27 +70,13 @@ function New-SafeProcessStartInfo {
     return $startInfo
 }
 
-function Test-ModernTerminalHost {
-    return (
-        $PSVersionTable.PSEdition -eq 'Core' -and
-        $PSVersionTable.PSVersion.Major -ge 7 -and
-        -not [string]::IsNullOrWhiteSpace($env:WT_SESSION)
-    )
+function Test-WindowsTerminalHost {
+    return -not [string]::IsNullOrWhiteSpace($env:WT_SESSION)
 }
 
-function Start-ModernTerminalHost {
-    if (Test-ModernTerminalHost) {
+function Start-WindowsTerminalHost {
+    if (Test-WindowsTerminalHost) {
         return $false
-    }
-
-    if ($TerminalHost -or [Environment]::GetEnvironmentVariable($RelaunchMarker) -eq '1') {
-        throw 'Windows Terminal opened, but Inlaid did not receive a PowerShell 7 terminal session.'
-    }
-
-    $pwsh = Get-Command -Name 'pwsh.exe' -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($null -eq $pwsh) {
-        throw 'PowerShell 7 (pwsh.exe) was not found. Install PowerShell 7, then double-click START-INLAID.cmd again.'
     }
 
     $terminal = Get-Command -Name 'wt.exe' -CommandType Application -ErrorAction SilentlyContinue |
@@ -101,26 +85,17 @@ function Start-ModernTerminalHost {
         throw 'Windows Terminal (wt.exe) was not found. Install Windows Terminal, then double-click START-INLAID.cmd again.'
     }
 
-    # `--` ends Windows Terminal option parsing. Everything after it is passed
-    # to PowerShell as a program plus arguments, including paths with spaces.
     $terminalArguments = @(
         '-w', 'new',
         'new-tab',
         '-d', $ProjectRoot,
         '--',
-        $pwsh.Source,
-        '-NoLogo',
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', $PSCommandPath,
-        '-TerminalHost'
+        $Executable,
+        '--settings', $SettingsPath
     )
-    if ($Rebuild) {
-        $terminalArguments += '-Rebuild'
-    }
 
     $startInfo = New-SafeProcessStartInfo -FilePath $terminal.Source -Arguments $terminalArguments
-    $startInfo.EnvironmentVariables[$RelaunchMarker] = '1'
+    $startInfo.EnvironmentVariables['INLAID_LAUNCHER'] = $(if (Test-Path -LiteralPath $SourcePackage -PathType Container) { 'source' } else { 'package' })
 
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
@@ -204,10 +179,6 @@ function Test-FFmpegAvailable {
 }
 
 try {
-    if (Start-ModernTerminalHost) {
-        exit 0
-    }
-
     try {
         $Host.UI.RawUI.WindowTitle = $WindowTitle
     }
@@ -239,14 +210,22 @@ try {
         }
     }
 
+    if (Start-WindowsTerminalHost) {
+        exit 0
+    }
+
     Push-Location -LiteralPath $ProjectRoot
     try {
         & $Executable '--settings' $SettingsPath
-        exit $LASTEXITCODE
+        $appExitCode = $LASTEXITCODE
     }
     finally {
         Pop-Location
     }
+    if ($appExitCode -ne 0) {
+        throw "Inlaid stopped unexpectedly with exit code $appExitCode."
+    }
+    exit 0
 }
 catch {
     Write-Host ''

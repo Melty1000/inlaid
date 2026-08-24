@@ -1,4 +1,5 @@
-// Package render adapts Charmbracelet Mosaic for repeated video frames.
+// Package render adapts Charmbracelet Mosaic for the deterministic dashboard
+// demo. Live camera frames use the canonical cellframe/cellrender path.
 package render
 
 import (
@@ -19,11 +20,9 @@ type Config struct {
 	Dither    bool
 }
 
-// Mosaic wraps a configured upstream Mosaic renderer.
+// Mosaic wraps a configured upstream Mosaic demo renderer.
 type Mosaic struct {
-	Columns int
-	Rows    int
-	inner   mosaic.Mosaic
+	inner mosaic.Mosaic
 }
 
 // New constructs a renderer for an exact terminal-cell rectangle.
@@ -41,11 +40,7 @@ func New(cfg Config) (*Mosaic, error) {
 		Symbol(cfg.Symbols).
 		Threshold(cfg.Threshold).
 		Dither(cfg.Dither)
-	return &Mosaic{
-		Columns: cfg.Columns,
-		Rows:    cfg.Rows,
-		inner:   inner,
-	}, nil
+	return &Mosaic{inner: inner}, nil
 }
 
 // Render turns an image into one ANSI truecolor frame without a trailing newline.

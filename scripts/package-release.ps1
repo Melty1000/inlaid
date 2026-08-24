@@ -40,8 +40,13 @@ $packageFiles = @(
     'SECURITY.md',
     'THIRD_PARTY_NOTICES.md',
     'docs\CELL_PIPELINE.md',
+    'docs\COMPATIBILITY.md',
     'docs\DESIGN.md',
     'docs\FILTERS.md',
+    'docs\PHASE_1.md',
+    'docs\PHASE_2.md',
+    'docs\ROADMAP.md',
+    'docs\TESTING.md',
     'filters\README.md',
     'scripts\install-ffmpeg.ps1'
 )

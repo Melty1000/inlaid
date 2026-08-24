@@ -3,9 +3,11 @@
 package taperecovery
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/Melty1000/inlaid/internal/celltape"
@@ -18,8 +20,8 @@ const (
 )
 
 var (
-	// ErrBusy means a tape cannot be claimed because another live handle has
-	// incompatible sharing. Scan silently omits busy staging tapes.
+	// ErrBusy means another live process owns the tape through the platform
+	// claim mechanism. Scan silently omits busy staging tapes.
 	ErrBusy = errors.New("taperecovery: tape is busy")
 	// ErrLimit means a configured resource bound was exceeded.
 	ErrLimit = errors.New("taperecovery: resource limit exceeded")
@@ -33,6 +35,9 @@ var (
 	ErrDamagedTail = errors.New("taperecovery: tape has a damaged tail")
 	// ErrConfig means the first frame's configuration envelope is malformed.
 	ErrConfig = errors.New("taperecovery: invalid versioned config")
+	// ErrIdentityChanged means a claimed path no longer names the file object
+	// whose operating-system identity was captured when the claim was acquired.
+	ErrIdentityChanged = errors.New("taperecovery: claimed tape identity changed")
 )
 
 // Options bounds all input selected by the recovery directory. Zero values
@@ -107,12 +112,97 @@ type VersionedConfig struct {
 	Raw     json.RawMessage
 }
 
-// Tape is durable claimed metadata sufficient to present a recovery choice and
-// pass Path to the offline CellTape exporter. RecoveredFrom is set only when a
-// staging tape was atomically renamed. RepairedBytes is the discarded damaged
-// suffix; no file is ever deleted by this package.
+// Reservation owns one live staging object before its writer closes. Copies
+// share one release/transfer slot, so only one caller can publish or release
+// the reservation.
+type Reservation struct {
+	Path string
+	slot *reservationSlot
+}
+
+type reservationSlot struct {
+	mu    sync.Mutex
+	claim *claimLease
+}
+
+func (r *Reservation) take() (*claimLease, error) {
+	if r == nil || r.slot == nil {
+		return nil, fmt.Errorf("%w: staging tape is not reserved", ErrIdentityChanged)
+	}
+	r.slot.mu.Lock()
+	defer r.slot.mu.Unlock()
+	if r.slot.claim == nil {
+		return nil, fmt.Errorf("%w: staging reservation was already consumed", ErrIdentityChanged)
+	}
+	claim := r.slot.claim
+	r.slot.claim = nil
+	return claim, nil
+}
+
+// Release gives up a reservation without publishing it.
+func (r *Reservation) Release() error {
+	if r == nil || r.slot == nil {
+		return nil
+	}
+	r.slot.mu.Lock()
+	claim := r.slot.claim
+	r.slot.claim = nil
+	r.slot.mu.Unlock()
+	if claim == nil {
+		return nil
+	}
+	return claim.release()
+}
+
+// Claim pins one exact CellTape object through export and retirement. Copies
+// share ownership, and Release remains idempotent across those copies.
+type Claim struct {
+	Path  string
+	claim *claimLease
+}
+
+// Release gives up this process's ownership. The operating system also releases
+// it if the process exits unexpectedly.
+func (c *Claim) Release() error {
+	if c == nil || c.claim == nil {
+		return nil
+	}
+	return c.claim.release()
+}
+
+// VerifyIdentity proves that Path still names the claimed file object. It
+// fails closed after Release and for unclaimed values.
+func (c *Claim) VerifyIdentity() error {
+	if c == nil || c.claim == nil {
+		return fmt.Errorf("%w: tape is not claimed", ErrIdentityChanged)
+	}
+	return c.claim.verifyPath(c.Path)
+}
+
+// Retire removes the claimed file object. A successful retirement also
+// releases ownership.
+func (c *Claim) Retire() error {
+	if c == nil || c.claim == nil {
+		return fmt.Errorf("%w: tape is not claimed", ErrIdentityChanged)
+	}
+	return c.claim.retirePath(c.Path)
+}
+
+// OpenReplayContext validates a duplicate of the claimed operation handle.
+// The returned replay owns only that duplicate; closing it never releases the
+// claim.
+func (c *Claim) OpenReplayContext(ctx context.Context, options celltape.OpenOptions) (*celltape.Replay, error) {
+	if c == nil || c.claim == nil {
+		return nil, fmt.Errorf("%w: tape is not claimed", ErrIdentityChanged)
+	}
+	return c.claim.openReplayContext(ctx, c.Path, options)
+}
+
+// Tape is validated recovery metadata plus exact-object ownership.
+// RecoveredFrom is set only when a staging tape was atomically renamed.
+// RepairedBytes is the discarded damaged suffix.
 type Tape struct {
-	Path             string
+	Claim
 	RecoveredFrom    string
 	SourceKind       Kind
 	Size             int64
@@ -126,16 +216,4 @@ type Tape struct {
 	FirstSourceNanos uint64
 	FirstHostNanos   uint64
 	Config           VersionedConfig
-	claim            *claimLease
-}
-
-// Release gives up this process's recovery ownership. Claim ownership is
-// backed by the operating system, so it is also released automatically if the
-// process exits unexpectedly. Release is idempotent and remains safe when a
-// Tape value has been copied.
-func (t *Tape) Release() error {
-	if t == nil || t.claim == nil {
-		return nil
-	}
-	return t.claim.release()
 }

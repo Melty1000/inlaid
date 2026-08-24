@@ -1,18 +1,37 @@
 //go:build windows
 
-package mfcapture
+package capture
 
 import (
 	"context"
+	"errors"
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+func TestMediaEventClassification(t *testing.T) {
+	if err := classifyMediaEvent(42, 0); err != nil {
+		t.Fatalf("ordinary event = %v", err)
+	}
+	if err := classifyMediaEvent(mfEventNonFatalError, 0); err == nil || !IsTemporary(err) {
+		t.Fatalf("nonfatal event = %v, want temporary", err)
+	}
+	for _, eventType := range []uint32{mfEventError, mfEventVideoCaptureDeviceRemoved, mfEventVideoCaptureDevicePreempted} {
+		if err := classifyMediaEvent(eventType, 0); err == nil || IsTemporary(err) {
+			t.Fatalf("event %d = %v, want terminal", eventType, err)
+		}
+	}
+	if err := classifyMediaEvent(42, uintptr(0x80004005)); err == nil || IsTemporary(err) {
+		t.Fatalf("failed event status = %v, want terminal", err)
+	}
+}
 
 func TestRealC922ControlInventory(t *testing.T) {
 	if os.Getenv("INLAID_MF_CAPTURE_REAL") != "1" {
@@ -143,6 +162,250 @@ func TestCallbackGateRejectsLateAdmissionAndDrainsInflight(t *testing.T) {
 	case <-drained:
 	case <-time.After(time.Second):
 		t.Fatal("callback gate did not drain completed work")
+	}
+}
+
+func TestNativeSourceInitializationFailureRetainsOwnerAndBlocksRetry(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DeviceID = "test-camera"
+	cfg.CloseTimeout = 100 * time.Millisecond
+	guard := &mfNativeInitializationGuard{}
+	initErr := errors.New("native initialization failed")
+	type owner struct {
+		source   *mfNativeSource
+		callback *mfCallback
+	}
+	ownerReady := make(chan owner, 1)
+	release := make(chan struct{})
+	released := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseOwner := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		releaseOwner()
+		select {
+		case <-released:
+		case <-time.After(time.Second):
+		}
+	})
+
+	started := time.Now()
+	_, err := newMFNativeSourceWithControl(context.Background(), cfg, guard,
+		func(_ context.Context, source *mfNativeSource, ready chan<- sourceInit) {
+			callback := newMFCallback(source)
+			ownerReady <- owner{source: source, callback: callback}
+			ready <- sourceInit{err: initErr}
+			<-release
+			callback.releaseOwner()
+			source.packetPool.close()
+			close(source.done)
+			close(released)
+		})
+	elapsed := time.Since(started)
+	if !errors.Is(err, initErr) || !errors.Is(err, ErrShutdownUncertain) {
+		t.Fatalf("initialization error = %v, want native failure plus uncertain ownership", err)
+	}
+	if maximum := sessionCloseWait(cfg.CloseTimeout) + 500*time.Millisecond; elapsed > maximum {
+		t.Fatalf("initialization cancellation took %s, want at most %s", elapsed, maximum)
+	}
+	owned := <-ownerReady
+	owned.source.packetPool.mu.Lock()
+	poolClosed := owned.source.packetPool.closed
+	owned.source.packetPool.mu.Unlock()
+	if poolClosed {
+		t.Fatal("caller closed packet memory still owned by the stalled initializer")
+	}
+	callbackRootsMu.Lock()
+	_, rooted := callbackRoots[owned.callback]
+	callbackRootsMu.Unlock()
+	if !rooted {
+		t.Fatal("caller released a callback still owned by the stalled initializer")
+	}
+	guard.mu.Lock()
+	remembered := guard.uncertain == owned.source
+	guard.mu.Unlock()
+	if !remembered {
+		t.Fatal("initialization guard did not retain the uncertain native owner")
+	}
+
+	retryStarted := make(chan struct{}, 1)
+	_, retryErr := newMFNativeSourceWithControl(context.Background(), cfg, guard,
+		func(context.Context, *mfNativeSource, chan<- sourceInit) { retryStarted <- struct{}{} })
+	if !errors.Is(retryErr, ErrShutdownUncertain) {
+		t.Fatalf("retry error = %v, want uncertain ownership", retryErr)
+	}
+	select {
+	case <-retryStarted:
+		t.Fatal("retry started over an abandoned native initializer")
+	default:
+	}
+
+	releaseOwner()
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("test initializer did not finish after release")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		guard.mu.Lock()
+		retained := guard.uncertain != nil || guard.uncertainErr != nil
+		guard.mu.Unlock()
+		if !retained {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("guard retained a source after its owner confirmed shutdown")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	opened, err := newMFNativeSourceWithControl(context.Background(), cfg, guard,
+		func(_ context.Context, source *mfNativeSource, ready chan<- sourceInit) {
+			ready <- sourceInit{}
+			<-source.stop
+			close(source.done)
+		})
+	if err != nil {
+		t.Fatalf("retry after confirmed owner shutdown: %v", err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatalf("close retry source: %v", err)
+	}
+}
+
+func TestNativeSourceParentCancellationIsBoundedAndRemembered(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.DeviceID = "test-camera"
+	cfg.CloseTimeout = 100 * time.Millisecond
+	guard := &mfNativeInitializationGuard{}
+	ctx, cancel := context.WithCancel(context.Background())
+	ownerReady := make(chan *mfNativeSource, 1)
+	release := make(chan struct{})
+	released := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseOwner := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		releaseOwner()
+		select {
+		case <-released:
+		case <-time.After(time.Second):
+		}
+	})
+	type result struct {
+		err     error
+		elapsed time.Duration
+	}
+	resultReady := make(chan result, 1)
+	go func() {
+		started := time.Now()
+		_, err := newMFNativeSourceWithControl(ctx, cfg, guard,
+			func(_ context.Context, source *mfNativeSource, _ chan<- sourceInit) {
+				ownerReady <- source
+				<-release
+				source.packetPool.close()
+				close(source.done)
+				close(released)
+			})
+		resultReady <- result{err: err, elapsed: time.Since(started)}
+	}()
+	owned := <-ownerReady
+	cancel()
+	var got result
+	select {
+	case got = <-resultReady:
+	case <-time.After(time.Second):
+		t.Fatal("canceled initialization did not return within its bounded allowance")
+	}
+	if !errors.Is(got.err, context.Canceled) || !errors.Is(got.err, ErrShutdownUncertain) {
+		t.Fatalf("canceled initialization error = %v, want cancellation plus uncertain ownership", got.err)
+	}
+	if maximum := sessionCloseWait(cfg.CloseTimeout) + 500*time.Millisecond; got.elapsed > maximum {
+		t.Fatalf("canceled initialization took %s, want at most %s", got.elapsed, maximum)
+	}
+	guard.mu.Lock()
+	remembered := guard.uncertain == owned
+	guard.mu.Unlock()
+	if !remembered {
+		t.Fatal("canceled initializer was not retained for retry prevention")
+	}
+	releaseOwner()
+}
+
+func TestNativeSourceCloseTimeoutRetainsOwnerUntilDone(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.CloseTimeout = 100 * time.Millisecond
+	guard := &mfNativeInitializationGuard{}
+	source := &mfNativeSource{
+		cfg: cfg, packets: make(chan Packet), errors: make(chan error),
+		stop: make(chan struct{}), done: make(chan struct{}), flush: make(chan struct{}),
+		packetPool: newPacketPool(cfg.MaxPacketPoolBytes), initGuard: guard,
+	}
+	callback := newMFCallback(source)
+	release := make(chan struct{})
+	released := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseOwner := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		releaseOwner()
+		select {
+		case <-released:
+		case <-time.After(time.Second):
+		}
+	})
+	go func() {
+		<-source.stop
+		<-release
+		callback.releaseOwner()
+		source.packetPool.close()
+		close(source.done)
+		close(released)
+	}()
+
+	started := time.Now()
+	err := source.Close()
+	elapsed := time.Since(started)
+	if !errors.Is(err, ErrShutdownUncertain) {
+		t.Fatalf("source close error = %v, want uncertain ownership", err)
+	}
+	if maximum := sessionCloseWait(cfg.CloseTimeout) + 500*time.Millisecond; elapsed > maximum {
+		t.Fatalf("source close took %s, want at most %s", elapsed, maximum)
+	}
+	source.packetPool.mu.Lock()
+	poolClosed := source.packetPool.closed
+	source.packetPool.mu.Unlock()
+	if poolClosed {
+		t.Fatal("bounded Close released packet memory still owned by native control")
+	}
+	callbackRootsMu.Lock()
+	_, rooted := callbackRoots[callback]
+	callbackRootsMu.Unlock()
+	if !rooted {
+		t.Fatal("bounded Close released a callback still owned by native control")
+	}
+	guard.mu.Lock()
+	retained := guard.uncertain == source
+	guard.mu.Unlock()
+	if !retained {
+		t.Fatal("bounded Close did not retain its uncertain native owner")
+	}
+
+	releaseOwner()
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("native owner did not finish after release")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		guard.mu.Lock()
+		retained = guard.uncertain != nil || guard.uncertainErr != nil
+		guard.mu.Unlock()
+		if !retained {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("guard did not forget the source after confirmed shutdown")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -312,7 +575,7 @@ func TestRealC922AsyncCaptureAndClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstControl := session.source.(*mfNativeSource).frameRateControl
-	var previous int64
+	var previous time.Duration
 	transientErrors := 0
 	frames := session.Frames
 	errorsCh := session.Errors
@@ -342,10 +605,10 @@ func TestRealC922AsyncCaptureAndClose(t *testing.T) {
 		if frame.Y.Width != 480 || frame.Y.Height != 270 || frame.Cb.Width != 240 || frame.Cb.Height != 270 || frame.Cr.Width != 240 || frame.Cr.Height != 270 {
 			t.Fatalf("unexpected planes: Y=%+v Cb=%+v Cr=%+v", frame.Y, frame.Cb, frame.Cr)
 		}
-		if index > 0 && frame.ReaderTimestamp100ns <= previous {
-			t.Fatalf("timestamp %d did not follow %d", frame.ReaderTimestamp100ns, previous)
+		if index > 0 && frame.PTS <= previous {
+			t.Fatalf("timestamp %s did not follow %s", frame.PTS, previous)
 		}
-		previous = frame.ReaderTimestamp100ns
+		previous = frame.PTS
 		frame.Release()
 	}
 	closeStart := time.Now()
@@ -433,7 +696,8 @@ func TestRealC922SustainedHalfDecodeCadence(t *testing.T) {
 	}
 	cfg := DefaultConfig()
 	cfg.DeviceID = selected.ID
-	cfg.Lowres = 1
+	cfg.Downsample = 2
+	cfg.Diagnostics = true
 	session, err := Open(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -442,12 +706,12 @@ func TestRealC922SustainedHalfDecodeCadence(t *testing.T) {
 	wic := session.decoder.(*wicDecoder)
 	frames, errorsCh := session.Frames, session.Errors
 	var (
-		count                         int
-		firstWall, lastWall           time.Time
-		firstTimestamp, lastTimestamp int64
-		previousTimestamp             int64
-		minimumTimestampGap           = int64(^uint64(0) >> 1)
-		maximumTimestampGap           int64
+		count               int
+		firstWall, lastWall time.Time
+		firstPTS, lastPTS   time.Duration
+		previousPTS         time.Duration
+		minimumPTSGap       = time.Duration(1<<63 - 1)
+		maximumPTSGap       time.Duration
 	)
 	deadline := time.NewTimer(6 * time.Second)
 	defer deadline.Stop()
@@ -460,18 +724,18 @@ loop:
 			}
 			now := time.Now()
 			if count == 0 {
-				firstWall, firstTimestamp = now, frame.ReaderTimestamp100ns
+				firstWall, firstPTS = now, frame.PTS
 			} else {
-				gap := frame.ReaderTimestamp100ns - previousTimestamp
-				if gap < minimumTimestampGap {
-					minimumTimestampGap = gap
+				gap := frame.PTS - previousPTS
+				if gap < minimumPTSGap {
+					minimumPTSGap = gap
 				}
-				if gap > maximumTimestampGap {
-					maximumTimestampGap = gap
+				if gap > maximumPTSGap {
+					maximumPTSGap = gap
 				}
 			}
 			count++
-			lastWall, lastTimestamp, previousTimestamp = now, frame.ReaderTimestamp100ns, frame.ReaderTimestamp100ns
+			lastWall, lastPTS, previousPTS = now, frame.PTS, frame.PTS
 			// Match the observed 6-8 ms cell reduction/solve cost while retaining
 			// overlap with the native source and WIC decoder goroutines.
 			time.Sleep(8 * time.Millisecond)
@@ -498,8 +762,8 @@ loop:
 	wallFPS, timestampFPS := 0.0, 0.0
 	if count > 1 {
 		wallFPS = float64(count-1) / lastWall.Sub(firstWall).Seconds()
-		if lastTimestamp > firstTimestamp {
-			timestampFPS = float64(count-1) * 1e7 / float64(lastTimestamp-firstTimestamp)
+		if lastPTS > firstPTS {
+			timestampFPS = float64(count-1) / (lastPTS - firstPTS).Seconds()
 		}
 	}
 	callbacks := native.callbackCount.Load()
@@ -516,7 +780,7 @@ loop:
 	if decodes > 0 {
 		decodeAverage = time.Duration(wic.decodeTotalNS.Load() / decodes)
 	}
-	t.Logf("delivered=%d wall_fps=%.2f timestamp_fps=%.2f pts_gap=%s..%s stats=%+v", count, wallFPS, timestampFPS, time.Duration(minimumTimestampGap*100), time.Duration(maximumTimestampGap*100), stats)
+	t.Logf("delivered=%d wall_fps=%.2f timestamp_fps=%.2f pts_gap=%s..%s stats=%+v", count, wallFPS, timestampFPS, minimumPTSGap, maximumPTSGap, stats)
 	t.Logf("frame_rate_control=%+v", native.frameRateControl)
 	t.Logf("callbacks=%d callback_gap_avg=%s max=%s requests=%d request_avg=%s max=%s decodes=%d decode_avg=%s max=%s", callbacks, callbackAverage, time.Duration(native.callbackMaxGapNS.Load()), requests, requestAverage, time.Duration(native.requestMaxNS.Load()), decodes, decodeAverage, time.Duration(wic.decodeMaxNS.Load()))
 	if wallFPS < 28 {
@@ -563,7 +827,7 @@ func TestRealC922ThreeMinuteSoak(t *testing.T) {
 	defer deadline.Stop()
 	defer ticker.Stop()
 	var frames, windowFrames, temporaryErrors int
-	var firstTimestamp, lastTimestamp int64
+	var firstPTS, lastPTS time.Duration
 	minimumWindowFPS := 1e9
 	firstMean, lastMean := 0.0, 0.0
 	for {
@@ -573,14 +837,14 @@ func TestRealC922ThreeMinuteSoak(t *testing.T) {
 				t.Fatalf("frame channel closed after %s", time.Since(started))
 			}
 			if frames == 0 {
-				firstTimestamp = frame.ReaderTimestamp100ns
+				firstPTS = frame.PTS
 				firstMean = sampledPlaneMean(frame.Y.Pix)
 			}
-			if lastTimestamp != 0 && frame.ReaderTimestamp100ns <= lastTimestamp {
+			if lastPTS != 0 && frame.PTS <= lastPTS {
 				frame.Release()
-				t.Fatalf("timestamp %d did not follow %d", frame.ReaderTimestamp100ns, lastTimestamp)
+				t.Fatalf("timestamp %s did not follow %s", frame.PTS, lastPTS)
 			}
-			lastTimestamp = frame.ReaderTimestamp100ns
+			lastPTS = frame.PTS
 			lastMean = sampledPlaneMean(frame.Y.Pix)
 			frames++
 			windowFrames++
@@ -608,7 +872,7 @@ func TestRealC922ThreeMinuteSoak(t *testing.T) {
 			if err := session.Close(); err != nil {
 				t.Fatal(err)
 			}
-			timestampFPS := float64(frames-1) * 1e7 / float64(lastTimestamp-firstTimestamp)
+			timestampFPS := float64(frames-1) / (lastPTS - firstPTS).Seconds()
 			t.Logf("soak passed duration=%s frames=%d source_fps=%.2f min_10s_fps=%.2f Y_mean_first=%.1f last=%.1f temporary_errors=%d stats=%+v", time.Since(started), frames, timestampFPS, minimumWindowFPS, firstMean, lastMean, temporaryErrors, session.Stats())
 			return
 		case <-ctx.Done():

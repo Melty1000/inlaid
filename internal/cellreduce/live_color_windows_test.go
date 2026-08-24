@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Melty1000/inlaid/internal/capture"
 	"github.com/Melty1000/inlaid/internal/cellframe"
 	"github.com/Melty1000/inlaid/internal/cellreduce"
-	"github.com/Melty1000/inlaid/internal/mfcapture"
 )
 
 // TestRealC922ColorPath is an opt-in end-to-end diagnostic for the native
@@ -24,7 +24,7 @@ func TestRealC922ColorPath(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	devices, err := mfcapture.Enumerate(ctx)
+	devices, err := capture.Enumerate(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,15 +38,15 @@ func TestRealC922ColorPath(t *testing.T) {
 	if id == "" {
 		t.Fatalf("C922 not found: %+v", devices)
 	}
-	cfg := mfcapture.DefaultConfig()
+	cfg := capture.DefaultConfig()
 	cfg.DeviceID = id
-	session, err := mfcapture.Open(ctx, cfg)
+	session, err := capture.Open(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer session.Close()
 
-	var frame *mfcapture.Frame
+	var frame *capture.Frame
 	for frame == nil {
 		select {
 		case frame = <-session.Frames:

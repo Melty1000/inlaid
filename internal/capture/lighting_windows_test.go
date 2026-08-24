@@ -1,6 +1,6 @@
 //go:build windows
 
-package mfcapture
+package capture
 
 import (
 	"context"
@@ -87,7 +87,7 @@ func testCaptureLighting(t *testing.T, label string, duration time.Duration) {
 	started := time.Now()
 	windowStart := started
 	var firstWall, lastWall time.Time
-	var firstTS, lastTS int64
+	var firstPTS, lastPTS time.Duration
 	var frames, windowFrames int
 	var ySum, yCount uint64
 	var histogram [256]uint64
@@ -123,11 +123,11 @@ func testCaptureLighting(t *testing.T, label string, duration time.Duration) {
 			}
 			now := time.Now()
 			if frames == 0 {
-				firstWall, firstTS = now, frame.ReaderTimestamp100ns
+				firstWall, firstPTS = now, frame.PTS
 			}
 			frames++
 			windowFrames++
-			lastWall, lastTS = now, frame.ReaderTimestamp100ns
+			lastWall, lastPTS = now, frame.PTS
 			for index := 0; index < len(frame.Y.Pix); index += 4 {
 				value := frame.Y.Pix[index]
 				histogram[value]++
@@ -149,7 +149,7 @@ func testCaptureLighting(t *testing.T, label string, duration time.Duration) {
 			wallFPS, timestampFPS := 0.0, 0.0
 			if frames > 1 {
 				wallFPS = float64(frames-1) / lastWall.Sub(firstWall).Seconds()
-				timestampFPS = float64(frames-1) * 1e7 / float64(lastTS-firstTS)
+				timestampFPS = float64(frames-1) / (lastPTS - firstPTS).Seconds()
 			}
 			t.Logf("%s total frames=%d wall=%.2f source=%.2f stats=%+v", label, frames, wallFPS, timestampFPS, session.Stats())
 			return

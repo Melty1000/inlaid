@@ -1,6 +1,6 @@
 //go:build windows
 
-package mfcapture
+package capture
 
 import (
 	"context"
@@ -17,6 +17,9 @@ import (
 
 // Enumerate returns Media Foundation friendly names and stable symbolic links.
 func Enumerate(ctx context.Context) ([]Device, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -57,19 +60,15 @@ func Open(parent context.Context, cfg Config) (*Session, error) {
 	selectedConfig.FPS = selected.NominalFPS()
 	selectedConfig, err = normalize(selectedConfig, true)
 	if err != nil {
-		_ = source.Close()
-		return nil, fmt.Errorf("selected native mode is unusable: %w", err)
+		return nil, errors.Join(fmt.Errorf("selected native mode is unusable: %w", err), source.Close())
 	}
 	decoder, err := newWICDecoder(selectedConfig)
 	if err != nil {
-		_ = source.Close()
-		return nil, err
+		return nil, errors.Join(err, source.Close())
 	}
 	session, err := StartPipeline(parent, selectedConfig, source, decoder)
 	if err != nil {
-		_ = decoder.Close()
-		_ = source.Close()
-		return nil, err
+		return nil, errors.Join(err, decoder.Close(), source.Close())
 	}
 	session.selectedMode = selected
 	return session, nil
@@ -94,6 +93,7 @@ type mfNativeSource struct {
 	reader     comObject
 	callbacks  callbackGate
 	packetPool *packetPool
+	initGuard  *mfNativeInitializationGuard
 
 	callbackCount    atomic.Uint64
 	callbackLastNS   atomic.Uint64
@@ -107,27 +107,114 @@ type mfNativeSource struct {
 
 type sourceInit struct{ err error }
 
+type mfNativeSourceControl func(context.Context, *mfNativeSource, chan<- sourceInit)
+
+type mfNativeInitializationGuard struct {
+	mu           sync.Mutex
+	initializing bool
+	uncertain    *mfNativeSource
+	uncertainErr error
+}
+
+var windowsMFInitialization mfNativeInitializationGuard
+
 func newMFNativeSource(parent context.Context, cfg Config) (*mfNativeSource, error) {
+	return newMFNativeSourceWithControl(parent, cfg, &windowsMFInitialization,
+		func(parent context.Context, source *mfNativeSource, ready chan<- sourceInit) {
+			source.control(parent, ready)
+		})
+}
+
+func newMFNativeSourceWithControl(parent context.Context, cfg Config, guard *mfNativeInitializationGuard, control mfNativeSourceControl) (_ *mfNativeSource, resultErr error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if err := guard.begin(); err != nil {
+		return nil, err
+	}
 	source := &mfNativeSource{
 		cfg:     cfg,
 		packets: make(chan Packet, cfg.PacketQueueDepth),
 		errors:  make(chan error, 2),
 		stop:    make(chan struct{}), done: make(chan struct{}), flush: make(chan struct{}),
 		packetPool: newPacketPool(cfg.MaxPacketPoolBytes),
+		initGuard:  guard,
 	}
+	defer func() { guard.finish(source, resultErr) }()
 	ready := make(chan sourceInit, 1)
-	go source.control(parent, ready)
+	go control(parent, source, ready)
 	select {
 	case initialized := <-ready:
 		if initialized.err != nil {
-			<-source.done
-			return nil, initialized.err
+			return nil, errors.Join(initialized.err, source.stopInitializing(sessionCloseWait(cfg.CloseTimeout)))
+		}
+		if err := parent.Err(); err != nil {
+			return nil, errors.Join(err, source.stopInitializing(sessionCloseWait(cfg.CloseTimeout)))
 		}
 		return source, nil
 	case <-parent.Done():
-		_ = source.Close()
-		return nil, parent.Err()
+		return nil, errors.Join(parent.Err(), source.stopInitializing(sessionCloseWait(cfg.CloseTimeout)))
 	}
+}
+
+func (g *mfNativeInitializationGuard) begin() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.uncertain == nil {
+		if g.initializing {
+			return errors.New("another Windows camera initialization is already in progress")
+		}
+		g.initializing = true
+		return nil
+	}
+	select {
+	case <-g.uncertain.done:
+		g.uncertain = nil
+		g.uncertainErr = nil
+	default:
+		return errors.Join(g.uncertainErr, errors.New("a previous Windows camera initializer still owns native state"))
+	}
+	if g.initializing {
+		return errors.New("another Windows camera initialization is already in progress")
+	}
+	g.initializing = true
+	return nil
+}
+
+func (g *mfNativeInitializationGuard) finish(source *mfNativeSource, err error) {
+	g.mu.Lock()
+	g.initializing = false
+	if errors.Is(err, ErrShutdownUncertain) {
+		g.retainLocked(source, err)
+	}
+	g.mu.Unlock()
+}
+
+func (g *mfNativeInitializationGuard) remember(source *mfNativeSource, err error) {
+	if source == nil || !errors.Is(err, ErrShutdownUncertain) {
+		return
+	}
+	g.mu.Lock()
+	g.retainLocked(source, err)
+	g.mu.Unlock()
+}
+
+func (g *mfNativeInitializationGuard) retainLocked(source *mfNativeSource, err error) {
+	if g.uncertain == source {
+		g.uncertainErr = err
+		return
+	}
+	g.uncertain = source
+	g.uncertainErr = err
+	go func() {
+		<-source.done
+		g.mu.Lock()
+		if g.uncertain == source {
+			g.uncertain = nil
+			g.uncertainErr = nil
+		}
+		g.mu.Unlock()
+	}()
 }
 
 func (s *mfNativeSource) Packets() <-chan Packet { return s.packets }
@@ -136,8 +223,35 @@ func (s *mfNativeSource) DroppedPackets() uint64 { return s.dropped.Load() }
 func (s *mfNativeSource) Mode() Mode             { return s.mode }
 
 func (s *mfNativeSource) Close() error {
+	s.signalStop()
+	err := s.waitForShutdown(sessionCloseWait(s.cfg.CloseTimeout), "Windows camera shutdown")
+	if s.initGuard != nil {
+		s.initGuard.remember(s, err)
+	}
+	return err
+}
+
+func (s *mfNativeSource) signalStop() {
 	s.closeOnce.Do(func() { close(s.stop) })
-	<-s.done
+}
+
+func (s *mfNativeSource) stopInitializing(wait time.Duration) error {
+	s.signalStop()
+	return s.waitForShutdown(wait, "Windows camera initialization")
+}
+
+func (s *mfNativeSource) waitForShutdown(wait time.Duration, operation string) error {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-s.done:
+		return s.getCloseError()
+	case <-timer.C:
+		return fmt.Errorf("%w: %s did not stop within %s", ErrShutdownUncertain, operation, wait)
+	}
+}
+
+func (s *mfNativeSource) getCloseError() error {
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
 	return s.closeErr
@@ -195,13 +309,18 @@ func (s *mfNativeSource) requestNext() error {
 	if s.stopping.Load() || !s.reader.valid() {
 		return nil
 	}
-	started := time.Now()
+	var started time.Time
+	if s.cfg.Diagnostics {
+		started = time.Now()
+	}
 	// Async mode requires every output parameter after control flags to be nil.
 	hr := s.reader.call(9, mfSourceReaderFirstVideoStream, 0, 0, 0, 0, 0)
-	elapsed := uint64(time.Since(started))
-	s.requestCount.Add(1)
-	s.requestTotalNS.Add(elapsed)
-	atomicMax(&s.requestMaxNS, elapsed)
+	if s.cfg.Diagnostics {
+		elapsed := uint64(time.Since(started))
+		s.requestCount.Add(1)
+		s.requestTotalNS.Add(elapsed)
+		atomicMax(&s.requestMaxNS, elapsed)
+	}
 	if failed(hr) {
 		return hrError("IMFSourceReader.ReadSample(async)", hr)
 	}
@@ -258,7 +377,7 @@ func (s *mfNativeSource) control(parent context.Context, ready chan<- sourceInit
 			shutdownMF()
 		}
 		if !readySent {
-			readyWith(errors.New("Media Foundation source initialization ended unexpectedly"))
+			readyWith(errors.New("source initialization ended unexpectedly in Media Foundation"))
 		}
 		s.outputMu.Lock()
 		close(s.packets)
@@ -368,7 +487,7 @@ func (s *mfNativeSource) control(parent context.Context, ready chan<- sourceInit
 		return
 	}
 	if !mediaTypeMatches(negotiated, selectedMode) {
-		readyWith(fmt.Errorf("Media Foundation negotiated %+v instead of selected native mode %+v", negotiated, selectedMode))
+		readyWith(fmt.Errorf("negotiated Media Foundation mode %+v differs from selected native mode %+v", negotiated, selectedMode))
 		return
 	}
 	s.cfg = selectedConfig
@@ -403,11 +522,12 @@ func (s *mfNativeSource) control(parent context.Context, ready chan<- sourceInit
 		s.setCloseError(hrError("IMFSourceReader.Flush", flushHR))
 	}
 
-	timer := time.NewTimer(s.cfg.CloseTimeout)
+	flushTimeout := s.cfg.CloseTimeout / 2
+	timer := time.NewTimer(flushTimeout)
 	select {
 	case <-s.flush:
 	case <-timer.C:
-		s.setCloseError(fmt.Errorf("Media Foundation OnFlush did not arrive within %s", s.cfg.CloseTimeout))
+		s.setCloseError(fmt.Errorf("flush callback from Media Foundation timed out after %s", flushTimeout))
 	}
 	if !timer.Stop() {
 		select {
@@ -553,13 +673,15 @@ func callbackOnReadSample(this *mfCallback, status int32, _ uint32, flags uint32
 		return 0
 	}
 	defer owner.callbacks.end()
-	now := uint64(time.Now().UnixNano())
-	previous := owner.callbackLastNS.Swap(now)
-	owner.callbackCount.Add(1)
-	if previous != 0 && now >= previous {
-		gap := now - previous
-		owner.callbackGapNS.Add(gap)
-		atomicMax(&owner.callbackMaxGapNS, gap)
+	if owner.cfg.Diagnostics {
+		now := uint64(time.Now().UnixNano())
+		previous := owner.callbackLastNS.Swap(now)
+		owner.callbackCount.Add(1)
+		if previous != 0 && now >= previous {
+			gap := now - previous
+			owner.callbackGapNS.Add(gap)
+			atomicMax(&owner.callbackMaxGapNS, gap)
+		}
 	}
 	if owner.stopping.Load() {
 		return 0
@@ -581,16 +703,16 @@ func callbackOnReadSample(this *mfCallback, status int32, _ uint32, flags uint32
 	}
 	if flags&mfSourceReaderFlagError != 0 {
 		rearm = false
-		owner.report(fmt.Errorf("Media Foundation reader error flag %#x", flags))
+		owner.report(fmt.Errorf("reader error flag from Media Foundation: %#x", flags))
 		return 0
 	}
 	if flags&mfSourceReaderFlagEOS != 0 {
 		rearm = false
-		owner.report(errors.New("Media Foundation camera reached end of stream"))
+		owner.report(errors.New("camera reached end of Media Foundation stream"))
 		return 0
 	}
 	if sample != nil {
-		packet, err := copyMFSample(comObject{sample}, timestamp, flags, owner.cfg.MaxPacketBytes, owner.packetPool)
+		packet, err := copyMFSample(comObject{sample}, timestamp, owner.cfg.MaxPacketBytes, owner.packetPool)
 		if err != nil {
 			owner.dropped.Add(1)
 			owner.report(temporaryCaptureError{err: err})
@@ -599,7 +721,7 @@ func callbackOnReadSample(this *mfCallback, status int32, _ uint32, flags uint32
 		owner.publish(packet)
 	} else if flags&mfSourceReaderFlagStreamTick == 0 {
 		owner.dropped.Add(1)
-		owner.report(temporaryCaptureError{err: errors.New("Media Foundation returned neither sample nor stream tick")})
+		owner.report(temporaryCaptureError{err: errors.New("neither sample nor stream tick returned by Media Foundation")})
 		return 0
 	}
 	return 0
@@ -659,13 +781,13 @@ func classifyMediaEvent(eventType uint32, status uintptr) error {
 	}
 	switch eventType {
 	case mfEventError:
-		return errors.New("Media Foundation reported a camera source error")
+		return errors.New("camera source error reported by Media Foundation")
 	case mfEventVideoCaptureDeviceRemoved:
 		return errors.New("camera device was removed")
 	case mfEventVideoCaptureDevicePreempted:
 		return errors.New("camera was taken over by another application")
 	case mfEventNonFatalError:
-		return temporaryCaptureError{err: errors.New("Media Foundation reported a recoverable camera event")}
+		return temporaryCaptureError{err: errors.New("recoverable camera event reported by Media Foundation")}
 	default:
 		return nil
 	}

@@ -1,4 +1,4 @@
-package mfcapture
+package capture
 
 import "testing"
 

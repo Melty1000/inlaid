@@ -1,6 +1,6 @@
 //go:build windows
 
-package mfcapture
+package capture
 
 import (
 	"bytes"
@@ -9,6 +9,7 @@ import (
 	"math"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -126,11 +127,6 @@ func (o comObject) call(index int, args ...uintptr) uintptr {
 	return r
 }
 
-func (o comObject) addRef() {
-	if o.valid() {
-		o.call(1)
-	}
-}
 func (o comObject) release() {
 	if o.valid() {
 		o.call(2)
@@ -465,7 +461,7 @@ func hrError(operation string, hr uintptr) error {
 func requireProcs(procs ...*windows.LazyProc) error {
 	for _, proc := range procs {
 		if err := proc.Find(); err != nil {
-			return fmt.Errorf("Windows API %s is unavailable: %w", proc.Name, err)
+			return fmt.Errorf("unavailable Windows API %s: %w", proc.Name, err)
 		}
 	}
 	return nil
@@ -535,15 +531,15 @@ func enumerateActivations() (*activationSet, error) {
 	set := &activationSet{array: array}
 	if count > maxDeviceCount {
 		set.close()
-		return nil, fmt.Errorf("Media Foundation returned %d devices, bound is %d", count, maxDeviceCount)
+		return nil, fmt.Errorf("device count returned by Media Foundation exceeds bound: %d > %d", count, maxDeviceCount)
 	}
 	if count == 0 {
 		set.close()
-		return nil, errors.New("Media Foundation found no video capture devices")
+		return nil, errors.New("no video capture devices found by Media Foundation")
 	}
 	if array == nil {
 		set.close()
-		return nil, errors.New("Media Foundation returned a null device array")
+		return nil, errors.New("null device array returned by Media Foundation")
 	}
 	pointers := unsafe.Slice((*unsafe.Pointer)(array), int(count))
 	set.items = make([]mfActivation, 0, count)
@@ -582,7 +578,7 @@ func (s *activationSet) exact(id string) (mfActivation, error) {
 			return activation, nil
 		}
 	}
-	return mfActivation{}, fmt.Errorf("Media Foundation device ID %q was not found", id)
+	return mfActivation{}, fmt.Errorf("device ID not found by Media Foundation: %q", id)
 }
 
 func mfAllocatedString(object comObject, key windows.GUID) (string, error) {
@@ -597,7 +593,7 @@ func mfAllocatedString(object comObject, key windows.GUID) (string, error) {
 	}
 	defer windows.CoTaskMemFree(pointer)
 	if length > 32768 {
-		return "", fmt.Errorf("Media Foundation string length %d exceeds bound", length)
+		return "", fmt.Errorf("string length returned by Media Foundation exceeds bound: %d", length)
 	}
 	return windows.UTF16ToString(unsafe.Slice((*uint16)(pointer), int(length)+1)), nil
 }
@@ -678,20 +674,7 @@ func selectBestNativeType(reader comObject, cfg Config) (comObject, Mode, error)
 	return mediaType, selected.Mode, nil
 }
 
-func copyMFSample(sample comObject, readerTimestamp int64, readerFlags uint32, maxPacketBytes int, pool *packetPool) (Packet, error) {
-	metadata := Packet{ReaderTimestamp100ns: readerTimestamp, ReaderFlags: readerFlags}
-	if hr := sample.call(33, uintptr(unsafe.Pointer(&metadata.SampleFlags))); failed(hr) {
-		return Packet{}, hrError("IMFSample.GetSampleFlags", hr)
-	}
-	if hr := sample.call(35, uintptr(unsafe.Pointer(&metadata.SampleTimestamp100ns))); failed(hr) {
-		return Packet{}, hrError("IMFSample.GetSampleTime", hr)
-	}
-	if hr := sample.call(37, uintptr(unsafe.Pointer(&metadata.SampleDuration100ns))); !failed(hr) {
-		metadata.DurationKnown = true
-	}
-	if hr := sample.call(39, uintptr(unsafe.Pointer(&metadata.BufferCount))); failed(hr) {
-		return Packet{}, hrError("IMFSample.GetBufferCount", hr)
-	}
+func copyMFSample(sample comObject, timestamp int64, maxPacketBytes int, pool *packetPool) (Packet, error) {
 	var bufferPtr unsafe.Pointer
 	if hr := sample.call(41, uintptr(unsafe.Pointer(&bufferPtr))); failed(hr) || bufferPtr == nil {
 		return Packet{}, hrError("IMFSample.ConvertToContiguousBuffer", hr)
@@ -710,25 +693,19 @@ func copyMFSample(sample comObject, readerTimestamp int64, readerFlags uint32, m
 		}
 	}()
 	if current > maximum {
-		return Packet{}, fmt.Errorf("Media Foundation buffer length %d exceeds maximum %d", current, maximum)
+		return Packet{}, fmt.Errorf("buffer length returned by Media Foundation exceeds maximum: %d > %d", current, maximum)
 	}
 	if current == 0 || int64(current) > int64(maxPacketBytes) {
-		return Packet{}, fmt.Errorf("Media Foundation MJPEG length %d is outside 1..%d", current, maxPacketBytes)
+		return Packet{}, fmt.Errorf("invalid Media Foundation MJPEG length %d; expected 1..%d", current, maxPacketBytes)
 	}
 	if data == nil {
-		return Packet{}, errors.New("Media Foundation locked a null buffer")
+		return Packet{}, errors.New("null buffer locked by Media Foundation")
 	}
 	packet, err := pool.acquire(int(current))
 	if err != nil {
 		return Packet{}, err
 	}
-	packet.ReaderTimestamp100ns = metadata.ReaderTimestamp100ns
-	packet.ReaderFlags = metadata.ReaderFlags
-	packet.SampleFlags = metadata.SampleFlags
-	packet.SampleTimestamp100ns = metadata.SampleTimestamp100ns
-	packet.SampleDuration100ns = metadata.SampleDuration100ns
-	packet.DurationKnown = metadata.DurationKnown
-	packet.BufferCount = metadata.BufferCount
+	packet.PTS = mediaFoundationDuration(timestamp)
 	copy(packet.Data, unsafe.Slice((*byte)(data), int(current)))
 	if hr := buffer.call(4); failed(hr) {
 		packet.Release()
@@ -749,6 +726,13 @@ func copyMFSample(sample comObject, readerTimestamp int64, readerFlags uint32, m
 		return Packet{}, err
 	}
 	return packet, nil
+}
+
+func mediaFoundationDuration(timestamp int64) time.Duration {
+	if timestamp < 0 || timestamp > math.MaxInt64/100 {
+		return 0
+	}
+	return time.Duration(timestamp * 100)
 }
 
 func guid(data1 uint32, data2, data3 uint16, data4 ...byte) windows.GUID {

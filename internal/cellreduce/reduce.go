@@ -37,7 +37,7 @@ type RGB24 struct {
 }
 
 // YCbCr is a reduced planar source. Chroma may be independently subsampled in
-// either axis; WIC's native JPEG path currently returns 4:2:2 planes.
+// either axis.
 type YCbCr struct {
 	Y, Cb, Cr                 []byte
 	Width, Height             int
@@ -46,11 +46,42 @@ type YCbCr struct {
 	CbStride, CrStride        int
 }
 
-// Reducer owns one fixed reusable statistics buffer. It is single-stream and
-// performs no allocation after construction.
+// Reducer owns one fixed reusable statistics buffer and caches sampling plans
+// for the current source layouts. It is single-stream and performs no
+// allocation while a source layout remains unchanged.
 type Reducer struct {
 	geometry Geometry
 	stats    []cellframe.SampleStats
+	sampling samplingPlan
+	ycbcr    ycbcrSamplingPlan
+}
+
+type sampleSpan struct {
+	start, end int
+	statOffset int
+}
+
+type samplingPlan struct {
+	width, height int
+	columns       []sampleSpan
+	rows          []sampleSpan
+}
+
+type ycbcrLayout struct {
+	width, height             int
+	yStride                   int
+	chromaWidth, chromaHeight int
+	cbStride, crStride        int
+}
+
+type sourceRowOffsets struct {
+	y, cb, cr int
+}
+
+type ycbcrSamplingPlan struct {
+	layout     ycbcrLayout
+	chromaX    []int
+	sourceRows []sourceRowOffsets
 }
 
 // New validates a bounded terminal geometry and allocates its one reusable
@@ -68,9 +99,6 @@ func New(geometry Geometry) (*Reducer, error) {
 	}, nil
 }
 
-// Geometry returns the reducer's fixed mapping.
-func (r *Reducer) Geometry() Geometry { return r.geometry }
-
 // ReduceRGB24 maps an arbitrary reduced RGB source into cell-major quadrant
 // statistics. Downscaling area-aggregates every covered source pixel;
 // upscaling uses nearest source support for otherwise empty bins.
@@ -79,10 +107,19 @@ func (r *Reducer) ReduceRGB24(source RGB24) (cellframe.StatisticsFrame, error) {
 		return cellframe.StatisticsFrame{}, err
 	}
 	clear(r.stats)
-	r.reduce(source.Width, source.Height, func(x, y int) (uint8, uint8, uint8) {
-		offset := y*source.Stride + x*3
-		return source.Pix[offset], source.Pix[offset+1], source.Pix[offset+2]
-	})
+	plan := r.prepareSamplingPlan(source.Width, source.Height)
+	for _, outputRow := range plan.rows {
+		for _, outputColumn := range plan.columns {
+			stats := &r.stats[outputRow.statOffset+outputColumn.statOffset]
+			for y := outputRow.start; y < outputRow.end; y++ {
+				row := y * source.Stride
+				for x := outputColumn.start; x < outputColumn.end; x++ {
+					offset := row + x*3
+					stats.AddRGB(source.Pix[offset], source.Pix[offset+1], source.Pix[offset+2])
+				}
+			}
+		}
+	}
 	return r.frame(), nil
 }
 
@@ -93,15 +130,21 @@ func (r *Reducer) ReduceYCbCr(source YCbCr) (cellframe.StatisticsFrame, error) {
 		return cellframe.StatisticsFrame{}, err
 	}
 	clear(r.stats)
-	r.reduce(source.Width, source.Height, func(x, y int) (uint8, uint8, uint8) {
-		cx := min(x*source.ChromaWidth/source.Width, source.ChromaWidth-1)
-		cy := min(y*source.ChromaHeight/source.Height, source.ChromaHeight-1)
-		return color.YCbCrToRGB(
-			source.Y[y*source.YStride+x],
-			source.Cb[cy*source.CbStride+cx],
-			source.Cr[cy*source.CrStride+cx],
-		)
-	})
+	plan := r.prepareSamplingPlan(source.Width, source.Height)
+	ycbcr := r.prepareYCbCrPlan(source)
+	for _, outputRow := range plan.rows {
+		for _, outputColumn := range plan.columns {
+			stats := &r.stats[outputRow.statOffset+outputColumn.statOffset]
+			for y := outputRow.start; y < outputRow.end; y++ {
+				offsets := ycbcr.sourceRows[y]
+				for x := outputColumn.start; x < outputColumn.end; x++ {
+					cx := ycbcr.chromaX[x]
+					r, g, b := color.YCbCrToRGB(source.Y[offsets.y+x], source.Cb[offsets.cb+cx], source.Cr[offsets.cr+cx])
+					stats.AddRGB(r, g, b)
+				}
+			}
+		}
+	}
 	return r.frame(), nil
 }
 
@@ -113,52 +156,97 @@ func (r *Reducer) frame() cellframe.StatisticsFrame {
 	}
 }
 
-type sampler func(x, y int) (uint8, uint8, uint8)
+func (r *Reducer) prepareSamplingPlan(sourceWidth, sourceHeight int) *samplingPlan {
+	if r.sampling.width == sourceWidth && r.sampling.height == sourceHeight {
+		return &r.sampling
+	}
 
-func (r *Reducer) reduce(sourceWidth, sourceHeight int, sample sampler) {
 	cropX, cropY, cropWidth, cropHeight := sourceCrop(sourceWidth, sourceHeight, r.geometry)
 	sampleColumns, sampleRows := r.geometry.Columns*2, r.geometry.Rows*2
-	for outputY := 0; outputY < sampleRows; outputY++ {
-		y0, y1 := sourceRange(outputY, sampleRows, cropY, cropHeight)
-		cellY, quadrantY := outputY/2, outputY&1
-		for outputX := 0; outputX < sampleColumns; outputX++ {
-			x0, x1 := sourceRange(outputX, sampleColumns, cropX, cropWidth)
-			cellX, quadrantX := outputX/2, outputX&1
-			quadrant := quadrantY*2 + quadrantX
-			stats := &r.stats[(cellY*r.geometry.Columns+cellX)*4+quadrant]
-			for y := y0; y < y1; y++ {
-				for x := x0; x < x1; x++ {
-					r, g, b := sample(x, y)
-					stats.AddRGB(r, g, b)
-				}
-			}
+	columns := r.sampling.columns
+	if cap(columns) < sampleColumns {
+		columns = make([]sampleSpan, sampleColumns)
+	} else {
+		columns = columns[:sampleColumns]
+	}
+	rows := r.sampling.rows
+	if cap(rows) < sampleRows {
+		rows = make([]sampleSpan, sampleRows)
+	} else {
+		rows = rows[:sampleRows]
+	}
+
+	for outputX := range sampleColumns {
+		start, end := sourceRange(outputX, sampleColumns, cropX, cropWidth)
+		displayX := outputX
+		if r.geometry.Mirror {
+			displayX = sampleColumns - 1 - outputX
+		}
+		columns[outputX] = sampleSpan{
+			start:      start,
+			end:        end,
+			statOffset: (displayX/2)*4 + displayX&1,
 		}
 	}
-	if r.geometry.Mirror {
-		r.mirrorStatistics()
+	for outputY := 0; outputY < sampleRows; outputY++ {
+		start, end := sourceRange(outputY, sampleRows, cropY, cropHeight)
+		rows[outputY] = sampleSpan{
+			start:      start,
+			end:        end,
+			statOffset: (outputY/2*r.geometry.Columns)*4 + (outputY&1)*2,
+		}
 	}
+
+	r.sampling = samplingPlan{
+		width:   sourceWidth,
+		height:  sourceHeight,
+		columns: columns,
+		rows:    rows,
+	}
+	return &r.sampling
 }
 
-func (r *Reducer) mirrorStatistics() {
-	columns, rows := r.geometry.Columns, r.geometry.Rows
-	for y := 0; y < rows; y++ {
-		for left := 0; left < (columns+1)/2; left++ {
-			right := columns - 1 - left
-			leftBase := (y*columns + left) * 4
-			rightBase := (y*columns + right) * 4
-			if left == right {
-				r.stats[leftBase], r.stats[leftBase+1] = r.stats[leftBase+1], r.stats[leftBase]
-				r.stats[leftBase+2], r.stats[leftBase+3] = r.stats[leftBase+3], r.stats[leftBase+2]
-				continue
-			}
-			for row := 0; row < 2; row++ {
-				l0, l1 := leftBase+row*2, leftBase+row*2+1
-				r0, r1 := rightBase+row*2, rightBase+row*2+1
-				r.stats[l0], r.stats[r1] = r.stats[r1], r.stats[l0]
-				r.stats[l1], r.stats[r0] = r.stats[r0], r.stats[l1]
-			}
+func (r *Reducer) prepareYCbCrPlan(source YCbCr) *ycbcrSamplingPlan {
+	layout := ycbcrLayout{
+		width:        source.Width,
+		height:       source.Height,
+		yStride:      source.YStride,
+		chromaWidth:  source.ChromaWidth,
+		chromaHeight: source.ChromaHeight,
+		cbStride:     source.CbStride,
+		crStride:     source.CrStride,
+	}
+	if r.ycbcr.layout == layout {
+		return &r.ycbcr
+	}
+
+	chromaX := r.ycbcr.chromaX
+	if cap(chromaX) < source.Width {
+		chromaX = make([]int, source.Width)
+	} else {
+		chromaX = chromaX[:source.Width]
+	}
+	for x := range source.Width {
+		chromaX[x] = x * source.ChromaWidth / source.Width
+	}
+
+	sourceRows := r.ycbcr.sourceRows
+	if cap(sourceRows) < source.Height {
+		sourceRows = make([]sourceRowOffsets, source.Height)
+	} else {
+		sourceRows = sourceRows[:source.Height]
+	}
+	for y := range source.Height {
+		cy := y * source.ChromaHeight / source.Height
+		sourceRows[y] = sourceRowOffsets{
+			y:  y * source.YStride,
+			cb: cy * source.CbStride,
+			cr: cy * source.CrStride,
 		}
 	}
+
+	r.ycbcr = ycbcrSamplingPlan{layout: layout, chromaX: chromaX, sourceRows: sourceRows}
+	return &r.ycbcr
 }
 
 func sourceCrop(width, height int, geometry Geometry) (x, y, cropWidth, cropHeight int) {
@@ -235,15 +323,19 @@ func hasBytes(data []byte, stride, height, rowBytes int) bool {
 	if stride < 0 || height <= 0 || rowBytes < 0 {
 		return false
 	}
-	required := int64(height-1)*int64(stride) + int64(rowBytes)
-	return required >= 0 && required <= int64(len(data))
+	rows := height - 1
+	if rows > 0 && stride > (math.MaxInt-rowBytes)/rows {
+		return false
+	}
+	return rows*stride+rowBytes <= len(data)
 }
 
 // FitGeometry chooses a whole-camera grid inside maxColumns/maxRows, then
 // applies the same bounded cell budget used by New. Fill uses the entire
 // requested interior until that budget is reached.
 func FitGeometry(sourceWidth, sourceHeight, maxColumns, maxRows int, fill bool) Geometry {
-	maxColumns, maxRows = max(maxColumns, 1), max(maxRows, 1)
+	maxColumns = min(max(maxColumns, 1), MaxCells)
+	maxRows = min(max(maxRows, 1), MaxCells)
 	columns, rows := maxColumns, maxRows
 	if !fill && sourceWidth > 0 && sourceHeight > 0 {
 		aspect := float64(sourceWidth) / float64(sourceHeight)

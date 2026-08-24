@@ -92,8 +92,8 @@ func TestPrepareCellFrameAbortReusesBufferAndRejectsStaleToken(t *testing.T) {
 	if err = recorder.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if len(recorder.free) != cap(recorder.free) {
-		t.Fatalf("recycled buffers = %d, want %d", len(recorder.free), cap(recorder.free))
+	if recorder.free.available() != recorder.free.capacity() {
+		t.Fatalf("recycled buffers = %d, want %d", recorder.free.available(), recorder.free.capacity())
 	}
 }
 
@@ -115,8 +115,8 @@ func TestPrepareCellFrameSaturationAndCloseRecycle(t *testing.T) {
 	if err = recorder.Close(); !errors.Is(err, ErrQueueSaturated) {
 		t.Fatalf("close = %v, want saturation", err)
 	}
-	if len(recorder.free) != 1 {
-		t.Fatalf("free buffers after abort/close = %d, want 1", len(recorder.free))
+	if recorder.free.available() != 1 {
+		t.Fatalf("free buffers after abort/close = %d, want 1", recorder.free.available())
 	}
 
 	closed, err := New(context.Background(), &memorySink{}, Config{QueueCapacity: 1})
@@ -133,8 +133,8 @@ func TestPrepareCellFrameSaturationAndCloseRecycle(t *testing.T) {
 	if err = pending.Commit(1); !errors.Is(err, ErrClosed) {
 		t.Fatalf("commit after close = %v, want %v", err, ErrClosed)
 	}
-	if len(closed.free) != 1 {
-		t.Fatalf("close-path recycled buffers = %d, want 1", len(closed.free))
+	if closed.free.available() != 1 {
+		t.Fatalf("close-path recycled buffers = %d, want 1", closed.free.available())
 	}
 }
 
@@ -170,8 +170,8 @@ func TestPrepareCellFrameWorkerFailureDrainsEveryBuffer(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("worker failure did not stop recorder")
 	}
-	if len(recorder.free) != cap(recorder.free) {
-		t.Fatalf("failure/drain recycled %d buffers, want %d", len(recorder.free), cap(recorder.free))
+	if recorder.free.available() != recorder.free.capacity() {
+		t.Fatalf("failure/drain recycled %d buffers, want %d", recorder.free.available(), recorder.free.capacity())
 	}
 	if err = recorder.Close(); err == nil {
 		t.Fatal("sink failure was not returned by Close")
@@ -200,6 +200,34 @@ func TestPrepareCellFrameSteadyStateDoesNotAllocate(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("steady-state allocations = %.2f, want 0", allocs)
+	}
+}
+
+func TestPrepareCellFrameReusesHotBufferBeforeWarmingStallCapacity(t *testing.T) {
+	frame := solvedCellFrame(t, 24, 8, time.Nanosecond)
+	defer frame.Release()
+	recorder, err := New(context.Background(), &memorySink{}, Config{QueueCapacity: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recorder.Close()
+
+	for range 100 {
+		prepared, prepareErr := recorder.PrepareCellFrame(frame, 1, []byte("x"), 0)
+		if prepareErr != nil {
+			t.Fatal(prepareErr)
+		}
+		prepared.Abort()
+	}
+
+	warmed := 0
+	for i := range recorder.pool {
+		if cap(recorder.pool[i].cells) != 0 {
+			warmed++
+		}
+	}
+	if warmed != 1 {
+		t.Fatalf("warmed cell buffers = %d, want 1 at producer depth one", warmed)
 	}
 }
 

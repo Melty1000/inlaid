@@ -6,7 +6,7 @@ type fixedTransform struct{ color RGB }
 
 func (transform fixedTransform) TransformRGB(RGB) RGB { return transform.color }
 
-func TestSolverColorTransformChangesColorsErrorAndHash(t *testing.T) {
+func TestSolverColorTransformChangesSolvedColors(t *testing.T) {
 	input := RGB24{
 		Pix:    []byte{10, 20, 30, 10, 20, 30, 10, 20, 30, 10, 20, 30},
 		Width:  2,
@@ -36,12 +36,10 @@ func TestSolverColorTransformChangesColorsErrorAndHash(t *testing.T) {
 	if cell.Foreground() != NewRGB(1, 2, 3) || cell.Background() != NewRGB(1, 2, 3) {
 		t.Fatalf("filtered cell colors = %#06x/%#06x", cell.Foreground().Packed(), cell.Background().Packed())
 	}
-	const wantError = uint64(4 * (9*9 + 18*18 + 27*27))
-	if got := filtered.ReconstructionError(); got != wantError {
-		t.Fatalf("filtered error = %d, want %d", got, wantError)
-	}
-	if filtered.Hash() == plain.Hash() {
-		t.Fatal("transformed visual hash did not change")
+	plainCell, _ := plain.Cell(0)
+	filteredCell, _ := filtered.Cell(0)
+	if filteredCell == plainCell {
+		t.Fatal("transform did not change the solved cell")
 	}
 }
 
@@ -59,9 +57,23 @@ func TestNilTransformPreservesExistingResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Release()
-	if first.Hash() != second.Hash() || first.ReconstructionError() != second.ReconstructionError() {
+	if !framesEqual(first, second) {
 		t.Fatal("nil transform changed solver result")
 	}
+}
+
+func framesEqual(left, right *CellFrame) bool {
+	if left == nil || right == nil || left.Columns() != right.Columns() || left.Rows() != right.Rows() || left.Len() != right.Len() {
+		return false
+	}
+	for index := 0; index < left.Len(); index++ {
+		leftCell, leftOK := left.Cell(index)
+		rightCell, rightOK := right.Cell(index)
+		if !leftOK || !rightOK || leftCell != rightCell {
+			return false
+		}
+	}
+	return true
 }
 
 func TestTransformRunsAfterDeadbandChoice(t *testing.T) {

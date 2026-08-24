@@ -6,9 +6,7 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
-// Theme uses the terminal's own background. Color is reserved for readable
-// state and focus signals, following the restrained palette used in Charm's
-// Bubble Tea examples rather than painting a second dark theme over the user's.
+// Theme uses the terminal background and reserves color for state and focus.
 type Theme struct {
 	Canvas    color.Color
 	Surface   color.Color

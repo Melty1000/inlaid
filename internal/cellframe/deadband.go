@@ -51,16 +51,6 @@ func NewDeadbandPolicy(columns, rows int, cfg DeadbandConfig) (*DeadbandPolicy, 
 	}, nil
 }
 
-// Reset forgets all temporal state. The next solve is exactly the base spatial
-// solution.
-func (p *DeadbandPolicy) Reset() {
-	if p == nil {
-		return
-	}
-	p.initialized = false
-	p.sceneCut = false
-}
-
 func (p *DeadbandPolicy) prepare(source spatialSource, meta SourceMeta) {
 	p.sceneCut = false
 	if !p.initialized || p.geometryEpoch != meta.GeometryEpoch || meta.SourceSequence <= p.lastSequence {
@@ -84,18 +74,18 @@ func (p *DeadbandPolicy) prepare(source spatialSource, meta SourceMeta) {
 	}
 }
 
-func (p *DeadbandPolicy) choose(index int, quadrants [4]SampleStats, optimum Cell, optimumError uint64) (Cell, uint64) {
+func (p *DeadbandPolicy) choose(index int, quadrants [4]SampleStats, optimum Cell, optimumError uint64) Cell {
 	if p.initialized && !p.sceneCut && p.ages[index] < p.config.MaxAge {
 		previous := p.cells[index]
 		previousError := cellErrorUnchecked(previous, quadrants)
 		if previousError >= optimumError && previousError-optimumError <= p.config.MaxCellErrorIncrease {
 			p.ages[index]++
-			return previous, previousError
+			return previous
 		}
 	}
 	p.cells[index] = optimum
 	p.ages[index] = 0
-	return optimum, optimumError
+	return optimum
 }
 
 func (p *DeadbandPolicy) finish(meta SourceMeta) {

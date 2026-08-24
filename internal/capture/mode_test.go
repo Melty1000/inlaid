@@ -1,4 +1,4 @@
-package mfcapture
+package capture
 
 import "testing"
 
@@ -84,9 +84,17 @@ func TestChooseBestModeRejectsInvalidModes(t *testing.T) {
 	if got, ok := chooseBestMode([]modeCandidate{
 		{Mode: testMode(1920, 1080, 30, 0), Index: 0},
 		{Mode: testMode(1920, 1080, 1, 2), Index: 1},
-		{Mode: Mode{Width: 1920, Height: 1080, FPSNumerator: 30, FPSDenominator: 1, Format: "NV12"}, Index: 2},
+		{Mode: Mode{Width: 1920, Height: 1080, FPSNumerator: 30, FPSDenominator: 1}, Index: 2},
 	}, target); ok {
 		t.Fatalf("invalid mode selected: %+v", got)
+	}
+}
+
+func TestChooseBestModeAcceptsPlatformNativeFormats(t *testing.T) {
+	target := Mode{Width: 1920, Height: 1080, FPSNumerator: 30, FPSDenominator: 1, Format: "NV12"}
+	want := modeCandidate{Mode: target, Index: 2}
+	if got, ok := chooseBestMode([]modeCandidate{want}, target); !ok || got != want {
+		t.Fatalf("chooseBestMode = %+v, %t; want %+v, true", got, ok, want)
 	}
 }
 

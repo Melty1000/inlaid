@@ -159,7 +159,8 @@ func Start(ctx context.Context, cfg Config) (*Writer, error) {
 		return nil, fmt.Errorf("start FFmpeg: %w", err)
 	}
 	// The explicit FFmpeg thread ceilings are the primary resource guard. On
-	// Windows, also make the encoder yield CPU time to the interactive terminal.
+	// supported hosts, also make the encoder yield CPU time to the interactive
+	// terminal.
 	// Priority changes are best-effort because locked-down systems can deny the
 	// process-information handle even though encoding itself is healthy.
 	_ = lowerEncoderPriority(command.Process)

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>Inlaid</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.melty1000.inlaid</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Inlaid</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Inlaid uses the camera you choose to render live video in your terminal.</string>
+</dict>
+</plist>

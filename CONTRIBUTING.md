@@ -1,15 +1,18 @@
 # Contributing
 
-Inlaid is a Windows application. Changes to capture, layout, recording, or launch behavior should be verified in Windows Terminal, not only through headless tests.
+The published Inlaid beta is a Windows application. The current source also has experimental Linux and macOS camera backends. Changes to capture, layout, recording, or launch behavior need native terminal and camera evidence; headless tests alone are not acceptance.
+
+The current evidence and platform requirements are kept in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). The exact checks and hardware report format are in [docs/TESTING.md](docs/TESTING.md).
 
 ## Development setup
 
-Install:
+All platforms need Go 1.26 or newer and a terminal with 24-bit ANSI color.
+
+Windows development additionally uses:
 
 - Windows 10 or 11
 - PowerShell 7
 - Windows Terminal
-- Go 1.26 or newer
 
 From the repository root:
 
@@ -20,30 +23,21 @@ From the repository root:
 
 Setup uses installed Go, or `.tools\go\bin\go.exe` when already present. It checks or acquires FFmpeg, downloads Go modules, runs the test/vet checks requested by `-Check`, and builds `bin\inlaid.exe` from `cmd/inlaid`.
 
-For the normal local gate:
+Linux native camera builds need a C compiler, `pkg-config`, and libturbojpeg 2.0 or newer development files. On Ubuntu, the package names are `pkg-config` and `libturbojpeg0-dev`. macOS native camera builds need Apple Clang and the macOS SDK, normally supplied by Xcode Command Line Tools.
 
-```powershell
+The normal source gate is the same on every platform:
+
+```text
 go test ./...
 go vet ./...
-go build -trimpath -o .\bin\inlaid.exe .\cmd\inlaid
+go build -trimpath ./cmd/inlaid
 ```
+
+The Linux and macOS jobs in CI are configured for these native dependencies, but the unpublished platform work is not accepted until those jobs pass and real-camera checks are recorded.
 
 ## Hardware tests
 
-Ordinary tests do not turn on a camera. Real-camera checks are opt-in:
-
-```powershell
-$env:INLAID_MF_CAPTURE_REAL = '1'
-go test .\internal\mfcapture .\internal\cellreduce
-
-$env:INLAID_LIVE_TEST = '1'
-$env:INLAID_TEST_DEVICE = 'Your Media Foundation camera name'
-go test .\internal\dashboard
-```
-
-The low-light camera-control checks and some dashboard acceptance cases are currently specific to the Logitech C922. The three-minute capture soak additionally requires `INLAID_MF_CAPTURE_SOAK=1` and should not be part of routine runs.
-
-Unset opt-in variables after testing so later test runs do not unexpectedly open the camera.
+Ordinary tests do not open a camera. Real-camera checks are deliberately opt-in and must be run on the operating system being claimed. Follow [docs/TESTING.md](docs/TESTING.md), then submit the result with the compatibility-report issue form. A cross-compile or passing CI job is not camera verification.
 
 ## Change guidelines
 
@@ -59,7 +53,7 @@ Unset opt-in variables after testing so later test runs do not unexpectedly open
 
 ## Pull requests
 
-Describe the user-visible result, the camera/terminal environment used, and the checks you ran. Include before/after captures for visual changes, but remove private camera content and machine-specific paths first.
+Describe the user-visible result, the camera and terminal environment used, and the checks you ran. The pull-request template lists the evidence expected for each kind of change. Include before/after captures for visual changes only when they are useful, and remove private camera content and machine-specific paths first.
 
 Do not commit `recordings\`, `snapshots\`, `.tools\`, local settings, generated binaries, or recovery tapes.
 

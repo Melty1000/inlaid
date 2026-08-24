@@ -15,9 +15,8 @@ const maxSettingsBytes = 64 << 10
 // Unknown fields remain forward-compatible with the launcher settings file.
 type Settings struct {
 	Device string `json:"Device"`
-	// DeviceID is the stable Media Foundation symbolic link. Device remains the
-	// human-readable label shown in the dashboard and keeps older settings
-	// files compatible.
+	// DeviceID is the platform camera's stable identity. Device remains the
+	// human-readable label and keeps older settings files compatible.
 	DeviceID        string `json:"DeviceID,omitempty"`
 	RenderFPS       int    `json:"RenderFPS"`
 	CaptureWidth    int    `json:"CaptureWidth"`

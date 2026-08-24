@@ -28,7 +28,7 @@ func sampleInput() Input {
 		Cells: []Cell{canonicalCell(0, 1), canonicalCell(1, 2), canonicalCell(2, 3), canonicalCell(3, 4)}}
 }
 
-func makeTape(t *testing.T) (string, []Frame) {
+func makeTape(t testing.TB) (string, []Frame) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "test.celltape")
 	f, err := os.Create(path)
@@ -72,6 +72,12 @@ func TestRoundTripDeterministicDeltaHoldAndResize(t *testing.T) {
 	if got := r.Recovery(); got.ValidRecords != uint64(len(want)) || got.TailError != nil {
 		t.Fatalf("recovery = %+v", got)
 	}
+	summary := r.Summary()
+	if summary.Records != uint64(len(want)) || summary.FirstColumns != 2 || summary.FirstRows != 2 ||
+		!summary.VariableGeometry || summary.GeometryChanges != 1 || summary.LastHostNanos != 70 ||
+		summary.MaxColumns != 2 || summary.MaxRows != 2 || summary.MaxCells != 4 || string(summary.Config) != "a" {
+		t.Fatalf("summary = %+v", summary)
+	}
 	var got []Frame
 	if err = r.Iterate(context.Background(), func(f Frame) error { got = append(got, f); return nil }); err != nil {
 		t.Fatal(err)
@@ -83,6 +89,68 @@ func TestRoundTripDeterministicDeltaHoldAndResize(t *testing.T) {
 	again, err := r.Next()
 	if err != nil || !reflect.DeepEqual(again, want[0]) {
 		t.Fatalf("rewind = %#v, %v", again, err)
+	}
+}
+
+func TestIterateBorrowedDoesNotCloneCallerFrame(t *testing.T) {
+	path, want := makeTape(t)
+	r, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	seen := 0
+	err = r.IterateBorrowed(context.Background(), func(frame Frame) error {
+		if len(frame.Cells) == 0 || len(r.prev.Cells) == 0 || &frame.Cells[0] != &r.prev.Cells[0] {
+			t.Fatal("borrowed iteration cloned the replay-owned cell slice")
+		}
+		if !reflect.DeepEqual(frame, want[seen]) {
+			t.Fatalf("borrowed frame %d mismatch", seen)
+		}
+		seen++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seen != len(want) {
+		t.Fatalf("borrowed frames = %d, want %d", seen, len(want))
+	}
+}
+
+type cancelingReaderAt struct {
+	io.ReaderAt
+	cancel context.CancelFunc
+	reads  int
+}
+
+func (r *cancelingReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.ReaderAt.ReadAt(p, off)
+	r.reads++
+	if r.reads == 3 {
+		r.cancel()
+	}
+	return n, err
+}
+
+func TestValidationScanHonorsContextBetweenRecords(t *testing.T) {
+	path, _ := makeTape(t)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := parseFileHeader(raw[:FileHeaderBytes], Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := &cancelingReaderAt{ReaderAt: bytes.NewReader(raw), cancel: cancel}
+	_, _, err = scan(ctx, reader, int64(len(raw)), header)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("scan error = %v, want context cancellation", err)
+	}
+	if reader.reads != 3 {
+		t.Fatalf("scan reads after cancellation = %d, want exactly one record's three reads", reader.reads)
 	}
 }
 
@@ -418,8 +486,8 @@ func TestPeriodicSyncStallDoesNotConsumeProducerQueue(t *testing.T) {
 	if err = r.Err(); err != nil {
 		t.Fatalf("recorder failed during routine sync stall: %v", err)
 	}
-	if cap(r.free) != 2 || len(r.pool) != 2 {
-		t.Fatalf("producer bound changed: free capacity %d, pool %d", cap(r.free), len(r.pool))
+	if r.free.capacity() != 2 || len(r.pool) != 2 {
+		t.Fatalf("producer bound changed: free capacity %d, pool %d", r.free.capacity(), len(r.pool))
 	}
 
 	// A crash snapshot taken during the stalled durability call still consists
@@ -499,9 +567,9 @@ func TestPeriodicSyncFailureFailsRecorder(t *testing.T) {
 func waitForFreeBuffers(t *testing.T, r *Recorder, want int) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
-	for len(r.free) != want {
+	for r.free.available() != want {
 		if time.Now().After(deadline) {
-			t.Fatalf("free buffers = %d, want %d", len(r.free), want)
+			t.Fatalf("free buffers = %d, want %d", r.free.available(), want)
 		}
 		time.Sleep(time.Millisecond)
 	}

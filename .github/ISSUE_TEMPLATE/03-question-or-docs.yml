@@ -1,0 +1,52 @@
+name: Question or documentation
+description: Ask for setup help or report unclear documentation
+title: "[Question]: "
+labels:
+  - needs triage
+  - question
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a public issue. Remove private camera output, personal paths, identifiers, and credentials before posting. Use a private security advisory for vulnerabilities.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What do you need?
+      options:
+        - Setup help
+        - Usage question
+        - Documentation correction
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: Inlaid version or commit
+      placeholder: v0.1.0-beta.1 or exact commit
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Relevant environment
+      description: Include OS, terminal, shell, and camera model when they matter.
+      placeholder: Windows 11, Windows Terminal 1.24, PowerShell 7.6, Logitech C922
+  - type: textarea
+    id: question
+    attributes:
+      label: Question or correction
+      description: Link the documentation page and heading when reporting a documentation problem.
+    validations:
+      required: true
+  - type: textarea
+    id: attempted
+    attributes:
+      label: What have you already tried?
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Public-data check
+      options:
+        - label: I reviewed this issue and its attachments for private media, personal paths, identifiers, and credentials.
+          required: true

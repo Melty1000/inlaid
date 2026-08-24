@@ -1,16 +1,20 @@
 package taperecovery
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Melty1000/inlaid/internal/celltape"
 )
@@ -80,9 +84,26 @@ func TestPublishedTapeScanClaimAndLoad(t *testing.T) {
 	}
 }
 
+func TestClaimContextCancellationLeavesTapeUntouched(t *testing.T) {
+	directory := t.TempDir()
+	path := createClosedTape(t, directory, true, validConfig, 2)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := mustEngine(t, directory, Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = engine.ClaimContext(ctx, Candidate{Path: path, Kind: Published})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ClaimContext error = %v, want context cancellation", err)
+	}
+	assertFileBytes(t, path, before)
+}
+
 func TestPublishedClaimIsExclusiveAcrossEnginesAndProcesses(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("Windows kernel claim lease is the product contract")
+	if !supportsCooperativeClaims() {
+		t.Skip("cross-process recovery claims are not implemented on this OS")
 	}
 	directory := t.TempDir()
 	path := createClosedTape(t, directory, true, validConfig, 1)
@@ -126,6 +147,425 @@ func TestPublishedClaimIsExclusiveAcrossEnginesAndProcesses(t *testing.T) {
 	}
 }
 
+func TestClaimedTapeDetectsPathReplacement(t *testing.T) {
+	directory := t.TempDir()
+	path := createClosedTape(t, directory, true, validConfig, 1)
+	engine := mustEngine(t, directory, Options{})
+	claimed, err := engine.Claim(Candidate{Path: path, Kind: Published})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := claimed.Release(); err != nil {
+			t.Errorf("release claim: %v", err)
+		}
+	})
+	if err = claimed.VerifyIdentity(); err != nil {
+		t.Fatalf("fresh claim identity: %v", err)
+	}
+
+	replacementPath := filepath.Join(directory, "replacement.celltape")
+	replacement := []byte("different file object")
+	if err = os.WriteFile(replacementPath, replacement, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	claimedAtReplacement := claimed
+	claimedAtReplacement.Path = replacementPath
+	if err = claimedAtReplacement.VerifyIdentity(); !errors.Is(err, ErrIdentityChanged) {
+		t.Fatalf("VerifyIdentity(replaced path) error = %v, want ErrIdentityChanged", err)
+	}
+	assertFileBytes(t, replacementPath, replacement)
+
+	if runtime.GOOS == "windows" {
+		if replaceErr := os.Rename(replacementPath, path); replaceErr == nil {
+			t.Fatal("claimed path was replaced despite delete-sharing pin")
+		}
+		assertFileBytes(t, replacementPath, replacement)
+		if renameErr := os.Rename(path, path+".displaced"); renameErr == nil {
+			t.Fatal("claimed path was renamed despite delete-sharing pin")
+		}
+		if removeErr := os.Remove(path); removeErr == nil {
+			t.Fatal("claimed path was removed despite delete-sharing pin")
+		}
+		if writer, writeErr := os.OpenFile(path, os.O_WRONLY, 0); writeErr == nil {
+			_ = writer.Close()
+			t.Fatal("claimed tape accepted a second write handle")
+		}
+		if truncateErr := os.Truncate(path, celltape.FileHeaderBytes); truncateErr == nil {
+			t.Fatal("claimed tape was truncated through its pathname")
+		}
+	} else if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+		displaced := path + ".displaced"
+		if err = os.Rename(path, displaced); err != nil {
+			t.Fatal(err)
+		}
+		if err = os.Rename(replacementPath, path); err != nil {
+			t.Fatal(err)
+		}
+		if replay, openErr := claimed.OpenReplayContext(context.Background(), celltape.OpenOptions{}); !errors.Is(openErr, ErrIdentityChanged) {
+			if replay != nil {
+				_ = replay.Close()
+			}
+			t.Fatalf("OpenReplayContext(replaced path) error = %v, want ErrIdentityChanged", openErr)
+		}
+		if err = claimed.Retire(); !errors.Is(err, ErrIdentityChanged) {
+			t.Fatalf("Retire(replaced path) error = %v, want ErrIdentityChanged", err)
+		}
+		assertFileBytes(t, path, replacement)
+		claimed.Path = displaced
+		if err = claimed.Retire(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = os.Stat(displaced); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("Retire left claimed object at displaced path: %v", err)
+		}
+		assertFileBytes(t, path, replacement)
+		return
+	}
+
+	if err = claimed.Retire(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Retire left claimed path: %v", err)
+	}
+	assertFileBytes(t, replacementPath, replacement)
+	if err = claimed.VerifyIdentity(); !errors.Is(err, ErrIdentityChanged) {
+		t.Fatalf("VerifyIdentity(after Retire) error = %v, want ErrIdentityChanged", err)
+	}
+}
+
+func TestUnixClaimValidationUsesTheHeldFile(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("Unix advisory-lock identity test")
+	}
+	directory := t.TempDir()
+	originalConfig := []byte(`{"version":1,"identity":"original"}`)
+	replacementConfig := []byte(`{"version":1,"identity":"replacement"}`)
+	original := createClosedTape(t, directory, true, originalConfig, 1)
+	replacement := createClosedTape(t, directory, true, replacementConfig, 1)
+	engine := mustEngine(t, directory, Options{})
+	lease, err := engine.acquireLease(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lease.release() })
+
+	displaced := original + ".displaced"
+	if err = os.Rename(original, displaced); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Rename(replacement, original); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = engine.loadClaimContext(context.Background(), lease, original, Published, true); !errors.Is(err, ErrIdentityChanged) {
+		t.Fatalf("loadClaimContext(replaced path) error = %v, want ErrIdentityChanged", err)
+	}
+
+	tape, _, err := engine.loadClaimContext(context.Background(), lease, displaced, Published, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(tape.Config.Raw, originalConfig) {
+		t.Fatalf("claimed config = %s, want exact held object %s", tape.Config.Raw, originalConfig)
+	}
+}
+
+func TestPublishReservedPinsExactObjectAcrossProcesses(t *testing.T) {
+	directory := t.TempDir()
+	recorder, staging, _ := createOpenTape(t, directory, validConfig, 2)
+	published := filepath.Join(directory, "finished.celltape")
+	engine := mustEngine(t, directory, Options{})
+	reservation, err := engine.Reserve(staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = recorder.Close(); err != nil {
+		_ = reservation.Release()
+		t.Fatal(err)
+	}
+	claim, err := engine.PublishReserved(&reservation, published)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = claim.Release() })
+	if claim.Path != published {
+		t.Fatalf("PublishReserved path = %s, want %s", claim.Path, published)
+	}
+	if err = claim.VerifyIdentity(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(staging); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("published staging path survived: %v", err)
+	}
+	if supportsCooperativeClaims() {
+		runClaimHelper(t, directory, published, "busy")
+	}
+	replay, err := claim.OpenReplayContext(context.Background(), celltape.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = replay.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if supportsCooperativeClaims() {
+		runClaimHelper(t, directory, published, "busy")
+	}
+	if runtime.GOOS == "windows" {
+		if renameErr := os.Rename(published, published+".moved"); renameErr == nil {
+			t.Fatal("published claim allowed pathname replacement")
+		}
+		if writer, writeErr := os.OpenFile(published, os.O_WRONLY, 0); writeErr == nil {
+			_ = writer.Close()
+			t.Fatal("published claim allowed a second writer")
+		}
+	}
+	if err = claim.Release(); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err := engine.Claim(Candidate{Path: published, Kind: Published})
+	if err != nil {
+		t.Fatalf("claim after PublishReserved release: %v", err)
+	}
+	if err = reclaimed.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPublishReservedAtomicallyRefusesDestinationRace(t *testing.T) {
+	directory := t.TempDir()
+	firstRecorder, first, _ := createOpenTape(t, directory, validConfig, 1)
+	secondRecorder, second, _ := createOpenTape(t, directory, validConfig, 1)
+	published := filepath.Join(directory, "winner.celltape")
+	engine := mustEngine(t, directory, Options{})
+	firstReservation, err := engine.Reserve(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondReservation, err := engine.Reserve(second)
+	if err != nil {
+		_ = firstReservation.Release()
+		t.Fatal(err)
+	}
+	if err = errors.Join(firstRecorder.Close(), secondRecorder.Close()); err != nil {
+		_ = firstReservation.Release()
+		_ = secondReservation.Release()
+		t.Fatal(err)
+	}
+	type result struct {
+		source string
+		claim  Claim
+		err    error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for _, item := range []struct {
+		source      string
+		reservation Reservation
+	}{{first, firstReservation}, {second, secondReservation}} {
+		go func(item struct {
+			source      string
+			reservation Reservation
+		}) {
+			<-start
+			claim, publishErr := engine.PublishReserved(&item.reservation, published)
+			results <- result{source: item.source, claim: claim, err: publishErr}
+		}(item)
+	}
+	close(start)
+	one, two := <-results, <-results
+	var winner, loser result
+	if one.err == nil && two.err != nil {
+		winner, loser = one, two
+	} else if two.err == nil && one.err != nil {
+		winner, loser = two, one
+	} else {
+		_ = one.claim.Release()
+		_ = two.claim.Release()
+		t.Fatalf("concurrent PublishReserved errors = %v, %v; want exactly one success", one.err, two.err)
+	}
+	t.Cleanup(func() { _ = winner.claim.Release() })
+	if err := winner.claim.VerifyIdentity(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(loser.source); err != nil {
+		t.Fatalf("losing staging tape was not preserved: %v", err)
+	}
+	if _, err := os.Stat(winner.source); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("winning staging tape survived: %v", err)
+	}
+	if err := winner.claim.Retire(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPublishReservedDoesNotAddAContentValidationPass(t *testing.T) {
+	directory := t.TempDir()
+	staging := filepath.Join(directory, ".unvalidated.celltape.1.celltape.tmp")
+	if err := os.WriteFile(staging, bytes.Repeat([]byte{0xa5}, celltape.FileHeaderBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	published := filepath.Join(directory, "unvalidated.celltape")
+	engine := mustEngine(t, directory, Options{})
+	reservation, err := engine.Reserve(staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := engine.PublishReserved(&reservation, published)
+	if err != nil {
+		t.Fatalf("PublishReserved replayed content: %v", err)
+	}
+	defer claim.Release()
+	if replay, openErr := celltape.Open(claim.Path, celltape.OpenOptions{}); openErr == nil {
+		_ = replay.Close()
+		t.Fatal("malformed tape unexpectedly passed the exporter's validation seam")
+	}
+}
+
+func TestPublishReservedDoesNotApplyRecoverySizeLimit(t *testing.T) {
+	directory := t.TempDir()
+	staging := filepath.Join(directory, ".long-recording.celltape.1.celltape.tmp")
+	initial := bytes.Repeat([]byte{0xa5}, celltape.FileHeaderBytes)
+	if err := os.WriteFile(staging, initial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine := mustEngine(t, directory, Options{MaxFileBytes: int64(len(initial) + 1)})
+	reservation, err := engine.Reserve(staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := os.OpenFile(staging, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		_ = reservation.Release()
+		t.Fatal(err)
+	}
+	if _, err = writer.Write([]byte("continued recording")); err != nil {
+		_ = writer.Close()
+		_ = reservation.Release()
+		t.Fatal(err)
+	}
+	if err = writer.Close(); err != nil {
+		_ = reservation.Release()
+		t.Fatal(err)
+	}
+	published := filepath.Join(directory, "long-recording.celltape")
+	claim, err := engine.PublishReserved(&reservation, published)
+	if err != nil {
+		t.Fatalf("PublishReserved applied the recovery size limit: %v", err)
+	}
+	defer claim.Release()
+	info, err := os.Stat(published)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() <= engine.options.MaxFileBytes {
+		t.Fatalf("published size = %d, want greater than recovery limit %d", info.Size(), engine.options.MaxFileBytes)
+	}
+}
+
+func TestPublishReservedRefusesTruncatedReservation(t *testing.T) {
+	directory := t.TempDir()
+	staging := filepath.Join(directory, ".truncated.celltape.1.celltape.tmp")
+	if err := os.WriteFile(staging, bytes.Repeat([]byte{0xa5}, celltape.FileHeaderBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine := mustEngine(t, directory, Options{})
+	reservation, err := engine.Reserve(staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Truncate(staging, celltape.FileHeaderBytes-1); err != nil {
+		_ = reservation.Release()
+		t.Fatal(err)
+	}
+	claim, err := engine.PublishReserved(&reservation, filepath.Join(directory, "truncated.celltape"))
+	_ = claim.Release()
+	if !errors.Is(err, ErrLimit) {
+		t.Fatalf("PublishReserved truncated error = %v, want ErrLimit", err)
+	}
+	if info, statErr := os.Stat(staging); statErr != nil || info.Size() != celltape.FileHeaderBytes-1 {
+		t.Fatalf("truncated staging was not retained: info=%v err=%v", info, statErr)
+	}
+}
+
+func TestPublishReservedRefusesAReplacementAtTheStagingPath(t *testing.T) {
+	directory := t.TempDir()
+	recorder, staging, _ := createOpenTape(t, directory, validConfig, 1)
+	engine := mustEngine(t, directory, Options{})
+	reservation, err := engine.Reserve(staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = recorder.Close(); err != nil {
+		_ = reservation.Release()
+		t.Fatal(err)
+	}
+	displaced := filepath.Join(directory, "displaced-original")
+	if err = os.Rename(staging, displaced); err != nil {
+		_ = reservation.Release()
+		t.Fatal(err)
+	}
+	replacement := bytes.Repeat([]byte{0xa7}, celltape.FileHeaderBytes)
+	if err = os.WriteFile(staging, replacement, 0o600); err != nil {
+		_ = reservation.Release()
+		t.Fatal(err)
+	}
+	published := filepath.Join(directory, "must-not-publish.celltape")
+	claim, err := engine.PublishReserved(&reservation, published)
+	if !errors.Is(err, ErrIdentityChanged) {
+		_ = claim.Release()
+		t.Fatalf("PublishReserved replacement error = %v, want ErrIdentityChanged", err)
+	}
+	assertFileBytes(t, staging, replacement)
+	if info, statErr := os.Stat(displaced); statErr != nil || info.Size() <= celltape.FileHeaderBytes {
+		t.Fatalf("reserved original was not retained: info=%v err=%v", info, statErr)
+	}
+	if _, statErr := os.Stat(published); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("replacement was published: %v", statErr)
+	}
+}
+
+func TestNormalStopKeepsStagingReservedAcrossProcesses(t *testing.T) {
+	if !supportsCooperativeClaims() {
+		t.Skip("cross-process recovery claims are not implemented on this OS")
+	}
+	directory := t.TempDir()
+	recorder, staging, final := createOpenTape(t, directory, validConfig, 1)
+	engine := mustEngine(t, directory, Options{})
+	reservation, err := engine.Reserve(staging)
+	if err != nil {
+		_ = recorder.Close()
+		t.Fatal(err)
+	}
+	helper := startInteractiveClaimHelper(t, directory, staging, final)
+	helper.expect(t, "READY")
+	helper.request(t, "CLAIM_STAGING", "BUSY_STAGING")
+
+	if err = recorder.Close(); err != nil {
+		_ = reservation.Release()
+		t.Fatal(err)
+	}
+	// With the writer closed, the reservation is now the only owner. Recovery
+	// must still lose; this is the former close-to-claim race window.
+	helper.request(t, "CLAIM_STAGING", "BUSY_STAGING")
+
+	claim, err := engine.PublishReserved(&reservation, final)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = claim.Release() })
+	helper.request(t, "CLAIM_STAGING", "MISSING_STAGING")
+	helper.request(t, "CLAIM_PUBLISHED", "BUSY_PUBLISHED")
+	if err = claim.VerifyIdentity(); err != nil {
+		t.Fatal(err)
+	}
+	if err = claim.Retire(); err != nil {
+		t.Fatal(err)
+	}
+	helper.request(t, "RELEASE", "RELEASED")
+	helper.close(t)
+}
+
 func TestPublishedClaimSubprocessHelper(t *testing.T) {
 	mode := os.Getenv("INLAID_CLAIM_HELPER_MODE")
 	if mode == "" {
@@ -133,6 +573,10 @@ func TestPublishedClaimSubprocessHelper(t *testing.T) {
 	}
 	directory := os.Getenv("INLAID_CLAIM_HELPER_DIRECTORY")
 	path := os.Getenv("INLAID_CLAIM_HELPER_PATH")
+	if mode == "interactive" {
+		runInteractiveClaimHelper(t, directory, path, os.Getenv("INLAID_CLAIM_HELPER_PUBLISHED"))
+		return
+	}
 	engine := mustEngine(t, directory, Options{})
 	tape, err := engine.Claim(Candidate{Path: path, Kind: Published})
 	switch mode {
@@ -151,6 +595,164 @@ func TestPublishedClaimSubprocessHelper(t *testing.T) {
 	}
 }
 
+func runInteractiveClaimHelper(t *testing.T, directory, staging, published string) {
+	engine := mustEngine(t, directory, Options{})
+	input := bufio.NewScanner(os.Stdin)
+	output := bufio.NewWriter(os.Stdout)
+	reply := func(message string) {
+		if _, err := fmt.Fprintln(output, message); err != nil {
+			t.Fatal(err)
+		}
+		if err := output.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var held Tape
+	heldClaim := false
+	defer func() {
+		if heldClaim {
+			_ = held.Release()
+		}
+	}()
+	reply("READY")
+	for input.Scan() {
+		command := strings.TrimSpace(input.Text())
+		switch command {
+		case "CLAIM_STAGING", "CLAIM_PUBLISHED":
+			if heldClaim {
+				reply("WON_" + strings.TrimPrefix(command, "CLAIM_"))
+				continue
+			}
+			path, kind, label := staging, Staging, "STAGING"
+			if command == "CLAIM_PUBLISHED" {
+				path, kind, label = published, Published, "PUBLISHED"
+			}
+			tape, err := engine.Claim(Candidate{Path: path, Kind: kind})
+			switch {
+			case err == nil:
+				held, heldClaim = tape, true
+				reply("WON_" + label)
+			case errors.Is(err, ErrBusy):
+				reply("BUSY_" + label)
+			case errors.Is(err, os.ErrNotExist):
+				reply("MISSING_" + label)
+			default:
+				reply("ERROR_" + label + ": " + err.Error())
+			}
+		case "RELEASE":
+			if heldClaim {
+				if err := held.Release(); err != nil {
+					reply("ERROR_RELEASE: " + err.Error())
+					continue
+				}
+				heldClaim = false
+			}
+			reply("RELEASED")
+		default:
+			reply("ERROR_COMMAND: " + command)
+		}
+	}
+	if err := input.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type interactiveClaimHelper struct {
+	command *exec.Cmd
+	input   io.WriteCloser
+	output  *bufio.Scanner
+	stderr  bytes.Buffer
+	closed  bool
+}
+
+func startInteractiveClaimHelper(t *testing.T, directory, staging, published string) *interactiveClaimHelper {
+	t.Helper()
+	helper := &interactiveClaimHelper{}
+	helper.command = exec.Command(os.Args[0], "-test.run=^TestPublishedClaimSubprocessHelper$")
+	helper.command.Env = append(os.Environ(),
+		"INLAID_CLAIM_HELPER_MODE=interactive",
+		"INLAID_CLAIM_HELPER_DIRECTORY="+directory,
+		"INLAID_CLAIM_HELPER_PATH="+staging,
+		"INLAID_CLAIM_HELPER_PUBLISHED="+published,
+	)
+	input, err := helper.command.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := helper.command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper.input = input
+	helper.output = bufio.NewScanner(output)
+	helper.command.Stderr = &helper.stderr
+	if err = helper.command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { helper.stop() })
+	return helper
+}
+
+func (h *interactiveClaimHelper) request(t *testing.T, command, want string) {
+	t.Helper()
+	if _, err := fmt.Fprintln(h.input, command); err != nil {
+		t.Fatalf("write claim helper command: %v", err)
+	}
+	h.expect(t, want)
+}
+
+func (h *interactiveClaimHelper) expect(t *testing.T, want string) {
+	t.Helper()
+	result := make(chan string, 1)
+	go func() {
+		if h.output.Scan() {
+			result <- h.output.Text()
+			return
+		}
+		result <- ""
+	}()
+	select {
+	case got := <-result:
+		if got != want {
+			t.Fatalf("claim helper response = %q, want %q (stderr: %s)", got, want, h.stderr.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("claim helper timed out waiting for %q (stderr: %s)", want, h.stderr.String())
+	}
+}
+
+func (h *interactiveClaimHelper) close(t *testing.T) {
+	t.Helper()
+	if h.closed {
+		return
+	}
+	h.closed = true
+	if err := h.input.Close(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- h.command.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("claim helper exit: %v\n%s", err, h.stderr.String())
+		}
+	case <-time.After(5 * time.Second):
+		_ = h.command.Process.Kill()
+		t.Fatalf("claim helper did not exit\n%s", h.stderr.String())
+	}
+}
+
+func (h *interactiveClaimHelper) stop() {
+	if h == nil || h.closed {
+		return
+	}
+	h.closed = true
+	_ = h.input.Close()
+	_ = h.command.Process.Kill()
+	_ = h.command.Wait()
+}
+
 func runClaimHelper(t *testing.T, directory, path, mode string) {
 	t.Helper()
 	command := exec.Command(os.Args[0], "-test.run=^TestPublishedClaimSubprocessHelper$")
@@ -165,8 +767,8 @@ func runClaimHelper(t *testing.T, directory, path, mode string) {
 }
 
 func TestByteTruncatedStagingIsRepairedAndDurablyClaimed(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("mandatory writer-sharing recovery is Windows-owned")
+	if !supportsCooperativeClaims() {
+		t.Skip("staging recovery claims are not implemented on this OS")
 	}
 	directory := t.TempDir()
 	staging := createClosedTape(t, directory, false, validConfig, 2)
@@ -220,7 +822,7 @@ func TestByteTruncatedStagingIsRepairedAndDurablyClaimed(t *testing.T) {
 
 func TestLiveOpenStagingIsIgnoredUntilWriterCloses(t *testing.T) {
 	if runtime.GOOS != "windows" {
-		t.Skip("mandatory writer-sharing recovery is Windows-owned")
+		t.Skip("a raw CellTape writer does not take Inlaid's cooperative Unix reservation")
 	}
 	directory := t.TempDir()
 	final := filepath.Join(directory, "live.celltape")
@@ -265,8 +867,8 @@ func TestLiveOpenStagingIsIgnoredUntilWriterCloses(t *testing.T) {
 }
 
 func TestMalformedOversizedAndFailedClaimsNeverDeleteFiles(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("staging claims are conservatively disabled off Windows")
+	if !supportsCooperativeClaims() {
+		t.Skip("staging recovery claims are not implemented on this OS")
 	}
 	directory := t.TempDir()
 	malformed := filepath.Join(directory, ".bad.celltape.1.celltape.tmp")
@@ -328,6 +930,10 @@ func TestMalformedOversizedAndFailedClaimsNeverDeleteFiles(t *testing.T) {
 	assertFileBytes(t, destination, []byte("existing"))
 }
 
+func supportsCooperativeClaims() bool {
+	return runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "darwin"
+}
+
 func TestLoadRejectsTailWithoutModificationAndScanBoundsCount(t *testing.T) {
 	directory := t.TempDir()
 	path := createClosedTape(t, directory, true, validConfig, 1)
@@ -367,6 +973,21 @@ func TestLoadRejectsTailWithoutModificationAndScanBoundsCount(t *testing.T) {
 
 func createClosedTape(t *testing.T, directory string, publish bool, config []byte, frames int) string {
 	t.Helper()
+	recorder, path, final := createOpenTape(t, directory, config, frames)
+	if err := recorder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if publish {
+		if err := celltape.Publish(path, final); err != nil {
+			t.Fatal(err)
+		}
+		path = final
+	}
+	return path
+}
+
+func createOpenTape(t *testing.T, directory string, config []byte, frames int) (*celltape.Recorder, string, string) {
+	t.Helper()
 	final := filepath.Join(directory, fmt.Sprintf("%s-%d.celltape", uniqueName(t), testTapeSequence.Add(1)))
 	recorder, err := celltape.Create(context.Background(), final, celltape.Config{
 		QueueCapacity: 4, KeyframeInterval: 120, Compression: celltape.CompressionNone,
@@ -380,17 +1001,7 @@ func createClosedTape(t *testing.T, directory string, publish bool, config []byt
 			t.Fatal(err)
 		}
 	}
-	if err = recorder.Close(); err != nil {
-		t.Fatal(err)
-	}
-	path := recorder.StagingPath()
-	if publish {
-		if err = celltape.Publish(path, final); err != nil {
-			t.Fatal(err)
-		}
-		path = final
-	}
-	return path
+	return recorder, recorder.StagingPath(), final
 }
 
 func testInput(config []byte, stamp uint64) celltape.Input {

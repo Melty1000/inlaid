@@ -1,6 +1,7 @@
 package taperecovery
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,17 +50,9 @@ func New(directory string, options Options) (*Engine, error) {
 	return &Engine{directory: abs, options: options}, nil
 }
 
-// Directory returns the absolute recovery directory.
-func (e *Engine) Directory() string {
-	if e == nil {
-		return ""
-	}
-	return e.directory
-}
-
 // Scan returns direct regular published tapes and closed crash-left staging
-// tapes. An active Windows writer is omitted only after an exclusive-sharing
-// probe reports a sharing violation; no age heuristic is used.
+// tapes. On Unix it first finishes any interrupted retirement. A live Inlaid
+// writer is omitted through the platform claim probe; no age heuristic is used.
 func (e *Engine) Scan() ([]Candidate, error) {
 	if e == nil {
 		return nil, errors.New("taperecovery: nil engine")
@@ -85,18 +78,28 @@ func (e *Engine) Scan() ([]Candidate, error) {
 
 	candidates := make([]Candidate, 0, min(len(entries), e.options.MaxCandidates))
 	for _, entry := range entries {
+		path := filepath.Join(e.directory, entry.Name())
+		retirement, err := e.reconcileRetirement(path, entry.Name())
+		if err != nil {
+			if errors.Is(err, ErrBusy) {
+				continue
+			}
+			return nil, fmt.Errorf("taperecovery: reconcile %s: %w", entry.Name(), err)
+		}
+		if retirement {
+			continue
+		}
 		kind, ok := classifyName(entry.Name())
 		if !ok {
 			continue
 		}
-		info, err := entry.Info()
+		info, err := os.Lstat(path)
 		if err != nil {
-			return nil, fmt.Errorf("taperecovery: inspect %s: %w", entry.Name(), err)
+			return nil, fmt.Errorf("taperecovery: inspect %s: %w", filepath.Base(path), err)
 		}
 		if !info.Mode().IsRegular() {
 			continue
 		}
-		path := filepath.Join(e.directory, entry.Name())
 		if kind == Staging {
 			busy, err := exclusiveProbe(path, true)
 			if err != nil {
@@ -125,13 +128,112 @@ func (e *Engine) Scan() ([]Candidate, error) {
 	return candidates, nil
 }
 
+// Reserve acquires cooperative ownership of a staging tape while its writer is
+// still live. The reservation keeps the same object owned across writer close
+// and publication.
+func (e *Engine) Reserve(staging string) (Reservation, error) {
+	if e == nil {
+		return Reservation{}, errors.New("taperecovery: nil engine")
+	}
+	source, sourceKind, err := e.resolveCandidate(staging)
+	if err != nil {
+		return Reservation{}, err
+	}
+	if sourceKind != Staging {
+		return Reservation{}, fmt.Errorf("%w: reservation source must be a staging tape", ErrNotCandidate)
+	}
+	if err = e.validateRegularSize(source); err != nil {
+		return Reservation{}, err
+	}
+	lease, err := reserveClaim(source)
+	if err != nil {
+		return Reservation{}, err
+	}
+	if err = lease.verifyPath(source); err == nil {
+		err = e.validateClaimedSize(lease)
+	}
+	if err != nil {
+		return Reservation{}, errors.Join(err, lease.release())
+	}
+	return Reservation{Path: source, slot: &reservationSlot{claim: lease}}, nil
+}
+
+// PublishReserved consumes a live reservation, attaches a full operation
+// handle to the same file identity, and publishes that exact object. It does
+// not replay CellTape content; opening the returned Claim remains the single
+// validation pass.
+func (e *Engine) PublishReserved(reservation *Reservation, published string) (Claim, error) {
+	if e == nil {
+		return Claim{}, errors.New("taperecovery: nil engine")
+	}
+	if reservation == nil {
+		return Claim{}, fmt.Errorf("%w: staging tape is not reserved", ErrIdentityChanged)
+	}
+	source, sourceKind, err := e.resolveCandidate(reservation.Path)
+	if err != nil {
+		return Claim{}, err
+	}
+	if sourceKind != Staging {
+		return Claim{}, fmt.Errorf("%w: publish source must be a staging tape", ErrNotCandidate)
+	}
+	destination, destinationKind, err := e.resolveCandidate(published)
+	if err != nil {
+		return Claim{}, err
+	}
+	if destinationKind != Published {
+		return Claim{}, fmt.Errorf("%w: publish destination must be a .celltape", ErrNotCandidate)
+	}
+	lease, err := reservation.take()
+	if err != nil {
+		return Claim{}, err
+	}
+	keepLease := false
+	defer func() {
+		if !keepLease {
+			_ = lease.release()
+		}
+	}()
+	if err = lease.attachOperation(source); err != nil {
+		return Claim{}, fmt.Errorf("taperecovery: attach reserved tape: %w", err)
+	}
+	if err = lease.verifyPath(source); err != nil {
+		return Claim{}, err
+	}
+	if err = validateReservedSize(lease); err != nil {
+		return Claim{}, err
+	}
+	if err = lease.syncPath(source); err != nil {
+		return Claim{}, fmt.Errorf("taperecovery: sync tape before publish: %w", err)
+	}
+	if err = lease.renamePath(source, destination); err != nil {
+		return Claim{}, fmt.Errorf("taperecovery: publish claimed tape: %w", err)
+	}
+	if err = lease.verifyPath(destination); err != nil {
+		return Claim{}, fmt.Errorf("taperecovery: verify published claim: %w", err)
+	}
+	keepLease = true
+	return Claim{Path: destination, claim: lease}, nil
+}
+
 // Claim validates a candidate's complete committed prefix, validates the first
 // frame config before modification, repairs a torn tail through CellTape, and
 // durably renames a staging tape to a unique published recovery name. Files are
 // retained at their source path on every failure before the final rename.
 func (e *Engine) Claim(candidate Candidate) (Tape, error) {
+	return e.ClaimContext(context.Background(), candidate)
+}
+
+// ClaimContext is Claim with cancellation for full-tape validation and repair.
+// Cancellation releases the claim and never gets classified as tail damage.
+func (e *Engine) ClaimContext(ctx context.Context, candidate Candidate) (Tape, error) {
 	if e == nil {
 		return Tape{}, errors.New("taperecovery: nil engine")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Tape{}, err
 	}
 	path, kind, err := e.resolveCandidate(candidate.Path)
 	if err != nil {
@@ -139,9 +241,6 @@ func (e *Engine) Claim(candidate Candidate) (Tape, error) {
 	}
 	if candidate.Kind != kind {
 		return Tape{}, fmt.Errorf("%w: candidate kind changed", ErrNotCandidate)
-	}
-	if err = e.validateRegularSize(path); err != nil {
-		return Tape{}, err
 	}
 	if kind == Staging {
 		busy, probeErr := exclusiveProbe(path, true)
@@ -152,7 +251,7 @@ func (e *Engine) Claim(candidate Candidate) (Tape, error) {
 			return Tape{}, ErrBusy
 		}
 	}
-	lease, err := acquireClaim(path)
+	lease, err := e.acquireLease(path)
 	if err != nil {
 		return Tape{}, err
 	}
@@ -162,16 +261,27 @@ func (e *Engine) Claim(candidate Candidate) (Tape, error) {
 			_ = lease.release()
 		}
 	}()
-
+	verify := func(stage, currentPath string) error {
+		if verifyErr := lease.verifyPath(currentPath); verifyErr != nil {
+			return fmt.Errorf("taperecovery: %s: %w", stage, verifyErr)
+		}
+		return nil
+	}
 	// Validate the durable prefix and its config before RepairTail can truncate
 	// anything. A bad header, first record, or config therefore leaves all bytes
 	// exactly where they were.
-	tape, recovery, err := e.load(path, kind, true)
+	tape, recovery, err := e.loadClaimContext(ctx, lease, path, kind, true)
 	if err != nil {
 		return Tape{}, err
 	}
+	if err = verify("verify validated tape", path); err != nil {
+		return Tape{}, err
+	}
 	if recovery.DiscardedBytes > 0 {
-		replay, repairErr := celltape.Open(path, celltape.OpenOptions{
+		if err = verify("verify tape before repair", path); err != nil {
+			return Tape{}, err
+		}
+		replay, repairErr := lease.openReplayContext(ctx, path, celltape.OpenOptions{
 			Limits: e.options.TapeLimits, RepairTail: true,
 		})
 		if repairErr != nil {
@@ -186,42 +296,65 @@ func (e *Engine) Claim(candidate Candidate) (Tape, error) {
 		tape.Records = repaired.ValidRecords
 		tape.RepairedBytes = repaired.DiscardedBytes
 		tape.Size = repaired.ValidBytes
+		if err = verify("verify repaired tape", path); err != nil {
+			return Tape{}, err
+		}
+	}
+	if err = ctx.Err(); err != nil {
+		return Tape{}, err
 	}
 	// A crash can leave an otherwise complete committed prefix in the system
 	// cache. Flush file data before the final write-through rename so a
 	// successful Claim is a durability boundary even without a truncation.
-	if err = syncTape(path); err != nil {
+	if err = verify("verify tape before sync", path); err != nil {
+		return Tape{}, err
+	}
+	if err = lease.syncPath(path); err != nil {
 		return Tape{}, fmt.Errorf("taperecovery: sync claimed tape: %w", err)
+	}
+	if err = verify("verify synced tape", path); err != nil {
+		return Tape{}, err
+	}
+	if err = ctx.Err(); err != nil {
+		return Tape{}, err
 	}
 
 	if kind == Staging {
 		destination := e.recoveredPath(path)
-		if err = renameDurable(path, destination); err != nil {
+		if err = verify("verify tape before publish", path); err != nil {
+			return Tape{}, err
+		}
+		if err = lease.renamePath(path, destination); err != nil {
 			return Tape{}, fmt.Errorf("taperecovery: publish recovered tape: %w", err)
+		}
+		if err = verify("verify published tape", destination); err != nil {
+			return Tape{}, err
 		}
 		tape.RecoveredFrom = path
 		tape.Path = destination
 	}
-	tape.claim = lease
+	tape.Claim = Claim{Path: tape.Path, claim: lease}
 	keepLease = true
 	return tape, nil
-}
-
-func syncTape(path string) error {
-	file, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		return err
-	}
-	syncErr := file.Sync()
-	closeErr := file.Close()
-	return errors.Join(syncErr, closeErr)
 }
 
 // Load validates an already published tape without repairing or renaming it.
 // A damaged tail returns ErrDamagedTail and leaves every byte untouched.
 func (e *Engine) Load(path string) (Tape, error) {
+	return e.LoadContext(context.Background(), path)
+}
+
+// LoadContext validates a published tape without modifying it and honors
+// cancellation while scanning its committed records.
+func (e *Engine) LoadContext(ctx context.Context, path string) (Tape, error) {
 	if e == nil {
 		return Tape{}, errors.New("taperecovery: nil engine")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return Tape{}, err
 	}
 	resolved, kind, err := e.resolveCandidate(path)
 	if err != nil {
@@ -233,51 +366,76 @@ func (e *Engine) Load(path string) (Tape, error) {
 	if err = e.validateRegularSize(resolved); err != nil {
 		return Tape{}, err
 	}
-	tape, _, err := e.load(resolved, Published, false)
+	tape, _, err := e.loadContext(ctx, resolved, Published, false)
 	return tape, err
 }
 
-func (e *Engine) load(path string, kind Kind, allowTail bool) (Tape, celltape.Recovery, error) {
-	replay, err := celltape.Open(path, celltape.OpenOptions{Limits: e.options.TapeLimits})
+func (e *Engine) loadContext(ctx context.Context, path string, kind Kind, allowTail bool) (Tape, celltape.Recovery, error) {
+	replay, err := celltape.OpenContext(ctx, path, celltape.OpenOptions{Limits: e.options.TapeLimits})
 	if err != nil {
 		return Tape{}, celltape.Recovery{}, fmt.Errorf("taperecovery: open tape: %w", err)
 	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return Tape{}, celltape.Recovery{}, errors.Join(err, replay.Close())
+	}
+	return e.loadReplay(path, kind, allowTail, info.Size(), replay)
+}
+
+func (e *Engine) loadClaimContext(
+	ctx context.Context,
+	lease *claimLease,
+	path string,
+	kind Kind,
+	allowTail bool,
+) (Tape, celltape.Recovery, error) {
+	replay, err := lease.openReplayContext(ctx, path, celltape.OpenOptions{Limits: e.options.TapeLimits})
+	if err != nil {
+		return Tape{}, celltape.Recovery{}, fmt.Errorf("taperecovery: open claimed tape: %w", err)
+	}
+	size, err := lease.fileSize()
+	if err != nil {
+		return Tape{}, celltape.Recovery{}, errors.Join(err, replay.Close())
+	}
+	return e.loadReplay(path, kind, allowTail, size, replay)
+}
+
+func (e *Engine) loadReplay(
+	path string,
+	kind Kind,
+	allowTail bool,
+	size int64,
+	replay *celltape.Replay,
+) (Tape, celltape.Recovery, error) {
 	recovery := replay.Recovery()
 	if recovery.TailError != nil && !allowTail {
 		_ = replay.Close()
 		return Tape{}, recovery, fmt.Errorf("%w: %v", ErrDamagedTail, recovery.TailError)
 	}
-	first, nextErr := replay.Next()
+	summary := replay.Summary()
 	closeErr := replay.Close()
-	if nextErr != nil {
-		if errors.Is(nextErr, io.EOF) {
-			return Tape{}, recovery, ErrNoFrames
-		}
-		return Tape{}, recovery, errors.Join(fmt.Errorf("taperecovery: read first frame: %w", nextErr), closeErr)
+	if summary.Records == 0 {
+		return Tape{}, recovery, errors.Join(ErrNoFrames, closeErr)
 	}
 	if closeErr != nil {
 		return Tape{}, recovery, closeErr
 	}
-	config, err := validateVersionedConfig(first.Config, e.options.MaxConfigBytes)
-	if err != nil {
-		return Tape{}, recovery, err
-	}
-	info, err := os.Stat(path)
+	config, err := validateVersionedConfig(summary.Config, e.options.MaxConfigBytes)
 	if err != nil {
 		return Tape{}, recovery, err
 	}
 	return Tape{
-		Path:             path,
+		Claim:            Claim{Path: path},
 		SourceKind:       kind,
-		Size:             info.Size(),
+		Size:             size,
 		ValidBytes:       recovery.ValidBytes,
 		Records:          recovery.ValidRecords,
-		Columns:          first.Columns,
-		Rows:             first.Rows,
-		GeometryEpoch:    first.GeometryEpoch,
-		ConfigEpoch:      first.ConfigEpoch,
-		FirstSourceNanos: first.SourceNanos,
-		FirstHostNanos:   first.HostNanos,
+		Columns:          summary.FirstColumns,
+		Rows:             summary.FirstRows,
+		GeometryEpoch:    summary.FirstGeometryEpoch,
+		ConfigEpoch:      summary.FirstConfigEpoch,
+		FirstSourceNanos: summary.FirstSourceNanos,
+		FirstHostNanos:   summary.FirstHostNanos,
 		Config:           config,
 	}, recovery, nil
 }
@@ -334,6 +492,45 @@ func (e *Engine) validateRegularSize(path string) error {
 	}
 	if info.Size() < celltape.FileHeaderBytes || info.Size() > e.options.MaxFileBytes {
 		return fmt.Errorf("%w: tape size %d is outside %d..%d", ErrLimit, info.Size(), celltape.FileHeaderBytes, e.options.MaxFileBytes)
+	}
+	return nil
+}
+
+func (e *Engine) acquireLease(path string) (*claimLease, error) {
+	if err := e.validateRegularSize(path); err != nil {
+		return nil, err
+	}
+	lease, err := acquireClaim(path)
+	if err != nil {
+		return nil, err
+	}
+	if err = lease.verifyPath(path); err == nil {
+		err = e.validateClaimedSize(lease)
+	}
+	if err != nil {
+		return nil, errors.Join(err, lease.release())
+	}
+	return lease, nil
+}
+
+func (e *Engine) validateClaimedSize(lease *claimLease) error {
+	size, err := lease.fileSize()
+	if err != nil {
+		return err
+	}
+	if size < celltape.FileHeaderBytes || size > e.options.MaxFileBytes {
+		return fmt.Errorf("%w: claimed tape size %d is outside %d..%d", ErrLimit, size, celltape.FileHeaderBytes, e.options.MaxFileBytes)
+	}
+	return nil
+}
+
+func validateReservedSize(lease *claimLease) error {
+	size, err := lease.fileSize()
+	if err != nil {
+		return err
+	}
+	if size < celltape.FileHeaderBytes {
+		return fmt.Errorf("%w: reserved tape size %d is below %d", ErrLimit, size, celltape.FileHeaderBytes)
 	}
 	return nil
 }

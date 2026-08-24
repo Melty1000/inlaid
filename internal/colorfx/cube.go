@@ -221,7 +221,7 @@ func validateLine(line []byte) error {
 	}
 	for _, r := range string(line) {
 		if r != '\t' && unicode.IsControl(r) {
-			return fmt.Errorf("Unicode control character U+%04X is not allowed", r)
+			return fmt.Errorf("unicode control character U+%04X is not allowed", r)
 		}
 	}
 	return nil
@@ -372,7 +372,7 @@ func (p *cubeParser) parseHeader(line string, fields []string) error {
 		p.threeDRange = value
 	}
 	if (p.domainMinSeen || p.domainMaxSeen) && (p.oneDRangeSeen || p.threeDRangeSeen) {
-		return errors.New("Adobe DOMAIN headers cannot be mixed with Resolve INPUT_RANGE headers")
+		return errors.New("mixed color-cube headers: Adobe DOMAIN and Resolve INPUT_RANGE")
 	}
 	return nil
 }

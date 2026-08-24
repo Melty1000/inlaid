@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,9 +10,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Melty1000/inlaid/internal/capture"
 	"github.com/Melty1000/inlaid/internal/cellframe"
 	"github.com/Melty1000/inlaid/internal/celllive"
 )
+
+type cameraSessionStub struct {
+	closeErr error
+	closes   int
+}
+
+func (s *cameraSessionStub) close() error                  { s.closes++; return s.closeErr }
+func (*cameraSessionStub) errors() <-chan error            { return nil }
+func (*cameraSessionStub) results() <-chan celllive.Result { return nil }
+func (*cameraSessionStub) update(celllive.ViewConfig)      {}
 
 func TestPreviewQueueKeepsOnlyNewestFrameAndRejectsDisplacedLease(t *testing.T) {
 	root := t.TempDir()
@@ -74,6 +86,237 @@ func TestCameraSwitchRejectsBufferedPreviousGeneration(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("camera switch did not reject its buffered previous-generation frame")
+	}
+}
+
+func TestCameraSwitchDoesNotAccumulateSessionsAfterShutdownTimeout(t *testing.T) {
+	root := t.TempDir()
+	runtime := NewRuntime(DefaultSettings(), filepath.Join(root, "settings.json"), root)
+	t.Cleanup(func() { _ = runtime.Close() })
+	runtime.cameraGeneration.Store(1)
+	want := errors.Join(capture.ErrShutdownUncertain, errors.New("camera shutdown exceeded 100ms"))
+	failed := &cameraSessionStub{closeErr: want}
+	runtime.sessionMu.Lock()
+	runtime.session = failed
+	runtime.sessionMu.Unlock()
+
+	runtime.switchCameraContext(runtime.ctx, 1, "DEMO")
+	runtime.switchCameraContext(runtime.ctx, 1, "DEMO")
+
+	runtime.sessionMu.RLock()
+	current, shutdownErr := runtime.session, runtime.cameraShutdownErr
+	runtime.sessionMu.RUnlock()
+	if current != nil {
+		t.Fatal("a replacement capture opened after an indeterminate shutdown")
+	}
+	if failed.closes != 1 {
+		t.Fatalf("failed session close calls = %d, want 1", failed.closes)
+	}
+	if !errors.Is(shutdownErr, want) {
+		t.Fatalf("remembered shutdown error = %v, want %v", shutdownErr, want)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		select {
+		case event := <-runtime.Events():
+			if event.Kind != RuntimeCameraError || !errors.Is(event.Err, want) || !strings.Contains(event.Err.Error(), "restart Inlaid") {
+				t.Fatalf("attempt %d event = %+v, want restart-blocked camera error", attempt+1, event)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("attempt %d did not report the blocked replacement", attempt+1)
+		}
+	}
+	if err := runtime.Close(); !errors.Is(err, want) {
+		t.Fatalf("Runtime.Close error = %v, want remembered shutdown failure", err)
+	}
+}
+
+func TestCameraOpenUncertaintyRequiresRestartAndBlocksRetry(t *testing.T) {
+	root := t.TempDir()
+	runtime := NewRuntime(DefaultSettings(), filepath.Join(root, "settings.json"), root)
+	t.Cleanup(func() { _ = runtime.Close() })
+	runtime.cameraGeneration.Store(1)
+	runtime.devicesMu.Lock()
+	runtime.deviceIDs["CAMERA"] = "test-camera"
+	runtime.devicesMu.Unlock()
+	want := errors.Join(capture.ErrShutdownUncertain, errors.New("Windows camera cleanup exceeded its deadline"))
+	attempts := 0
+	runtime.startCamera = func(context.Context, capture.Config, celllive.ViewConfig) (*celllive.Session, error) {
+		attempts++
+		return nil, want
+	}
+
+	runtime.switchCameraContext(runtime.ctx, 1, "CAMERA")
+	runtime.switchCameraContext(runtime.ctx, 1, "CAMERA")
+
+	if attempts != 1 {
+		t.Fatalf("camera open attempts = %d, want one native attempt before restart block", attempts)
+	}
+	runtime.sessionMu.RLock()
+	shutdownErr := runtime.cameraShutdownErr
+	runtime.sessionMu.RUnlock()
+	if !errors.Is(shutdownErr, want) {
+		t.Fatalf("remembered open cleanup error = %v, want %v", shutdownErr, want)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		select {
+		case event := <-runtime.Events():
+			if event.Kind != RuntimeCameraError || !errors.Is(event.Err, want) || !errors.Is(event.Err, errCameraRestartRequired) || !strings.Contains(event.Err.Error(), "restart Inlaid") {
+				t.Fatalf("attempt %d event = %+v, want restart-required camera error", attempt+1, event)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("attempt %d did not report restart-required cleanup uncertainty", attempt+1)
+		}
+	}
+}
+
+func TestSelectingNewCameraCancelsInFlightOpen(t *testing.T) {
+	root := t.TempDir()
+	runtime := NewRuntime(DefaultSettings(), filepath.Join(root, "settings.json"), root)
+	t.Cleanup(func() { _ = runtime.Close() })
+	runtime.devicesMu.Lock()
+	runtime.deviceIDs["CAMERA"] = "test-camera"
+	runtime.devicesMu.Unlock()
+	started := make(chan struct{})
+	canceled := make(chan error, 1)
+	runtime.startCamera = func(ctx context.Context, _ capture.Config, _ celllive.ViewConfig) (*celllive.Session, error) {
+		close(started)
+		<-ctx.Done()
+		canceled <- ctx.Err()
+		return nil, ctx.Err()
+	}
+
+	runtime.SelectCamera("CAMERA")
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first camera open did not start")
+	}
+	runtime.SelectCamera("DEMO")
+	select {
+	case err := <-canceled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("first camera context error = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("new selection did not cancel the in-flight camera open")
+	}
+
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case event := <-runtime.Events():
+			if event.Kind == RuntimeCameraError {
+				t.Fatalf("stale camera open published an error: %v", event.Err)
+			}
+			if event.Kind == RuntimeCameraLive && event.Device == "DEMO" {
+				return
+			}
+		case <-deadline:
+			t.Fatal("replacement camera did not become live")
+		}
+	}
+}
+
+func TestStaleCameraLifetimeCannotCancelLatestSelection(t *testing.T) {
+	root := t.TempDir()
+	runtime := NewRuntime(DefaultSettings(), filepath.Join(root, "settings.json"), root)
+	t.Cleanup(func() { _ = runtime.Close() })
+	staleGeneration := runtime.advanceCameraGeneration()
+	latestGeneration := runtime.advanceCameraGeneration()
+	latest, ok := runtime.replaceCameraLifetime(latestGeneration)
+	if !ok {
+		t.Fatal("latest camera generation was rejected")
+	}
+	stale, ok := runtime.replaceCameraLifetime(staleGeneration)
+	if ok {
+		t.Fatal("stale camera generation replaced the latest lifetime")
+	}
+	select {
+	case <-stale.Done():
+	default:
+		t.Fatal("rejected stale camera context was not canceled")
+	}
+	select {
+	case <-latest.Done():
+		t.Fatal("stale camera generation canceled the latest lifetime")
+	default:
+	}
+}
+
+func TestCameraSwitchRetriesAfterCompletedShutdownWarning(t *testing.T) {
+	root := t.TempDir()
+	runtime := NewRuntime(DefaultSettings(), filepath.Join(root, "settings.json"), root)
+	t.Cleanup(func() { _ = runtime.Close() })
+	runtime.cameraGeneration.Store(1)
+	closed := &cameraSessionStub{closeErr: errors.New("flush callback timed out after ownership was released")}
+	runtime.sessionMu.Lock()
+	runtime.session = closed
+	runtime.sessionMu.Unlock()
+
+	runtime.switchCameraContext(runtime.ctx, 1, "DEMO")
+
+	runtime.sessionMu.RLock()
+	current, shutdownErr := runtime.session, runtime.cameraShutdownErr
+	runtime.sessionMu.RUnlock()
+	if closed.closes != 1 {
+		t.Fatalf("completed session close calls = %d, want 1", closed.closes)
+	}
+	if shutdownErr != nil {
+		t.Fatalf("completed shutdown warning blocked retry: %v", shutdownErr)
+	}
+	if current == nil || current == closed {
+		t.Fatal("completed shutdown warning did not install a replacement capture")
+	}
+}
+
+func TestRuntimeCloseReturnsCompletedCameraCleanupWarning(t *testing.T) {
+	root := t.TempDir()
+	runtime := NewRuntime(DefaultSettings(), filepath.Join(root, "settings.json"), root)
+	want := errors.New("camera controls could not be restored")
+	session := &cameraSessionStub{closeErr: want}
+	runtime.sessionMu.Lock()
+	runtime.session = session
+	runtime.sessionMu.Unlock()
+
+	if err := runtime.Close(); !errors.Is(err, want) {
+		t.Fatalf("Runtime.Close error = %v, want completed cleanup warning %v", err, want)
+	}
+	if session.closes != 1 {
+		t.Fatalf("session close calls = %d, want 1", session.closes)
+	}
+}
+
+func TestCameraSwitchStillReplacesSessionAfterCleanShutdown(t *testing.T) {
+	root := t.TempDir()
+	runtime := NewRuntime(DefaultSettings(), filepath.Join(root, "settings.json"), root)
+	t.Cleanup(func() { _ = runtime.Close() })
+	runtime.cameraGeneration.Store(1)
+	old := &cameraSessionStub{}
+	runtime.sessionMu.Lock()
+	runtime.session = old
+	runtime.sessionMu.Unlock()
+
+	runtime.switchCameraContext(runtime.ctx, 1, "DEMO")
+
+	runtime.sessionMu.RLock()
+	current, shutdownErr := runtime.session, runtime.cameraShutdownErr
+	runtime.sessionMu.RUnlock()
+	if old.closes != 1 {
+		t.Fatalf("old session close calls = %d, want 1", old.closes)
+	}
+	if current == nil || current == old {
+		t.Fatal("clean shutdown did not install the replacement capture")
+	}
+	if shutdownErr != nil {
+		t.Fatalf("clean switch remembered shutdown error: %v", shutdownErr)
+	}
+	select {
+	case event := <-runtime.Events():
+		if event.Kind != RuntimeCameraLive || event.Device != "DEMO" {
+			t.Fatalf("switch event = %+v, want DEMO live", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("clean switch did not report the replacement live")
 	}
 }
 
@@ -204,7 +447,7 @@ func TestInstallSessionReconcilesViewChangedWhileCameraOpened(t *testing.T) {
 		Symbol: "quarter", Detail: "auto", TargetFPS: 30,
 	}
 	runtime.viewMu.Unlock()
-	runtime.installSession(session)
+	runtime.installSession(&cellLiveCameraSession{session: session})
 
 	deadline := time.NewTimer(2 * time.Second)
 	defer deadline.Stop()

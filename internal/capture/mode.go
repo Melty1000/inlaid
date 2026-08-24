@@ -1,6 +1,9 @@
-package mfcapture
+package capture
 
-import "math/bits"
+import (
+	"math/bits"
+	"strings"
+)
 
 type modeCandidate struct {
 	Mode  Mode
@@ -22,7 +25,8 @@ func chooseBestMode(candidates []modeCandidate, target Mode) (modeCandidate, boo
 }
 
 func validCaptureMode(mode Mode) bool {
-	if mode.Format != "MJPG" || mode.Width < 1 || mode.Height < 1 || mode.Width > maxDimension || mode.Height > maxDimension || mode.FPSNumerator == 0 || mode.FPSDenominator == 0 {
+	format := strings.TrimSpace(mode.Format)
+	if format == "" || len(format) > 16 || mode.Width < 1 || mode.Height < 1 || mode.Width > maxDimension || mode.Height > maxDimension || mode.FPSNumerator == 0 || mode.FPSDenominator == 0 {
 		return false
 	}
 	rateNumerator, rateDenominator := uint64(mode.FPSNumerator), uint64(mode.FPSDenominator)
