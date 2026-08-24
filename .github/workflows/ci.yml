@@ -119,7 +119,7 @@ jobs:
 
       - name: Verify camera privacy declaration
         run: |
-          xcrun otool-classic -X -s __TEXT __info_plist bin/inlaid | xxd -r -p > embedded-info.plist
+          xcrun segedit bin/inlaid -extract __TEXT __info_plist embedded-info.plist
           plutil -lint embedded-info.plist
           usage="$(plutil -extract NSCameraUsageDescription raw -o - embedded-info.plist)"
           test "$usage" = "Inlaid uses the camera you choose to render live video in your terminal."
