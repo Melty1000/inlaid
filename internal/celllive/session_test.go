@@ -2,14 +2,17 @@ package celllive
 
 import (
 	"context"
-	"math"
+	"os"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Melty1000/inlaid/internal/capture"
 	"github.com/Melty1000/inlaid/internal/cellframe"
 	"github.com/Melty1000/inlaid/internal/cellreduce"
-	"github.com/Melty1000/inlaid/internal/mfcapture"
 )
 
 func TestSyntheticProducesCanonicalANSIAndCloses(t *testing.T) {
@@ -103,6 +106,7 @@ func TestPipelineStateRebuildsSolverWhenOnlyModeChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	epoch := state.geometryEpoch
+	reducer := state.reducer
 
 	soft := detailed
 	soft.Mode = cellframe.ModeSoft
@@ -112,8 +116,39 @@ func TestPipelineStateRebuildsSolverWhenOnlyModeChanges(t *testing.T) {
 	if err := state.update(soft, 640, 480); err != nil {
 		t.Fatal(err)
 	}
-	if state.solver.Mode() != cellframe.ModeSoft || state.geometryEpoch != epoch+1 {
-		t.Fatalf("mode=%v epoch=%d, want soft epoch %d", state.solver.Mode(), state.geometryEpoch, epoch+1)
+	if state.solver.Mode() != cellframe.ModeSoft || state.geometryEpoch != epoch {
+		t.Fatalf("mode=%v epoch=%d, want soft at unchanged geometry epoch %d", state.solver.Mode(), state.geometryEpoch, epoch)
+	}
+	if state.reducer != reducer {
+		t.Fatal("mode-only update rebuilt the geometry-bound reducer")
+	}
+	resized := soft
+	resized.MaxColumns--
+	if err := state.update(resized, 640, 480); err != nil {
+		t.Fatal(err)
+	}
+	if state.geometryEpoch != epoch+1 {
+		t.Fatalf("resized epoch=%d, want %d", state.geometryEpoch, epoch+1)
+	}
+}
+
+func BenchmarkPipelineStateModeOnlyUpdate240x67(b *testing.B) {
+	state := pipelineState{}
+	view := normalizeView(ViewConfig{MaxColumns: 240, MaxRows: 67, Fill: true, Mode: cellframe.ModeDetailed})
+	if err := state.update(view, 480, 270); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		if index&1 == 0 {
+			view.Mode = cellframe.ModeSoft
+		} else {
+			view.Mode = cellframe.ModeDetailed
+		}
+		if err := state.update(view, 480, 270); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -137,15 +172,61 @@ func TestSyntheticStatisticsReuseBoundedBuffer(t *testing.T) {
 	}
 }
 
-func TestNormalizeViewBoundsForgedResizeBeforeGeometry(t *testing.T) {
-	view := normalizeView(ViewConfig{MaxColumns: math.MaxInt, MaxRows: 1})
-	if view.MaxColumns != cellreduce.MaxCells {
-		t.Fatalf("max columns = %d, want %d", view.MaxColumns, cellreduce.MaxCells)
+func TestPipelineCoreThirtyFPSBoundedHeapSoak(t *testing.T) {
+	secondsText := os.Getenv("INLAID_PIPELINE_SOAK_SECONDS")
+	if secondsText == "" {
+		t.Skip("set INLAID_PIPELINE_SOAK_SECONDS to run the deterministic 30 FPS heap soak")
 	}
-	geometry := cellreduce.FitGeometry(1920, 1080, view.MaxColumns, view.MaxRows, view.Fill)
-	if geometry.Columns*geometry.Rows > cellreduce.MaxCells {
-		t.Fatalf("geometry exceeds bound: %+v", geometry)
+	seconds, err := strconv.Atoi(secondsText)
+	if err != nil || seconds <= 0 || seconds > 24*60*60 {
+		t.Fatalf("INLAID_PIPELINE_SOAK_SECONDS=%q must be an integer from 1 through 86400", secondsText)
 	}
+
+	state := pipelineState{}
+	view := normalizeView(ViewConfig{MaxColumns: 240, MaxRows: 67, Fill: true, Mode: cellframe.ModeDetailed})
+	if err := state.update(view, 480, 270); err != nil {
+		t.Fatal(err)
+	}
+	source := cellreduce.YCbCr{
+		Y: make([]byte, 480*270), Cb: make([]byte, 240*270), Cr: make([]byte, 240*270),
+		Width: 480, Height: 270, YStride: 480,
+		ChromaWidth: 240, ChromaHeight: 270, CbStride: 240, CrStride: 240,
+	}
+	process := func(sequence uint64) {
+		source.Y[0] = byte(sequence)
+		statistics, reduceErr := state.reducer.ReduceYCbCr(source)
+		if reduceErr != nil {
+			t.Fatal(reduceErr)
+		}
+		frame, solveErr := state.solver.SolveStatistics(statistics, cellframe.SourceMeta{
+			SourceSequence: sequence,
+			PTS:            time.Duration(sequence) * time.Second / 30,
+		})
+		if solveErr != nil {
+			t.Fatal(solveErr)
+		}
+		frame.Release()
+	}
+	process(0) // Populate every reusable plan and pool before measuring.
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	frames := seconds * 30
+	for index := 1; index <= frames; index++ {
+		process(uint64(index))
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	runtime.KeepAlive(&state)
+	runtime.KeepAlive(source)
+
+	const retainedHeapTolerance = 2 << 20
+	if after.HeapAlloc > before.HeapAlloc+retainedHeapTolerance {
+		t.Fatalf("retained heap grew by %d bytes after %d frames", after.HeapAlloc-before.HeapAlloc, frames)
+	}
+	t.Logf("%d logical frames (%s at 30 FPS): retained heap delta=%d bytes, live-object delta=%d",
+		frames, time.Duration(seconds)*time.Second, int64(after.HeapAlloc)-int64(before.HeapAlloc),
+		int64(after.Mallocs-after.Frees)-int64(before.Mallocs-before.Frees))
 }
 
 type temporaryTestError struct{}
@@ -159,7 +240,7 @@ func TestPublishErrorPreservesTemporaryClassificationAndIsBounded(t *testing.T) 
 		session.publishError(temporaryTestError{})
 	}
 	got := <-session.Errors
-	if !mfcapture.IsTemporary(got) {
+	if !capture.IsTemporary(got) {
 		t.Fatalf("temporary classification was lost: %v", got)
 	}
 	session.finish()
@@ -173,7 +254,7 @@ func TestPublishErrorPrioritizesTerminalFailureOverQueuedTransientNoise(t *testi
 
 	foundTerminal := false
 	for range 2 {
-		if got := <-session.Errors; !mfcapture.IsTemporary(got) {
+		if got := <-session.Errors; !capture.IsTemporary(got) {
 			foundTerminal = true
 		}
 	}
@@ -216,31 +297,126 @@ func TestPublishReleasesCanonicalFrameEvictedByLatestQueue(t *testing.T) {
 
 type planarTestDecoder struct{}
 
-func (planarTestDecoder) Decode(_ context.Context, packet mfcapture.Packet) (*mfcapture.Frame, error) {
+func (planarTestDecoder) Decode(_ context.Context, packet capture.Packet) (*capture.Frame, error) {
 	y := make([]byte, 16)
 	cb := make([]byte, 16)
 	cr := make([]byte, 16)
 	for index := range y {
 		y[index], cb[index], cr[index] = 128, 128, 128
 	}
-	return &mfcapture.Frame{
-		Y:                    mfcapture.Plane{Pix: y, Width: 4, Height: 4, Stride: 4},
-		Cb:                   mfcapture.Plane{Pix: cb, Width: 4, Height: 4, Stride: 4},
-		Cr:                   mfcapture.Plane{Pix: cr, Width: 4, Height: 4, Stride: 4},
-		ReaderTimestamp100ns: packet.ReaderTimestamp100ns,
-		SampleTimestamp100ns: packet.SampleTimestamp100ns,
+	return &capture.Frame{
+		Layout: capture.PixelLayoutPlanarYCbCr,
+		Range:  capture.ColorRangeFull,
+		Matrix: capture.ColorMatrixBT601,
+		Y:      capture.Plane{Pix: y, Width: 4, Height: 4, Stride: 4},
+		Cb:     capture.Plane{Pix: cb, Width: 4, Height: 4, Stride: 4},
+		Cr:     capture.Plane{Pix: cr, Width: 4, Height: 4, Stride: 4},
+		PTS:    packet.PTS,
 	}, nil
 }
 
 func (planarTestDecoder) Close() error { return nil }
 
-func TestMediaPipelineReportsTemporaryErrorAndContinuesToFrame(t *testing.T) {
-	source, err := mfcapture.NewSyntheticSource(2)
+type shutdownBlockingDecoder struct {
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+}
+
+func TestReduceCameraFrameUsesNV12ColorMetadata(t *testing.T) {
+	reducer, err := cellreduce.New(cellreduce.Geometry{Columns: 1, Rows: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	capture, err := mfcapture.StartPipeline(context.Background(), mfcapture.Config{
-		Width: 4, Height: 4, FPS: 30, Lowres: 1,
+	statistics, err := reduceCameraFrame(reducer, &capture.Frame{
+		Layout: capture.PixelLayoutNV12,
+		Range:  capture.ColorRangeVideo,
+		Matrix: capture.ColorMatrixBT601,
+		Y:      capture.Plane{Pix: []byte{81, 81, 81, 81}, Width: 2, Height: 2, Stride: 2},
+		UV:     capture.Plane{Pix: []byte{90, 240}, Width: 1, Height: 1, Stride: 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, sample := range statistics.Quadrants {
+		if sample.Count != 1 || sample.SumR < 253 || sample.SumG > 1 || sample.SumB > 1 {
+			t.Fatalf("quadrant %d = %+v, want red", index, sample)
+		}
+	}
+}
+
+func TestReduceCameraFrameRejectsMissingColorMetadata(t *testing.T) {
+	reducer, err := cellreduce.New(cellreduce.Geometry{Columns: 1, Rows: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = reduceCameraFrame(reducer, &capture.Frame{
+		Layout: capture.PixelLayoutNV12,
+		Y:      capture.Plane{Pix: make([]byte, 4), Width: 2, Height: 2, Stride: 2},
+		UV:     capture.Plane{Pix: make([]byte, 2), Width: 1, Height: 1, Stride: 2},
+	})
+	if err == nil {
+		t.Fatal("missing color metadata was accepted")
+	}
+}
+
+func (d *shutdownBlockingDecoder) Decode(context.Context, capture.Packet) (*capture.Frame, error) {
+	d.startedOnce.Do(func() { close(d.started) })
+	<-d.release
+	return nil, nil
+}
+
+func (d *shutdownBlockingDecoder) Close() error {
+	<-d.release
+	return nil
+}
+
+func TestMediaSessionClosePropagatesNativeShutdownTimeout(t *testing.T) {
+	source, err := capture.NewSyntheticSource(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := &shutdownBlockingDecoder{started: make(chan struct{}), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(decoder.release) }) })
+	cfg := capture.DefaultConfig()
+	cfg.CloseTimeout = 100 * time.Millisecond
+	nativeSession, err := capture.StartPipeline(context.Background(), cfg, source, decoder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	session := newSession(cancel)
+	go session.runCamera(ctx, nativeSession, normalizeView(ViewConfig{
+		MaxColumns: 2, MaxRows: 2, Fill: true, TargetFPS: 30,
+	}))
+	if err := source.Push(capture.Packet{Data: []byte{1}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-decoder.started:
+	case <-time.After(time.Second):
+		t.Fatal("decoder did not accept the packet")
+	}
+
+	started := time.Now()
+	err = session.Close()
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("Close took %s after native shutdown stalled", elapsed)
+	}
+	if err == nil || !strings.Contains(err.Error(), "shutdown exceeded") {
+		t.Fatalf("Close error = %v, want propagated native shutdown timeout", err)
+	}
+	releaseOnce.Do(func() { close(decoder.release) })
+}
+
+func TestMediaPipelineReportsTemporaryErrorAndContinuesToFrame(t *testing.T) {
+	source, err := capture.NewSyntheticSource(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nativeSession, err := capture.StartPipeline(context.Background(), capture.Config{
+		Width: 4, Height: 4, FPS: 30, Downsample: 2,
 		QueueDepth: 1, PacketQueueDepth: 1, MaxPacketBytes: 1024,
 		MaxFrameBytes: 1024, MaxPoolBytes: 1 << 20, MaxConsecutiveErrors: 3,
 		CloseTimeout: 100 * time.Millisecond,
@@ -250,7 +426,7 @@ func TestMediaPipelineReportsTemporaryErrorAndContinuesToFrame(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	session := newSession(cancel)
-	go session.runMediaFoundation(ctx, capture, normalizeView(ViewConfig{
+	go session.runCamera(ctx, nativeSession, normalizeView(ViewConfig{
 		MaxColumns: 2, MaxRows: 2, Fill: true, TargetFPS: 30,
 	}))
 	defer session.Close()
@@ -258,7 +434,7 @@ func TestMediaPipelineReportsTemporaryErrorAndContinuesToFrame(t *testing.T) {
 	if err := source.Fail(temporaryTestError{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := source.Push(mfcapture.Packet{Data: []byte{1}}); err != nil {
+	if err := source.Push(capture.Packet{Data: []byte{1}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -268,7 +444,7 @@ func TestMediaPipelineReportsTemporaryErrorAndContinuesToFrame(t *testing.T) {
 	for !gotTemporary || !gotFrame {
 		select {
 		case got := <-session.Errors:
-			if mfcapture.IsTemporary(got) {
+			if capture.IsTemporary(got) {
 				gotTemporary = true
 			}
 		case result := <-session.Results:

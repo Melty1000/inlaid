@@ -22,58 +22,116 @@ type Recovery struct {
 	TailError      error
 }
 
+// Summary is metadata collected while Open validates the committed prefix.
+// Config is the first committed frame's configuration. No cell backing escapes
+// the validation pass, so callers can plan recovery/export without replaying
+// the tape merely to rediscover its shape and duration.
+type Summary struct {
+	Records                                         uint64
+	FirstColumns, FirstRows                         uint32
+	FirstGeometryEpoch, FirstConfigEpoch            uint64
+	FirstSourceNanos, FirstHostNanos, LastHostNanos uint64
+	Config                                          []byte
+	VariableGeometry                                bool
+	GeometryChanges                                 uint64
+	MaxColumns, MaxRows, MaxCells                   uint32
+}
+
 // Replay is a deterministic cursor over the CRC-checked committed prefix.
 type Replay struct {
 	file     *os.File
 	header   fileHeader
 	recovery Recovery
+	summary  Summary
 	offset   int64
 	prev     Frame
 }
 
 func Open(path string, opts OpenOptions) (*Replay, error) {
+	return OpenContext(context.Background(), path, opts)
+}
+
+// OpenContext validates a tape's committed prefix while honoring cancellation.
+// Cancellation is never treated as a damaged tail and therefore never repairs
+// or truncates the file.
+func OpenContext(ctx context.Context, path string, opts OpenOptions) (*Replay, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	mode := os.O_RDONLY
 	if opts.RepairTail {
 		mode = os.O_RDWR
 	}
-	f, err := os.OpenFile(path, mode, 0)
+	f, err := openReplayFile(path, mode)
 	if err != nil {
 		return nil, err
 	}
-	info, err := f.Stat()
+	return OpenOwnedFileContext(ctx, f, opts)
+}
+
+// OpenOwnedFileContext validates an already-open tape and takes ownership of
+// file. Replay.Close closes it. This lets a recovery claim use a duplicated
+// handle without reopening mutable content by pathname.
+func OpenOwnedFileContext(ctx context.Context, file *os.File, opts OpenOptions) (_ *Replay, err error) {
+	if file == nil {
+		return nil, errors.New("celltape: open file is required")
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, file.Close())
+		}
+	}()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
 	if err != nil {
-		f.Close()
 		return nil, err
 	}
 	if info.Size() < FileHeaderBytes {
-		f.Close()
 		return nil, fmt.Errorf("%w: truncated file header", ErrCorrupt)
 	}
 	hb := make([]byte, FileHeaderBytes)
-	if _, err = f.ReadAt(hb, 0); err != nil {
-		f.Close()
+	if _, err = file.ReadAt(hb, 0); err != nil {
 		return nil, err
 	}
 	h, err := parseFileHeader(hb, opts.Limits)
 	if err != nil {
-		f.Close()
 		return nil, err
 	}
-	recovery := scan(f, info.Size(), h)
+	recovery, summary, scanErr := scan(ctx, file, info.Size(), h)
+	if scanErr != nil {
+		return nil, scanErr
+	}
 	if opts.RepairTail && recovery.DiscardedBytes > 0 {
-		if err = f.Truncate(recovery.ValidBytes); err != nil {
-			f.Close()
+		if err = ctx.Err(); err != nil {
 			return nil, err
 		}
-		if err = f.Sync(); err != nil {
-			f.Close()
+		if err = file.Truncate(recovery.ValidBytes); err != nil {
+			return nil, err
+		}
+		if err = file.Sync(); err != nil {
 			return nil, err
 		}
 	}
-	return &Replay{file: f, header: h, recovery: recovery, offset: FileHeaderBytes}, nil
+	return &Replay{file: file, header: h, recovery: recovery, summary: summary, offset: FileHeaderBytes}, nil
 }
 
 func (r *Replay) Recovery() Recovery { return r.recovery }
+func (r *Replay) Summary() Summary {
+	if r == nil {
+		return Summary{}
+	}
+	summary := r.summary
+	summary.Config = append([]byte(nil), summary.Config...)
+	return summary
+}
 func (r *Replay) Close() error {
 	if r == nil || r.file == nil {
 		return nil
@@ -88,6 +146,14 @@ func (r *Replay) Rewind() {
 }
 
 func (r *Replay) Next() (Frame, error) {
+	f, err := r.nextBorrowed()
+	if err != nil {
+		return Frame{}, err
+	}
+	return cloneFrame(f), nil
+}
+
+func (r *Replay) nextBorrowed() (Frame, error) {
 	if r == nil || r.file == nil {
 		return Frame{}, ErrClosed
 	}
@@ -100,7 +166,7 @@ func (r *Replay) Next() (Frame, error) {
 	}
 	r.offset += n
 	r.prev = f
-	return cloneFrame(f), nil
+	return f, nil
 }
 
 // Iterate is the encoder-facing API. It includes duplicate holds and explicit boundaries.
@@ -124,18 +190,100 @@ func (r *Replay) Iterate(ctx context.Context, yield func(Frame) error) error {
 	}
 }
 
-func scan(r io.ReaderAt, size int64, h fileHeader) Recovery {
+// IterateBorrowed avoids the defensive cell/config clone made by Next. Slice
+// fields in the yielded Frame are read-only and valid only until yield returns.
+// Callers that need to retain a frame must copy it themselves.
+func (r *Replay) IterateBorrowed(ctx context.Context, yield func(Frame) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		f, err := r.nextBorrowed()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err = yield(f); err != nil {
+			return err
+		}
+	}
+}
+
+// IterateBorrowedIntervals yields each state with the next state's host time.
+// The current frame is read-only and valid only until yield returns. hasNext is
+// false for the final state.
+func (r *Replay) IterateBorrowedIntervals(ctx context.Context, yield func(frame Frame, nextHostNanos uint64, hasNext bool) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	current, err := r.nextBorrowed()
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		next, nextErr := r.nextBorrowed()
+		if errors.Is(nextErr, io.EOF) {
+			return yield(current, 0, false)
+		}
+		if nextErr != nil {
+			return nextErr
+		}
+		if err = yield(current, next.HostNanos, true); err != nil {
+			return err
+		}
+		current = next
+	}
+}
+
+func scan(ctx context.Context, r io.ReaderAt, size int64, h fileHeader) (Recovery, Summary, error) {
 	off := int64(FileHeaderBytes)
 	var prev Frame
 	var records uint64
+	var summary Summary
 	for off < size {
+		if err := ctx.Err(); err != nil {
+			return Recovery{}, Summary{}, err
+		}
 		frame, n, err := readFrameAt(r, off, h, prev)
 		if err != nil {
-			return Recovery{ValidBytes: off, ValidRecords: records, DiscardedBytes: size - off, TailError: err}
+			return Recovery{ValidBytes: off, ValidRecords: records, DiscardedBytes: size - off, TailError: err}, summary, nil
 		}
+		if records == 0 {
+			summary.FirstColumns = frame.Columns
+			summary.FirstRows = frame.Rows
+			summary.FirstGeometryEpoch = frame.GeometryEpoch
+			summary.FirstConfigEpoch = frame.ConfigEpoch
+			summary.FirstSourceNanos = frame.SourceNanos
+			summary.FirstHostNanos = frame.HostNanos
+			summary.Config = append([]byte(nil), frame.Config...)
+		} else if frame.Columns != prev.Columns || frame.Rows != prev.Rows {
+			summary.VariableGeometry = true
+			summary.GeometryChanges++
+		}
+		summary.Records++
+		summary.LastHostNanos = frame.HostNanos
+		summary.MaxColumns = max(summary.MaxColumns, frame.Columns)
+		summary.MaxRows = max(summary.MaxRows, frame.Rows)
+		summary.MaxCells = max(summary.MaxCells, frame.Columns*frame.Rows)
 		prev, off, records = frame, off+n, records+1
 	}
-	return Recovery{ValidBytes: off, ValidRecords: records}
+	return Recovery{ValidBytes: off, ValidRecords: records}, summary, nil
 }
 
 func readFrameAt(r io.ReaderAt, off int64, h fileHeader, prev Frame) (Frame, int64, error) {

@@ -54,6 +54,58 @@ type reservation struct {
 	generation uint64
 }
 
+// bufferPool is a bounded LIFO free list. Reusing the hottest buffer keeps the
+// retained cell backing proportional to the producer's actual high-water
+// depth; a FIFO free channel eventually warmed every configured stall slot
+// even when the disk worker was never more than one frame behind.
+type bufferPool struct {
+	mu        sync.Mutex
+	free      []*jobBuffer
+	maximum   int
+	highWater int
+}
+
+func (p *bufferPool) take() *jobBuffer {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.free) == 0 {
+		return nil
+	}
+	last := len(p.free) - 1
+	buffer := p.free[last]
+	p.free[last] = nil
+	p.free = p.free[:last]
+	p.highWater = max(p.highWater, p.maximum-len(p.free))
+	return buffer
+}
+
+func (p *bufferPool) put(buffer *jobBuffer) {
+	if buffer == nil {
+		return
+	}
+	p.mu.Lock()
+	p.free = append(p.free, buffer)
+	p.mu.Unlock()
+}
+
+func (p *bufferPool) available() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.free)
+}
+
+func (p *bufferPool) capacity() int { return p.maximum }
+
+func (p *bufferPool) pressure() QueuePressure {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return QueuePressure{
+		InFlight:  p.maximum - len(p.free),
+		HighWater: p.highWater,
+		Capacity:  p.maximum,
+	}
+}
+
 // concurrentSyncSink is deliberately package-private. Create wraps its os.File
 // with this marker because os.File documents all of its methods as safe for
 // concurrent use. Caller-provided sinks used through New retain serialized
@@ -132,7 +184,7 @@ type Recorder struct {
 	sink   Sink
 	cfg    Config
 	jobs   chan job
-	free   chan *jobBuffer
+	free   bufferPool
 	pool   []jobBuffer
 	stop   chan struct{}
 	done   chan struct{}
@@ -174,14 +226,15 @@ func newRecorder(ctx context.Context, sink Sink, cfg Config) (*Recorder, error) 
 		sink:   sink,
 		cfg:    cfg,
 		jobs:   make(chan job, cfg.QueueCapacity),
-		free:   make(chan *jobBuffer, cfg.QueueCapacity),
 		pool:   make([]jobBuffer, cfg.QueueCapacity),
 		stop:   make(chan struct{}),
 		done:   make(chan struct{}),
 		errors: make(chan error, 1),
 	}
+	r.free.maximum = cfg.QueueCapacity
+	r.free.free = make([]*jobBuffer, 0, cfg.QueueCapacity)
 	for i := range r.pool {
-		r.free <- &r.pool[i]
+		r.free.put(&r.pool[i])
 	}
 	go r.run(ctx)
 	return r, nil
@@ -213,19 +266,13 @@ func (r *Recorder) StagingPath() string {
 	}
 	return r.stagingPath
 }
-func (r *Recorder) DurabilityWindow() time.Duration {
+
+// QueuePressure returns a lock-consistent snapshot of bounded producer use.
+func (r *Recorder) QueuePressure() QueuePressure {
 	if r == nil {
-		return 0
+		return QueuePressure{}
 	}
-	return r.cfg.DurabilityWindow
-}
-func (r *Recorder) Errors() <-chan error {
-	if r == nil {
-		ch := make(chan error)
-		close(ch)
-		return ch
-	}
-	return r.errors
+	return r.free.pressure()
 }
 func (r *Recorder) Done() <-chan struct{} {
 	if r == nil {
@@ -242,12 +289,6 @@ func (r *Recorder) Err() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.fatal
-}
-func (r *Recorder) Report(columns, rows, configBytes, fps uint32) (SizeReport, error) {
-	if r == nil {
-		return SizeReport{}, ErrClosed
-	}
-	return Preflight(columns, rows, configBytes, fps, r.cfg)
 }
 
 // Prepare validates and deep-copies a state only after reserving one of the
@@ -280,10 +321,8 @@ func (r *Recorder) reserve() (reservation, error) {
 		return reservation{}, err
 	}
 	r.mu.Unlock()
-	var buffer *jobBuffer
-	select {
-	case buffer = <-r.free:
-	default:
+	buffer := r.free.take()
+	if buffer == nil {
 		err := fmt.Errorf("%w (capacity %d)", ErrQueueSaturated, r.cfg.QueueCapacity)
 		r.fail(err)
 		return reservation{}, err
@@ -369,7 +408,7 @@ func (p reservation) commit(hostNanos uint64) error {
 		buffer.state = bufferFree
 		buffer.input = Input{}
 		buffer.mu.Unlock()
-		r.free <- buffer
+		r.free.put(buffer)
 		return ErrClosed
 	}
 	if r.fatal != nil {
@@ -378,7 +417,7 @@ func (p reservation) commit(hostNanos uint64) error {
 		buffer.state = bufferFree
 		buffer.input = Input{}
 		buffer.mu.Unlock()
-		r.free <- buffer
+		r.free.put(buffer)
 		return err
 	}
 	a := &r.accepted
@@ -389,7 +428,7 @@ func (p reservation) commit(hostNanos uint64) error {
 			buffer.state = bufferFree
 			buffer.input = Input{}
 			buffer.mu.Unlock()
-			r.free <- buffer
+			r.free.put(buffer)
 			return ErrTimingRegression
 		}
 		if in.GeometryEpoch < a.geometryEpoch || (in.GeometryEpoch == a.geometryEpoch && (in.Columns != a.columns || in.Rows != a.rows)) {
@@ -397,7 +436,7 @@ func (p reservation) commit(hostNanos uint64) error {
 			buffer.state = bufferFree
 			buffer.input = Input{}
 			buffer.mu.Unlock()
-			r.free <- buffer
+			r.free.put(buffer)
 			return ErrEpochRegression
 		}
 		if in.ConfigEpoch < a.configEpoch || (in.ConfigEpoch == a.configEpoch && !bytes.Equal(in.Config, a.config)) {
@@ -405,7 +444,7 @@ func (p reservation) commit(hostNanos uint64) error {
 			buffer.state = bufferFree
 			buffer.input = Input{}
 			buffer.mu.Unlock()
-			r.free <- buffer
+			r.free.put(buffer)
 			return ErrEpochRegression
 		}
 	}
@@ -444,7 +483,7 @@ func (p reservation) abort() {
 	buffer.state = bufferFree
 	buffer.input = Input{}
 	buffer.mu.Unlock()
-	p.recorder.free <- buffer
+	p.recorder.free.put(buffer)
 }
 
 func (r *Recorder) Submit(in Input, hostNanos uint64) error {
@@ -611,7 +650,7 @@ func (r *Recorder) recycle(buffer *jobBuffer) {
 	buffer.input = Input{}
 	buffer.state = bufferFree
 	buffer.mu.Unlock()
-	r.free <- buffer
+	r.free.put(buffer)
 }
 
 func (r *Recorder) Close() error {

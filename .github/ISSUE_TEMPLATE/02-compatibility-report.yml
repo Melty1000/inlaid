@@ -1,0 +1,144 @@
+name: Compatibility report
+description: Record a physical camera, operating system, and terminal result
+title: "[Compatibility]: "
+labels:
+  - needs triage
+  - compatibility
+  - needs hardware
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Passing and failing reports are both useful. This issue is public. Do not include camera media, account names, serial numbers, stable device IDs, personal paths, credentials, or an environment dump.
+  - type: input
+    id: build
+    attributes:
+      label: Inlaid version or commit
+      placeholder: v0.1.0-beta.1 or exact commit
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Distribution
+      options:
+        - GitHub release ZIP
+        - Built from source
+        - Another distribution
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system or distribution
+      placeholder: Ubuntu 24.04.3 LTS
+    validations:
+      required: true
+  - type: dropdown
+    id: architecture
+    attributes:
+      label: Architecture
+      options:
+        - x86_64 / amd64
+        - arm64 / aarch64
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: General machine hardware
+      description: Processor or machine class is enough. Do not include serial numbers, host names, or account names.
+      placeholder: Ryzen 7 desktop with 32 GB RAM
+    validations:
+      required: true
+  - type: input
+    id: camera
+    attributes:
+      label: Camera model
+      description: Use the public model name only. Do not include a serial number or stable device ID.
+      placeholder: Logitech C922
+    validations:
+      required: true
+  - type: input
+    id: mode
+    attributes:
+      label: Actual camera mode
+      description: Record the size, exact or displayed FPS, and pixel format selected by Inlaid.
+      placeholder: 1920x1080, 29.97 FPS, MJPEG
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal and version
+      placeholder: kitty 0.42.2
+    validations:
+      required: true
+  - type: input
+    id: shell_launch
+    attributes:
+      label: Shell, version, and launch method
+      placeholder: zsh 5.9; ran ./inlaid from an existing kitty tab
+    validations:
+      required: true
+  - type: input
+    id: grid
+    attributes:
+      label: Terminal grid
+      placeholder: 220x62 cells
+    validations:
+      required: true
+  - type: input
+    id: duration_fps
+    attributes:
+      label: Duration and frame rate
+      description: Include source FPS, shown FPS, skipped frames, and how long the live view ran.
+      placeholder: 10 minutes; source 29.97; shown 29.4; 18 skipped
+    validations:
+      required: true
+  - type: textarea
+    id: memory
+    attributes:
+      label: Memory behavior
+      description: Record start/end or stable observed memory when available. Write "not measured" otherwise.
+    validations:
+      required: true
+  - type: textarea
+    id: outputs
+    attributes:
+      label: Snapshot and recording results
+      description: Record PNG, MP4, and GIF separately, with recording duration. Write "not tested" for any skipped path.
+      placeholder: |
+        PNG: pass
+        MP4: pass, 60 seconds
+        GIF: not tested
+    validations:
+      required: true
+  - type: textarea
+    id: lifecycle
+    attributes:
+      label: Camera lifecycle results
+      description: Record close/reopen. Add removal, permission denial, or another-application ownership if tested.
+      placeholder: Closed cleanly and reopened twice.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Problems or useful notes
+      description: Exact errors are useful. Remove personal paths and identifiers.
+  - type: textarea
+    id: support_report
+    attributes:
+      label: Optional local support report
+      description: Review the JSON before dragging it here. Attaching it makes it public immediately; Inlaid never uploads it for you.
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I ran this on a physical machine with the camera named above; this is not a cross-build or CI-only result.
+          required: true
+        - label: I reviewed this issue and its attachments for private camera media, personal paths, identifiers, and credentials.
+          required: true

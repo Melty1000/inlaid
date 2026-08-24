@@ -3,6 +3,7 @@ package recording
 import (
 	"context"
 	"errors"
+	"go/build"
 	"image"
 	"os"
 	"os/exec"
@@ -104,6 +105,43 @@ func TestEmitCellTapeFramesPreservesHostCadenceAndPixels(t *testing.T) {
 	}
 }
 
+func TestProjectedExportSkipsStatesDiscardedByOutputCadence(t *testing.T) {
+	path := createExportTape(t,
+		tapeState{host: 0, color: 0x100000},
+		tapeState{host: uint64(10 * time.Millisecond), color: 0x200000},
+		tapeState{host: uint64(20 * time.Millisecond), color: 0x300000},
+		tapeState{host: uint64(30 * time.Millisecond), color: 0x400000},
+		tapeState{host: uint64(40 * time.Millisecond), color: 0x500000},
+	)
+	replay, err := celltape.Open(path, celltape.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replay.Close()
+
+	projections, writes := 0, 0
+	err = emitProjectedCellTapeFrames(
+		context.Background(),
+		replay,
+		2,
+		10,
+		func(celltape.Frame) (*image.RGBA, error) {
+			projections++
+			return image.NewRGBA(image.Rect(0, 0, 1, 1)), nil
+		},
+		func(*image.RGBA) error {
+			writes++
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projections != 2 || writes != 2 {
+		t.Fatalf("export work = %d projections / %d writes, want 2 / 2", projections, writes)
+	}
+}
+
 func TestFrameCountNeverShortensRequestedDuration(t *testing.T) {
 	for _, test := range []struct {
 		nanos uint64
@@ -128,6 +166,33 @@ func TestFrameCountNeverShortensRequestedDuration(t *testing.T) {
 	}
 }
 
+func TestExportCellTapeRejectsHostileTapeTimelineBeforeFFmpeg(t *testing.T) {
+	path := createExportTape(t,
+		tapeState{host: 0, color: 0x123456},
+		tapeState{host: uint64(8 * 24 * time.Hour), color: 0x654321},
+	)
+	output := filepath.Join(t.TempDir(), "must-not-exist.mp4")
+	limit := uint64(7 * 24 * 60 * 60 * 60)
+	report, err := ExportCellTape(context.Background(), CellTapeExportConfig{
+		TapePath:        path,
+		MaxOutputFrames: limit,
+		Writer: Config{
+			FFmpeg: "definitely-not-started", Output: output,
+			Width: 1280, Height: 720, FPS: 60, Format: FormatMP4,
+		},
+	})
+	if !errors.Is(err, ErrCellTapeAmplification) {
+		t.Fatalf("amplification error = %v, want %v", err, ErrCellTapeAmplification)
+	}
+	if report.EncodedFrames <= limit {
+		t.Fatalf("planned frames = %d, want more than recovery limit %d", report.EncodedFrames, limit)
+	}
+	assertCanonicalTapeRetained(t, path)
+	if _, statErr := os.Stat(output); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("amplified export started FFmpeg or published output: %v", statErr)
+	}
+}
+
 func TestCellTapeGridChangeUsesReusableExactCanvas(t *testing.T) {
 	path := createExportTape(t,
 		tapeState{host: 0, color: 0xff0000, cols: 1, rows: 1},
@@ -145,7 +210,6 @@ func TestCellTapeGridChangeUsesReusableExactCanvas(t *testing.T) {
 	if !plan.variable || plan.changes != 1 {
 		t.Fatalf("resize plan = %+v", plan)
 	}
-	replay.Rewind()
 	var canvases [][]byte
 	var reused *image.RGBA
 	err = emitCellTapeCanvasFrames(context.Background(), replay, 2, 20, 10, 8, func(canvas *image.RGBA) error {
@@ -200,7 +264,7 @@ func TestExportCellTapeRequiresExplicitTailRepair(t *testing.T) {
 	}
 	after, _ := os.Stat(path)
 	if before.Size() != after.Size() {
-		t.Fatalf("tape changed without RepairTail: %d -> %d", before.Size(), after.Size())
+		t.Fatalf("export mutated a tape with a damaged tail: %d -> %d", before.Size(), after.Size())
 	}
 }
 
@@ -520,7 +584,7 @@ func main() {
 	if err := os.WriteFile(source, []byte(program), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	goBinary := filepath.Join(runtime.GOROOT(), "bin", "go")
+	goBinary := filepath.Join(build.Default.GOROOT, "bin", "go")
 	if runtime.GOOS == "windows" {
 		goBinary += ".exe"
 	}

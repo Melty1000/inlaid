@@ -1,7 +1,6 @@
-// Package mfcapture provides the production Windows camera boundary: stable
-// Media Foundation device selection, native timestamped MJPEG samples, reduced
-// planar Microsoft WIC decode, and bounded latest-frame delivery.
-package mfcapture
+// Package capture owns camera identity, mode selection, native frame capture,
+// bounded delivery, and frame lifetime on every supported operating system.
+package capture
 
 import (
 	"context"
@@ -24,17 +23,19 @@ const (
 	defaultDecodeErrors = 3
 )
 
-// Device is a Media Foundation video-capture device. ID is the stable symbolic
-// link that must be retained for subsequent Open calls; Name is presentation
-// text only.
+// ErrShutdownUncertain means a native capture component did not confirm that
+// it released ownership before the bounded shutdown deadline.
+var ErrShutdownUncertain = errors.New("camera shutdown ownership is uncertain")
+
+// Device identifies one camera. ID is the platform's stable opaque identity;
+// Name is presentation text only.
 type Device struct {
 	Name string `json:"name"`
 	ID   string `json:"id"`
 }
 
-// Mode is the native MJPEG mode selected for a capture session. The rational
-// frame rate is retained exactly because many cameras advertise NTSC-derived
-// rates such as 30000/1001 rather than an integer 30 fps.
+// Mode is the native mode selected for a capture session. The rational frame
+// rate preserves rates such as 30000/1001 exactly.
 type Mode struct {
 	Width          int    `json:"width"`
 	Height         int    `json:"height"`
@@ -60,10 +61,8 @@ func (m Mode) NominalFPS() int {
 	return int((uint64(m.FPSNumerator) + uint64(m.FPSDenominator)/2) / uint64(m.FPSDenominator))
 }
 
-// Config fixes the stable camera identity and requests a preferred native
-// mode. Open never substitutes another device or a non-MJPEG subtype. When an
-// exact native mode is unavailable, it deterministically chooses the closest
-// usable MJPEG mode and exposes that choice through Session.Mode.
+// Config fixes the stable camera identity and requests a preferred native mode.
+// Open never substitutes another device and reports its selected mode.
 type Config struct {
 	DeviceID string `json:"device_id"`
 	Width    int    `json:"width"`
@@ -73,7 +72,7 @@ type Config struct {
 	// chooses an exposure longer than the negotiated frame interval. The
 	// default false temporarily bounds exposure for the requested FPS.
 	AllowVariableFrameRate bool          `json:"allow_variable_frame_rate"`
-	Lowres                 int           `json:"lowres"`
+	Downsample             int           `json:"downsample"`
 	QueueDepth             int           `json:"queue_depth"`
 	PacketQueueDepth       int           `json:"packet_queue_depth"`
 	MaxPacketBytes         int           `json:"max_packet_bytes"`
@@ -82,6 +81,7 @@ type Config struct {
 	MaxPoolBytes           int           `json:"max_pool_bytes"`
 	MaxConsecutiveErrors   int           `json:"max_consecutive_decode_errors"`
 	CloseTimeout           time.Duration `json:"close_timeout"`
+	Diagnostics            bool          `json:"diagnostics"`
 }
 
 func DefaultConfig() Config {
@@ -89,7 +89,7 @@ func DefaultConfig() Config {
 		Width:                1920,
 		Height:               1080,
 		FPS:                  30,
-		Lowres:               2,
+		Downsample:           4,
 		QueueDepth:           4,
 		PacketQueueDepth:     2,
 		MaxPacketBytes:       defaultMaxPacket,
@@ -112,8 +112,8 @@ func normalize(cfg Config, requireDevice bool) (Config, error) {
 	if cfg.FPS == 0 {
 		cfg.FPS = defaults.FPS
 	}
-	if cfg.Lowres == 0 {
-		cfg.Lowres = defaults.Lowres
+	if cfg.Downsample == 0 {
+		cfg.Downsample = defaults.Downsample
 	}
 	if cfg.QueueDepth == 0 {
 		cfg.QueueDepth = defaults.QueueDepth
@@ -150,7 +150,7 @@ func normalize(cfg Config, requireDevice bool) (Config, error) {
 		cfg.CloseTimeout = defaults.CloseTimeout
 	}
 	if requireDevice && cfg.DeviceID == "" {
-		return Config{}, errors.New("exact Media Foundation device ID is required")
+		return Config{}, errors.New("exact camera device ID is required")
 	}
 	if cfg.Width < 1 || cfg.Height < 1 || cfg.Width > maxDimension || cfg.Height > maxDimension {
 		return Config{}, fmt.Errorf("dimensions must be within 1..%d", maxDimension)
@@ -158,8 +158,8 @@ func normalize(cfg Config, requireDevice bool) (Config, error) {
 	if cfg.FPS < 1 || cfg.FPS > 240 {
 		return Config{}, errors.New("fps must be within 1..240")
 	}
-	if cfg.Lowres < 1 || cfg.Lowres > 3 {
-		return Config{}, errors.New("lowres must be 1, 2, or 3")
+	if cfg.Downsample != 2 && cfg.Downsample != 4 && cfg.Downsample != 8 {
+		return Config{}, errors.New("downsample must be 2, 4, or 8")
 	}
 	if cfg.QueueDepth < 1 || cfg.QueueDepth > maxQueueDepth {
 		return Config{}, fmt.Errorf("queue depth must be within 1..%d", maxQueueDepth)
@@ -185,8 +185,8 @@ func normalize(cfg Config, requireDevice bool) (Config, error) {
 	if cfg.CloseTimeout < 100*time.Millisecond || cfg.CloseTimeout > 30*time.Second {
 		return Config{}, errors.New("close timeout must be within 100ms..30s")
 	}
-	reducedWidth := reducedDimension(cfg.Width, cfg.Lowres)
-	reducedHeight := reducedDimension(cfg.Height, cfg.Lowres)
+	reducedWidth := reducedDimension(cfg.Width, cfg.Downsample)
+	reducedHeight := reducedDimension(cfg.Height, cfg.Downsample)
 	// Three full-size 8-bit planes is a conservative allocation upper bound.
 	if int64(reducedWidth)*int64(reducedHeight)*3 > int64(cfg.MaxFrameBytes) {
 		return Config{}, fmt.Errorf("reduced planar frame exceeds %d-byte bound", cfg.MaxFrameBytes)
@@ -194,22 +194,14 @@ func normalize(cfg Config, requireDevice bool) (Config, error) {
 	return cfg, nil
 }
 
-func reducedDimension(value, lowres int) int {
-	divisor := 1 << lowres
-	return (value + divisor - 1) / divisor
+func reducedDimension(value, downsample int) int {
+	return (value + downsample - 1) / downsample
 }
 
-// Packet owns a complete native MJPEG IMFSample copy and the original Media
-// Foundation timing/boundary metadata.
+// Packet owns one complete native MJPEG sample copy.
 type Packet struct {
-	Data                 []byte
-	ReaderTimestamp100ns int64
-	SampleTimestamp100ns int64
-	SampleDuration100ns  int64
-	DurationKnown        bool
-	ReaderFlags          uint32
-	SampleFlags          uint32
-	BufferCount          uint32
+	Data []byte
+	PTS  time.Duration
 
 	owner      *packetBuffer
 	ownerToken uint64
@@ -343,8 +335,8 @@ func packetBucketSize(size int) int {
 	return bucket
 }
 
-// Plane is one tightly bounded WIC output plane. Pix is valid until its Frame
-// is released.
+// Plane is one tightly bounded image plane. Pix is valid until its Frame is
+// released.
 type Plane struct {
 	Pix    []byte
 	Width  int
@@ -352,18 +344,36 @@ type Plane struct {
 	Stride int
 }
 
-// Frame owns pooled reduced Y/Cb/Cr buffers. Call Release exactly once when the
-// consumer is done; Release is idempotent for defensive shutdown paths.
+type PixelLayout uint8
+
+const (
+	PixelLayoutPlanarYCbCr PixelLayout = iota + 1
+	PixelLayoutNV12
+)
+
+type ColorRange uint8
+
+const (
+	ColorRangeFull ColorRange = iota + 1
+	ColorRangeVideo
+)
+
+type ColorMatrix uint8
+
+const (
+	ColorMatrixBT601 ColorMatrix = iota + 1
+	ColorMatrixBT709
+)
+
+// Frame owns one reduced camera image and its presentation timestamp. Call
+// Release exactly once when the consumer is done; Release is idempotent.
 type Frame struct {
-	Y, Cb, Cr            Plane
-	Sequence             uint64
-	ReaderTimestamp100ns int64
-	SampleTimestamp100ns int64
-	SampleDuration100ns  int64
-	DurationKnown        bool
-	ReaderFlags          uint32
-	SampleFlags          uint32
-	SourceBufferCount    uint32
+	Layout        PixelLayout
+	Range         ColorRange
+	Matrix        ColorMatrix
+	Y, Cb, Cr, UV Plane
+	Sequence      uint64
+	PTS           time.Duration
 
 	releaseOnce sync.Once
 	release     func()
@@ -391,24 +401,30 @@ type Source interface {
 }
 
 // Decoder is the test seam for pooled planar decoding. Decode must not retain
-// Packet.Data after it returns. Close must be idempotent and unblock Decode.
+// Packet.Data after it returns. Close must be idempotent, safe alongside
+// Decode, and unblock it.
 type Decoder interface {
 	Decode(context.Context, Packet) (*Frame, error)
 	Close() error
 }
 
 type Stats struct {
-	Packets        uint64
-	Decoded        uint64
-	DroppedPackets uint64
-	DroppedFrames  uint64
-	DecodeErrors   uint64
+	Packets         uint64
+	Decoded         uint64
+	DroppedPackets  uint64
+	DroppedFrames   uint64
+	DecodeErrors    uint64
+	TemporaryErrors uint64
 }
 
 type counters struct {
-	packets, decoded, droppedPackets, droppedFrames, decodeErrors atomic.Uint64
+	packets, decoded, droppedPackets, droppedFrames, decodeErrors, temporaryErrors atomic.Uint64
 }
 
 func (c *counters) snapshot() Stats {
-	return Stats{Packets: c.packets.Load(), Decoded: c.decoded.Load(), DroppedPackets: c.droppedPackets.Load(), DroppedFrames: c.droppedFrames.Load(), DecodeErrors: c.decodeErrors.Load()}
+	return Stats{
+		Packets: c.packets.Load(), Decoded: c.decoded.Load(),
+		DroppedPackets: c.droppedPackets.Load(), DroppedFrames: c.droppedFrames.Load(),
+		DecodeErrors: c.decodeErrors.Load(), TemporaryErrors: c.temporaryErrors.Load(),
+	}
 }

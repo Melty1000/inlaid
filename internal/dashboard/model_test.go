@@ -3,6 +3,7 @@ package dashboard
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -20,6 +21,13 @@ type cameraSwitchProbe struct {
 	RuntimeClient
 	calls []string
 }
+
+type supportReportProbe struct {
+	RuntimeClient
+	calls int
+}
+
+func (p *supportReportProbe) CreateSupportReport() { p.calls++ }
 
 func (p *cameraSwitchProbe) SelectCamera(name string) {
 	p.calls = append(p.calls, "select:"+name)
@@ -49,6 +57,66 @@ func newPreviewFixtureRuntime() *previewFixtureRuntime {
 		previews: make(chan PreviewUpdate, 1),
 		events:   make(chan RuntimeEvent),
 		accepted: make(chan struct{}),
+	}
+}
+
+func TestCameraShutdownFailurePromptsRestart(t *testing.T) {
+	m := New(DefaultSettings())
+	m.applyRuntimeEvent(RuntimeEvent{
+		Kind: RuntimeCameraError,
+		Err:  cameraRestartBlockedError(errors.New("native shutdown timed out")),
+	})
+	if !strings.Contains(m.persistentError, "restart Inlaid") {
+		t.Fatalf("camera error = %q, want restart instruction", m.persistentError)
+	}
+}
+
+func TestDiscoveryFailureRemainsVisibleWhileDemoRuns(t *testing.T) {
+	m := New(DefaultSettings())
+	want := errors.New("camera permission denied")
+	m.applyRuntimeEvent(RuntimeEvent{Kind: RuntimeDevicesFound, Device: "DEMO", Err: want})
+	m.applyRuntimeEvent(RuntimeEvent{Kind: RuntimeConnecting, Device: "DEMO"})
+	m.applyRuntimeEvent(RuntimeEvent{Kind: RuntimeCameraLive, Device: "DEMO", Width: 320, Height: 180, FPS: 30})
+	if !strings.Contains(m.persistentError, "Camera discovery failed") || m.technicalError != want.Error() {
+		t.Fatalf("demo hid discovery failure: warning = %q detail = %q", m.persistentError, m.technicalError)
+	}
+
+	m.applyRuntimeEvent(RuntimeEvent{Kind: RuntimeConnecting, Device: "Camera"})
+	m.applyRuntimeEvent(RuntimeEvent{Kind: RuntimeCameraLive, Device: "Camera", Width: 1920, Height: 1080, FPS: 30})
+	if m.persistentError != "" || m.technicalError != "" {
+		t.Fatalf("live camera retained stale discovery failure: warning = %q detail = %q", m.persistentError, m.technicalError)
+	}
+}
+
+func TestSavedRecordingSurfacesRecoveryCleanupFailure(t *testing.T) {
+	m := New(DefaultSettings())
+	m.quitting = true
+	cmd := m.applyRuntimeEvent(RuntimeEvent{
+		Kind:   RuntimeRecordingSaved,
+		Format: "mp4",
+		Path:   "capture.mp4",
+		Err:    errors.New("recovery tape is still open"),
+	})
+	if m.recordState != "idle" || !strings.Contains(m.persistentError, "recovery file could not be removed") {
+		t.Fatalf("saved cleanup state = %q / %q", m.recordState, m.persistentError)
+	}
+	if m.quitting || cmd != nil {
+		t.Fatalf("cleanup failure should keep the warning visible: quitting = %t, command = %T", m.quitting, cmd)
+	}
+}
+
+func TestDeferredQuitStopsWhenRecordingOrRecoveryFails(t *testing.T) {
+	tests := []RuntimeEvent{
+		{Kind: RuntimeRecordingError, Err: errors.New("disk full")},
+		{Kind: RuntimeRecoveryError, Err: errors.New("conversion failed")},
+	}
+	for _, event := range tests {
+		m := New(DefaultSettings())
+		m.quitting = true
+		cmd := m.applyRuntimeEvent(event)
+		if m.quitting || cmd != nil || m.persistentError == "" {
+			t.Fatalf("event %d should keep its warning visible: quitting = %t, command = %T, warning = %q", event.Kind, m.quitting, cmd, m.persistentError)
+		}
 	}
 }
 
@@ -201,7 +269,7 @@ func TestDistilledPageAndCameraAspectExportGrid(t *testing.T) {
 	if got := len(strings.Split(page, "\n")); got != 24 {
 		t.Fatalf("80x24 preview rendered %d lines", got)
 	}
-	for _, want := range []string{"FILL WINDOW", "SHOW WHOLE CAMERA", "COLOR LOOK", "SAVE AS", "RECORD MP4", "FOLDER"} {
+	for _, want := range []string{"FILL WINDOW", "SHOW WHOLE CAMERA", "COLOR LOOK", "SAVE AS", "REC MP4", "FOLDER", "REPORT"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("preview missing %q", want)
 		}
@@ -327,6 +395,25 @@ func TestTransportIgnoresDoubleClickAndHeldKeyRepeat(t *testing.T) {
 	m = updated.(Model)
 	if cmd != nil || m.recordState != "idle" {
 		t.Fatal("held R key started or toggled a recording")
+	}
+}
+
+func TestSupportReportRequiresTwoDeliberateActivations(t *testing.T) {
+	runtime := &supportReportProbe{}
+	m := NewLive(DefaultSettings(), runtime, nil)
+	m.now = time.Unix(100, 0)
+	m.activate("transport.report")
+	if runtime.calls != 0 || m.reportState != "confirm" {
+		t.Fatalf("first report activation = calls %d, state %q", runtime.calls, m.reportState)
+	}
+	page := ansi.Strip(m.RenderPreview())
+	if !strings.Contains(page, "LOCAL JSON ONLY") || !strings.Contains(page, "no images, paths, IDs, or upload") {
+		t.Fatalf("report disclosure was not visible:\n%s", page)
+	}
+	m.now = m.now.Add(transportRepeatGuard)
+	m.activate("transport.report")
+	if runtime.calls != 1 || m.reportState != "saving" {
+		t.Fatalf("confirmed report activation = calls %d, state %q", runtime.calls, m.reportState)
 	}
 }
 

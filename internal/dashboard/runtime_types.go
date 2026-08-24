@@ -1,7 +1,5 @@
 package dashboard
 
-import "time"
-
 // RuntimeClient is the non-visual side of the dashboard. It owns the single
 // camera stream and fans each frame out to preview, recording, and snapshots.
 // Model.Update only sends small commands; camera and encoder work never runs on
@@ -16,6 +14,7 @@ type RuntimeClient interface {
 	StopRecording()
 	Snapshot(RecordOptions)
 	OpenFolder()
+	CreateSupportReport()
 	Save(Settings)
 	Close() error
 }
@@ -44,8 +43,6 @@ type PreviewUpdate struct {
 	SourceFPS        float64
 	ShownFPS         float64
 	Dropped          uint64
-	RenderDuration   time.Duration
-	CapturedAt       time.Time
 	cameraGeneration uint64
 	acknowledge      func(bool)
 }
@@ -82,6 +79,8 @@ const (
 	RuntimeSettingsSaved
 	RuntimeSettingsError
 	RuntimeLooksFound
+	RuntimeSupportReportSaved
+	RuntimeSupportReportError
 )
 
 type RuntimeEvent struct {
@@ -95,6 +94,5 @@ type RuntimeEvent struct {
 	Width   int
 	Height  int
 	FPS     float64
-	Backend string
 	Err     error
 }

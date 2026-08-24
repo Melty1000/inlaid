@@ -86,7 +86,6 @@ func TestDetailedSolverDeterministicEdgesAndTies(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			input := rgb24ForCell(test.pixels)
-			var firstHash uint64
 			for sequence := uint64(1); sequence <= 20; sequence++ {
 				frame, err := solver.SolveRGB24(input, SourceMeta{GeometryEpoch: 9, SourceSequence: sequence})
 				if err != nil {
@@ -96,16 +95,6 @@ func TestDetailedSolverDeterministicEdgesAndTies(t *testing.T) {
 				if !ok || cell != test.want {
 					frame.Release()
 					t.Fatalf("cell = %#x, want %#x", cell.Packed(), test.want.Packed())
-				}
-				if gotError := frame.ReconstructionError(); gotError != 0 {
-					frame.Release()
-					t.Fatalf("error = %d, want 0", gotError)
-				}
-				if sequence == 1 {
-					firstHash = frame.Hash()
-				} else if gotHash := frame.Hash(); gotHash != firstHash {
-					frame.Release()
-					t.Fatalf("hash changed with source sequence: %#x != %#x", gotHash, firstHash)
 				}
 				frame.Release()
 			}
@@ -129,7 +118,8 @@ func TestIntegerLeastSquaresRoundsNearestWithLowerTie(t *testing.T) {
 	if got, want := cell.Background(), NewRGB(1, 0, 0); got != want {
 		t.Fatalf("mean color = %#x, want nearest integer %#x", got.Packed(), want.Packed())
 	}
-	if got, want := frame.ReconstructionError(), uint64(4); got != want {
+	quadrants := [4]SampleStats{stats, stats, stats, stats}
+	if got, want := referenceStatisticsCellError(cell, quadrants), uint64(4); got != want {
 		t.Fatalf("error = %d, want %d", got, want)
 	}
 
@@ -161,7 +151,7 @@ func TestDetailedMatchesBruteForceAndBeatsThresholdBaseline(t *testing.T) {
 						t.Fatal(err)
 					}
 					gotCell, _ := frame.Cell(0)
-					gotError := frame.ReconstructionError()
+					gotError := referenceCellError(pixels, gotCell)
 					if gotCell != wantCell || gotError != wantError {
 						frame.Release()
 						t.Fatalf("pixels %#v: got cell=%#x err=%d, brute cell=%#x err=%d", pixels, gotCell.Packed(), gotError, wantCell.Packed(), wantError)
@@ -180,13 +170,34 @@ func TestDetailedMatchesBruteForceAndBeatsThresholdBaseline(t *testing.T) {
 	}
 }
 
+func TestAggregatePartitionScoringMatchesReference(t *testing.T) {
+	var state uint32 = 0x7f4a7c15
+	for testCase := 0; testCase < 256; testCase++ {
+		var quadrants [4]SampleStats
+		for quadrant := range quadrants {
+			samples := 1 + (testCase+quadrant)%7
+			for range samples {
+				state = state*1664525 + 1013904223
+				quadrants[quadrant].AddRGB(byte(state>>24), byte(state>>16), byte(state>>8))
+			}
+		}
+		for _, mode := range []Mode{ModeDetailed, ModeSoft} {
+			gotCell, gotError := solveCell(quadrants, mode)
+			wantCell, wantError := referenceStatisticsSolve(quadrants, mode)
+			if gotCell != wantCell || gotError != wantError {
+				t.Fatalf("case %d mode %d: got cell=%#x error=%d, want cell=%#x error=%d", testCase, mode, gotCell.Packed(), gotError, wantCell.Packed(), wantError)
+			}
+		}
+	}
+}
+
 func TestRGBPlanarAndStatisticsAreEquivalent(t *testing.T) {
 	pixels := [4]RGB{
 		NewRGB(3, 200, 70), NewRGB(240, 8, 100),
 		NewRGB(40, 20, 255), NewRGB(210, 220, 4),
 	}
 	solver := mustSolver(t, Config{Columns: 1, Rows: 1, Mode: ModeDetailed, Buffers: 3})
-	meta := SourceMeta{GeometryEpoch: 4, SourceSequence: 7, CapturedAt: time.Unix(123, 456), PTS: 17 * time.Millisecond}
+	meta := SourceMeta{GeometryEpoch: 4, SourceSequence: 7, PTS: 17 * time.Millisecond}
 	rgbFrame, err := solver.SolveRGB24(rgb24ForCell(pixels), meta)
 	if err != nil {
 		t.Fatal(err)
@@ -213,9 +224,9 @@ func TestRGBPlanarAndStatisticsAreEquivalent(t *testing.T) {
 	wantCell, _ := rgbFrame.Cell(0)
 	for name, frame := range map[string]*CellFrame{"planar": planarFrame, "statistics": statsFrame} {
 		gotCell, _ := frame.Cell(0)
-		if gotCell != wantCell || frame.ReconstructionError() != rgbFrame.ReconstructionError() || frame.Hash() != rgbFrame.Hash() {
-			t.Errorf("%s differs: cell=%#x error=%d hash=%#x; RGB cell=%#x error=%d hash=%#x",
-				name, gotCell.Packed(), frame.ReconstructionError(), frame.Hash(), wantCell.Packed(), rgbFrame.ReconstructionError(), rgbFrame.Hash())
+		if gotCell != wantCell || frame.GeometryEpoch() != meta.GeometryEpoch || frame.SourceSequence() != meta.SourceSequence || frame.SourcePTS() != meta.PTS {
+			t.Errorf("%s differs: cell=%#x meta=%d/%d/%s; RGB cell=%#x",
+				name, gotCell.Packed(), frame.GeometryEpoch(), frame.SourceSequence(), frame.SourcePTS(), wantCell.Packed())
 		}
 	}
 }
@@ -312,58 +323,40 @@ func TestExactDimensionsBoundsAndCellBounds(t *testing.T) {
 	}
 }
 
-func TestInputReuseDoesNotAliasLiveFramesAndHashIsStable(t *testing.T) {
+func TestInputReuseDoesNotAliasLiveFrames(t *testing.T) {
 	solver := mustSolver(t, Config{Columns: 1, Rows: 1, Mode: ModeDetailed, Buffers: 3})
 	pixels := [4]RGB{NewRGB(1, 2, 3), NewRGB(4, 5, 6), NewRGB(7, 8, 9), NewRGB(10, 11, 12)}
 	input := rgb24ForCell(pixels)
 	first, err := solver.SolveRGB24(input, SourceMeta{
-		GeometryEpoch: 2, SourceSequence: 1, CapturedAt: time.Unix(10, 0), PTS: time.Millisecond,
+		GeometryEpoch: 2, SourceSequence: 1, PTS: time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Release()
 	second, err := solver.SolveRGB24(input, SourceMeta{
-		GeometryEpoch: 2, SourceSequence: 99, CapturedAt: time.Unix(99, 0), PTS: time.Hour,
+		GeometryEpoch: 2, SourceSequence: 99, PTS: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Hash() != second.Hash() {
-		secondHash := second.Hash()
-		second.Release()
-		t.Fatalf("volatile metadata changed visual hash: %#x != %#x", first.Hash(), secondHash)
-	}
 	wantCell, _ := first.Cell(0)
-	wantHash := first.Hash()
 	for i := range input.Pix {
 		input.Pix[i] = 255
 	}
-	if got, _ := first.Cell(0); got != wantCell || first.Hash() != wantHash {
-		t.Fatalf("source buffer mutation aliased frame: cell %#x -> %#x, hash %#x -> %#x", wantCell.Packed(), got.Packed(), wantHash, first.Hash())
+	if got, _ := first.Cell(0); got != wantCell {
+		t.Fatalf("source buffer mutation aliased frame: cell %#x -> %#x", wantCell.Packed(), got.Packed())
 	}
 	third, err := solver.SolveRGB24(input, SourceMeta{GeometryEpoch: 2, SourceSequence: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if third.Hash() == first.Hash() {
+	if got, _ := third.Cell(0); got == wantCell {
 		third.Release()
-		t.Fatal("changed pixels did not change hash")
+		t.Fatal("changed pixels did not change the solved cell")
 	}
 	third.Release()
-
-	// Releasing one buffer allows an identical visual frame with a new epoch;
-	// epoch is intentionally part of hash identity.
 	second.Release()
-	epochFrame, err := solver.SolveRGB24(rgb24ForCell(pixels), SourceMeta{GeometryEpoch: 3})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if epochFrame.Hash() == first.Hash() {
-		epochFrame.Release()
-		t.Fatal("geometry epoch did not change hash")
-	}
-	epochFrame.Release()
 }
 
 func TestFramePoolLeaseAndRetain(t *testing.T) {
@@ -557,6 +550,10 @@ func referencePartition(pixels [4]RGB, mask uint8) (Cell, uint64) {
 		bg = fg
 	}
 	cell := NewCell(mask, fg, bg)
+	return cell, referenceCellError(pixels, cell)
+}
+
+func referenceCellError(pixels [4]RGB, cell Cell) uint64 {
 	var total uint64
 	for quadrant, pixel := range pixels {
 		candidate := cell.ColorAt(quadrant)
@@ -565,7 +562,55 @@ func referencePartition(pixels [4]RGB, mask uint8) (Cell, uint64) {
 		db := int64(pixel.B()) - int64(candidate.B())
 		total += uint64(dr*dr + dg*dg + db*db)
 	}
-	return cell, total
+	return total
+}
+
+func referenceStatisticsSolve(quadrants [4]SampleStats, mode Mode) (Cell, uint64) {
+	if mode == ModeSoft {
+		return referenceStatisticsPartition(quadrants, 0x03)
+	}
+	bestCell, bestError := referenceStatisticsPartition(quadrants, 0)
+	for mask := uint8(1); mask < 8; mask++ {
+		candidate, candidateError := referenceStatisticsPartition(quadrants, mask)
+		if candidateError < bestError {
+			bestCell, bestError = candidate, candidateError
+		}
+	}
+	return bestCell, bestError
+}
+
+func referenceStatisticsPartition(quadrants [4]SampleStats, mask uint8) (Cell, uint64) {
+	var foreground, background SampleStats
+	for quadrant, stats := range quadrants {
+		group := &background
+		if mask&(1<<quadrant) != 0 {
+			group = &foreground
+		}
+		group.Count += stats.Count
+		group.SumR += stats.SumR
+		group.SumG += stats.SumG
+		group.SumB += stats.SumB
+		group.SumSquares += stats.SumSquares
+	}
+	fg, bg := foreground.meanLower(), background.meanLower()
+	if foreground.Count == 0 {
+		fg = bg
+	}
+	if background.Count == 0 {
+		bg = fg
+	}
+	cell := NewCell(mask, fg, bg)
+	return cell, referenceStatisticsCellError(cell, quadrants)
+}
+
+func referenceStatisticsCellError(cell Cell, quadrants [4]SampleStats) uint64 {
+	var total uint64
+	for quadrant, stats := range quadrants {
+		color := cell.ColorAt(quadrant)
+		r, g, b := uint64(color.R()), uint64(color.G()), uint64(color.B())
+		total += stats.SumSquares + stats.Count*(r*r+g*g+b*b) - 2*(r*stats.SumR+g*stats.SumG+b*stats.SumB)
+	}
+	return total
 }
 
 func referenceThresholdError(pixels [4]RGB, threshold uint8) uint64 {

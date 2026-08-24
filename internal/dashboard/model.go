@@ -1,10 +1,7 @@
-// THESIS: Inlaid is a camera-first terminal tool; it refuses the generic settings dashboard.
-// OWN-WORLD: The user's terminal canvas, adaptive Charm-like signal colors, inline controls, bordered transport.
-// STORY: See the camera and every consequential control together, then shape and capture without navigation.
-// FIRST VIEWPORT: A wide live preview dominates above horizontal CAMERA and SAVE channels; transport anchors the bottom.
 package dashboard
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -65,23 +62,25 @@ type Model struct {
 	preview  PreviewSource // deterministic fallback used only without a runtime
 	runtime  RuntimeClient
 
-	width, height int
-	focus         int
-	hover         string
-	pressed       string
-	mousePressID  string
-	pressSequence uint64
-	lastTransport string
-	transportAt   time.Time
-	now           time.Time
-	rendered      string
-	hitMap        *lipgloss.Compositor
-	renderLines   []string
-	previewPrefix []string
-	previewSuffix []string
-	previewCacheY int
-	previewCacheW int
-	previewCacheH int
+	width, height    int
+	focus            int
+	hover            string
+	pressed          string
+	mousePressID     string
+	pressSequence    uint64
+	lastTransport    string
+	transportAt      time.Time
+	now              time.Time
+	rendered         string
+	hitMap           *lipgloss.Compositor
+	renderLines      []string
+	previewPrefix    []string
+	previewSuffix    []string
+	previewBlank     string
+	previewCacheY    int
+	previewCacheW    int
+	previewCacheH    int
+	renderShellBytes int
 
 	camera       Select
 	view         SegmentedControl
@@ -101,28 +100,29 @@ type Model struct {
 	liveColumns, liveRows int
 	sourceFPS, shownFPS   float64
 	dropped               uint64
-	renderDuration        time.Duration
 	sequence              uint64
 
-	cameraState    string // finding, connecting, live, unavailable, demo
-	cameraName     string
-	cameraError    string
-	captureWidth   int
-	captureHeight  int
-	captureFPS     float64
-	captureBackend string
-	paused         bool
-	recordState    string // idle, starting, recording, saving, error
-	recordFormat   string
-	recordStarted  time.Time
-	snapshotSaving bool
-	quitting       bool
+	cameraState        string // finding, connecting, live, unavailable, demo
+	cameraName         string
+	captureWidth       int
+	captureHeight      int
+	captureFPS         float64
+	paused             bool
+	recordState        string // idle, starting, recording, saving, error
+	recordFormat       string
+	recordStarted      time.Time
+	snapshotSaving     bool
+	reportState        string
+	reportConfirmUntil time.Time
+	quitting           bool
 
 	flashUntil      time.Time
 	toast           string
 	toastUntil      time.Time
 	persistentError string
 	technicalError  string
+	discoveryError  string
+	discoveryDetail string
 }
 
 func New(cfg Settings) Model { return newModel(cfg, nil, nil) }
@@ -179,6 +179,7 @@ func newModel(cfg Settings, runtime RuntimeClient, startupErr error) Model {
 			{ID: "transport.record", Label: "RECORD", Glyph: "●", Tone: "danger"},
 			{ID: "transport.snapshot", Label: "SNAPSHOT", Glyph: "◆"},
 			{ID: "transport.open", Label: "OPEN FOLDER", Glyph: "↗", Enabled: true},
+			{ID: "transport.report", Label: "REPORT", Glyph: "?"},
 		},
 	}
 	if startupErr != nil {
@@ -187,7 +188,7 @@ func newModel(cfg Settings, runtime RuntimeClient, startupErr error) Model {
 	m.focusOrder = []string{
 		m.camera.ID, m.view.ID, m.mirror.ID, m.mosaicStyle.ID, m.colorLook.ID, m.lookStrength.ID, m.details.ID,
 		m.saveAs.ID, m.size.ID, m.fps.ID, m.quality.ID,
-		"transport.live", "transport.record", "transport.snapshot", "transport.open",
+		"transport.live", "transport.record", "transport.snapshot", "transport.open", "transport.report",
 	}
 	m.syncEnabled()
 	m.now = time.Now()
@@ -249,6 +250,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.toast = ""
 			dirty = true
 		}
+		if m.reportState == "confirm" && !m.now.Before(m.reportConfirmUntil) {
+			m.reportState = "idle"
+			dirty = true
+		}
 		if m.recordState == "recording" && elapsedSecond(previousNow, m.recordStarted) != elapsedSecond(m.now, m.recordStarted) {
 			dirty = true
 		}
@@ -267,7 +272,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if accepted {
 			m.liveANSI, m.liveColumns, m.liveRows = msg.ANSI, msg.Columns, msg.Rows
 			m.sequence, m.sourceFPS, m.shownFPS = msg.Sequence, msg.SourceFPS, msg.ShownFPS
-			m.dropped, m.renderDuration = msg.Dropped, msg.RenderDuration
+			m.dropped = msg.Dropped
 			m.refreshPreviewRender()
 		}
 		msg.acknowledgeRendered(accepted)
@@ -359,26 +364,48 @@ func (m *Model) applyRuntimeEvent(event RuntimeEvent) tea.Cmd {
 	switch event.Kind {
 	case RuntimeFindingCameras:
 		m.cameraState = "finding"
+		m.discoveryError = ""
+		m.discoveryDetail = ""
 	case RuntimeDevicesFound:
 		m.setDevices(event.Devices, event.Device)
+		if event.Err != nil {
+			m.discoveryDetail = errorText(event.Err)
+			m.discoveryError = friendlyError(event.Err, "Camera discovery failed — check camera permission, then restart Inlaid.")
+			m.technicalError = m.discoveryDetail
+			m.persistentError = m.discoveryError
+		}
 	case RuntimeConnecting:
-		m.cameraState, m.cameraName, m.cameraError = "connecting", event.Device, ""
-		m.captureWidth, m.captureHeight, m.captureFPS, m.captureBackend = 0, 0, 0, ""
-		m.persistentError = ""
+		m.cameraState, m.cameraName = "connecting", event.Device
+		m.captureWidth, m.captureHeight, m.captureFPS = 0, 0, 0
+		m.persistentError = m.discoveryError
+		if m.discoveryDetail != "" {
+			m.technicalError = m.discoveryDetail
+		}
 		m.liveANSI = ""
 	case RuntimeCameraLive:
 		m.cameraState = "live"
 		if strings.EqualFold(event.Device, "DEMO") {
 			m.cameraState = "demo"
 		}
-		m.cameraName, m.cameraError = event.Device, ""
-		m.captureWidth, m.captureHeight, m.captureFPS, m.captureBackend = event.Width, event.Height, event.FPS, event.Backend
-		m.technicalError = ""
-		m.persistentError = ""
+		m.cameraName = event.Device
+		m.captureWidth, m.captureHeight, m.captureFPS = event.Width, event.Height, event.FPS
+		if m.cameraState == "demo" && m.discoveryError != "" {
+			m.technicalError = m.discoveryDetail
+			m.persistentError = m.discoveryError
+		} else {
+			m.discoveryError = ""
+			m.discoveryDetail = ""
+			m.technicalError = ""
+			m.persistentError = ""
+		}
 	case RuntimeCameraError:
-		m.cameraState, m.cameraError = "unavailable", friendlyError(event.Err, "Camera unavailable — close other apps using it, then choose the camera again.")
+		m.cameraState = "unavailable"
 		m.technicalError = errorText(event.Err)
-		m.persistentError = m.cameraError
+		message := "Camera unavailable — close other apps using it, then choose the camera again."
+		if errors.Is(event.Err, errCameraRestartRequired) {
+			message = "Camera did not shut down cleanly — restart Inlaid before choosing another camera."
+		}
+		m.persistentError = friendlyError(event.Err, message)
 	case RuntimeRecordingStarting:
 		m.recordState, m.recordFormat = "starting", strings.ToUpper(event.Format)
 	case RuntimeRecordingStarted:
@@ -388,6 +415,11 @@ func (m *Model) applyRuntimeEvent(event RuntimeEvent) tea.Cmd {
 	case RuntimeRecordingSaved:
 		m.recordState = "idle"
 		m.notify("Saved " + strings.ToUpper(event.Format) + " · " + shortPath(event.Path))
+		if event.Err != nil {
+			m.technicalError = errorText(event.Err)
+			m.persistentError = "Recording saved, but its recovery file could not be removed. It may be recovered again after restart."
+			m.quitting = false
+		}
 		if m.quitting {
 			return tea.Quit
 		}
@@ -395,9 +427,7 @@ func (m *Model) applyRuntimeEvent(event RuntimeEvent) tea.Cmd {
 		m.recordState = "error"
 		m.technicalError = errorText(event.Err)
 		m.persistentError = friendlyError(event.Err, "Recording stopped — the file could not be written.")
-		if m.quitting {
-			return tea.Quit
-		}
+		m.quitting = false
 	case RuntimeRecoveryStarting:
 		m.recordState, m.recordFormat = "saving", "RECOVERY"
 		m.persistentError = ""
@@ -419,9 +449,7 @@ func (m *Model) applyRuntimeEvent(event RuntimeEvent) tea.Cmd {
 		} else {
 			m.persistentError = "A previous recording could not be recovered. Its CellTape was kept so you can try again."
 		}
-		if m.quitting {
-			return tea.Quit
-		}
+		m.quitting = false
 	case RuntimeSnapshotSaving:
 		m.snapshotSaving = true
 	case RuntimeSnapshotSaved:
@@ -447,6 +475,13 @@ func (m *Model) applyRuntimeEvent(event RuntimeEvent) tea.Cmd {
 			m.technicalError = errorText(event.Err)
 			m.notify("Some .cube looks were skipped · Details shows why")
 		}
+	case RuntimeSupportReportSaved:
+		m.reportState = "idle"
+		m.notify("Local support report saved · " + shortPath(event.Path))
+	case RuntimeSupportReportError:
+		m.reportState = "error"
+		m.technicalError = errorText(event.Err)
+		m.persistentError = "Support report could not be created. No data was uploaded."
 	}
 	m.syncEnabled()
 	return nil
@@ -490,7 +525,9 @@ func (m *Model) refreshRender() {
 func (m *Model) cachePreviewRows() {
 	m.renderLines = strings.Split(m.rendered, "\n")
 	m.previewPrefix, m.previewSuffix = nil, nil
+	m.previewBlank = ""
 	m.previewCacheY, m.previewCacheW, m.previewCacheH = 0, 0, 0
+	m.renderShellBytes = 0
 	if m.runtime == nil || m.width < minimumDashboardWidth || m.height < minimumDashboardHeight {
 		return
 	}
@@ -506,6 +543,7 @@ func (m *Model) cachePreviewRows() {
 	}
 	m.previewPrefix = make([]string, rows)
 	m.previewSuffix = make([]string, rows)
+	m.previewBlank = strings.Repeat(" ", columns)
 	for row := 0; row < rows; row++ {
 		line := m.renderLines[lineY+row]
 		lineWidth := ansi.StringWidth(line)
@@ -515,9 +553,13 @@ func (m *Model) cachePreviewRows() {
 		}
 		m.previewPrefix[row] = ansi.Cut(line, 0, interiorX)
 		m.previewSuffix[row] = ansi.Cut(line, interiorX+columns, lineWidth)
-		m.renderLines[lineY+row] = m.previewPrefix[row] + strings.Repeat(" ", columns) + m.previewSuffix[row]
+		m.renderLines[lineY+row] = m.previewPrefix[row] + m.previewBlank + m.previewSuffix[row]
 	}
 	m.previewCacheY, m.previewCacheW, m.previewCacheH = lineY, boxWidth, boxHeight
+	m.renderShellBytes = max(len(m.renderLines)-1, 0)
+	for _, line := range m.renderLines {
+		m.renderShellBytes += len(line)
+	}
 }
 
 func (m *Model) refreshPreviewRender() {
@@ -532,12 +574,87 @@ func (m *Model) stitchPreviewRows() {
 	if len(m.previewPrefix) == 0 || len(m.renderLines) == 0 {
 		return
 	}
+	if m.stitchTrustedLiveRows() {
+		return
+	}
 	interior, _, _ := m.previewInterior(m.previewCacheW, m.previewCacheH)
 	if len(interior) != len(m.previewPrefix) {
 		return
 	}
+	m.stitchInteriorRows(interior)
+}
+
+// stitchTrustedLiveRows handles the hot camera path without reparsing ANSI
+// that cellrender already guarantees has exactly Columns visible cells per
+// row. Structural mismatches fall back to the defensive generic projection.
+func (m *Model) stitchTrustedLiveRows() bool {
+	if m.runtime == nil || m.liveANSI == "" || m.liveColumns <= 0 || m.liveRows <= 0 {
+		return false
+	}
+	maxColumns, maxRows := m.previewCacheW-2, m.previewCacheH-2
+	if maxColumns <= 0 || maxRows != len(m.previewPrefix) || len(m.previewBlank) != maxColumns ||
+		m.liveColumns > maxColumns || m.liveRows > maxRows {
+		return false
+	}
+
+	leftPad := (maxColumns - m.liveColumns) / 2
+	rightPad := maxColumns - m.liveColumns - leftPad
+	topPad := (maxRows - m.liveRows) / 2
+
+	// The shell already contains maxColumns blank bytes for every preview row.
+	// Replace only the live rows: ANSI row bytes replace liveColumns blanks, and
+	// the frame's own newline separators are supplied by the cached page lines.
+	capacity := m.renderShellBytes + len(m.liveANSI) - (m.liveRows - 1) - m.liveRows*m.liveColumns
 	var builder strings.Builder
-	builder.Grow(len(m.rendered) + len(m.liveANSI))
+	builder.Grow(max(capacity, 0))
+	cursor := 0
+	for lineIndex, line := range m.renderLines {
+		if lineIndex > 0 {
+			builder.WriteByte('\n')
+		}
+		row := lineIndex - m.previewCacheY
+		if row < 0 || row >= maxRows {
+			builder.WriteString(line)
+			continue
+		}
+		liveRow := row - topPad
+		if liveRow < 0 || liveRow >= m.liveRows {
+			builder.WriteString(line)
+			continue
+		}
+
+		end := len(m.liveANSI)
+		if liveRow+1 < m.liveRows {
+			relative := strings.IndexByte(m.liveANSI[cursor:], '\n')
+			if relative < 0 {
+				return false
+			}
+			end = cursor + relative
+		} else if strings.IndexByte(m.liveANSI[cursor:], '\n') >= 0 {
+			return false
+		}
+		builder.WriteString(m.previewPrefix[row])
+		builder.WriteString(m.previewBlank[:leftPad])
+		builder.WriteString(m.liveANSI[cursor:end])
+		builder.WriteString(m.previewBlank[:rightPad])
+		builder.WriteString(m.previewSuffix[row])
+		cursor = end + 1
+	}
+	if cursor != len(m.liveANSI)+1 {
+		return false
+	}
+	m.rendered = builder.String()
+	return true
+}
+
+func (m *Model) stitchInteriorRows(interior []string) {
+	maxColumns := max(m.previewCacheW-2, 0)
+	capacity := m.renderShellBytes
+	for _, row := range interior {
+		capacity += len(row) - maxColumns
+	}
+	var builder strings.Builder
+	builder.Grow(max(capacity, 0))
 	for lineIndex, line := range m.renderLines {
 		if lineIndex > 0 {
 			builder.WriteByte('\n')
@@ -721,6 +838,9 @@ func (m *Model) activate(id string) {
 	if !m.canActivate(id) {
 		return
 	}
+	if m.reportState == "confirm" && id != "transport.report" {
+		m.reportState = "idle"
+	}
 	if strings.HasPrefix(id, "transport.") && !m.allowTransportAction(id) {
 		return
 	}
@@ -760,6 +880,16 @@ func (m *Model) activate(id string) {
 		if m.runtime != nil {
 			m.runtime.OpenFolder()
 		}
+	case "transport.report":
+		if m.reportState != "confirm" {
+			m.reportState = "confirm"
+			m.reportConfirmUntil = m.clockNow().Add(12 * time.Second)
+			m.toast = ""
+			break
+		}
+		m.reportState = "saving"
+		m.persistentError = ""
+		m.runtime.CreateSupportReport()
 	}
 	m.syncEnabled()
 }
@@ -929,6 +1059,8 @@ func (m *Model) syncEnabled() {
 			m.transport[i].Enabled = live && !locked && !m.snapshotSaving
 		case "transport.open":
 			m.transport[i].Enabled = true
+		case "transport.report":
+			m.transport[i].Enabled = m.runtime != nil && !locked && m.reportState != "saving"
 		}
 	}
 }

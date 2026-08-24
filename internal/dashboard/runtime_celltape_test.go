@@ -12,6 +12,7 @@ import (
 	"github.com/Melty1000/inlaid/internal/cellframe"
 	"github.com/Melty1000/inlaid/internal/cellrender"
 	"github.com/Melty1000/inlaid/internal/celltape"
+	ffmpegexe "github.com/Melty1000/inlaid/internal/ffmpeg"
 	"github.com/Melty1000/inlaid/internal/taperecovery"
 )
 
@@ -33,7 +34,7 @@ func TestRecordingQueueCapacityProvidesBoundedStallBudget(t *testing.T) {
 }
 
 func TestRuntimeAutomaticallyRepairsAndExportsCrashStagingTape(t *testing.T) {
-	ffmpeg, err := filepath.Abs(filepath.Join("..", "..", ".tools", "ffmpeg", "bin", "ffmpeg.exe"))
+	ffmpeg, err := filepath.Abs(ffmpegexe.BundledPath(filepath.Join("..", "..")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +57,7 @@ func TestRuntimeAutomaticallyRepairsAndExportsCrashStagingTape(t *testing.T) {
 		pixels[i] = byte(i * 17)
 	}
 	frame, err := solver.SolveRGB24(cellframe.RGB24{Pix: pixels, Width: 16, Height: 8, Stride: 48}, cellframe.SourceMeta{
-		GeometryEpoch: 1, SourceSequence: 1, CapturedAt: time.Now(), PTS: 30 * time.Millisecond,
+		GeometryEpoch: 1, SourceSequence: 1, PTS: 30 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -153,8 +154,106 @@ func TestRuntimeReleasesRecoveryClaimAfterExportFailure(t *testing.T) {
 	}
 }
 
+func TestRecoveryOutputDoesNotTreatNonemptyCollisionAsCompletion(t *testing.T) {
+	root := t.TempDir()
+	runtime := NewRuntime(DefaultSettings(), filepath.Join(root, "settings.json"), root)
+	defer runtime.Close()
+	recordings := filepath.Join(root, "recordings")
+	if err := os.MkdirAll(recordings, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tape := filepath.Join(recordings, ".recovery", "Inlaid_collision.celltape")
+	preferred := filepath.Join(recordings, "Inlaid_collision.mp4")
+	marker := []byte("unrelated-media")
+	if err := os.WriteFile(preferred, marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := runtime.recoveryOutput(tape, "mp4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output == preferred {
+		t.Fatal("same-name nonempty file was treated as proof of completed recovery")
+	}
+	if got, err := os.ReadFile(preferred); err != nil || string(got) != string(marker) {
+		t.Fatalf("collision changed: got=%q err=%v", got, err)
+	}
+}
+
+func TestRetireClaimedRecoveryTapeRefusesDifferentObject(t *testing.T) {
+	recoveryDir := t.TempDir()
+	path := filepath.Join(recoveryDir, "recording.celltape")
+	recorder, err := celltape.Create(context.Background(), path, celltape.Config{
+		Limits: canonicalTapeLimits, QueueCapacity: 1, Compression: celltape.CompressionNone,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := json.Marshal(tapeRecordingConfig{Version: 1, Output: RecordOptions{
+		Format: "mp4", Quality: "high", Width: 320, Height: 180, FPS: 30,
+	}})
+	if err == nil {
+		err = recorder.Submit(celltape.Input{
+			GeometryEpoch: 1, ConfigEpoch: 1, Columns: 1, Rows: 1, Config: config,
+			Cells: []celltape.Cell{{FG: 0x112233, BG: 0x112233}},
+		}, 0)
+	}
+	if closeErr := recorder.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = celltape.Publish(recorder.StagingPath(), path)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := taperecovery.New(recoveryDir, taperecovery.Options{TapeLimits: canonicalTapeLimits})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := engine.Claim(taperecovery.Candidate{Path: path, Kind: taperecovery.Published})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = claimed.Release() })
+
+	replacementPath := filepath.Join(recoveryDir, "replacement.celltape")
+	replacement := []byte("replacement must survive")
+	if err = os.WriteFile(replacementPath, replacement, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	claimed.Path = replacementPath
+	if err = retireClaimedRecoveryTape(&claimed); !errors.Is(err, taperecovery.ErrIdentityChanged) {
+		t.Fatalf("retireClaimedRecoveryTape error = %v, want ErrIdentityChanged", err)
+	}
+	if got, readErr := os.ReadFile(replacementPath); readErr != nil || string(got) != string(replacement) {
+		t.Fatalf("replacement changed: got=%q err=%v", got, readErr)
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("claimed object changed: %v", statErr)
+	}
+}
+
+func TestValidateRecoveredOutputUsesProductBounds(t *testing.T) {
+	valid := RecordOptions{Format: "mp4", Quality: "high", Width: 320, Height: 180, FPS: 60}
+	if err := validateRecoveredOutput(valid, "mp4"); err != nil {
+		t.Fatal(err)
+	}
+	invalid := valid
+	invalid.FPS = 240
+	if err := validateRecoveredOutput(invalid, "mp4"); err == nil {
+		t.Fatal("recovery accepted FPS unavailable in the product")
+	}
+	invalid = valid
+	invalid.Width, invalid.Height = 7680, 4320
+	if err := validateRecoveredOutput(invalid, "mp4"); err == nil {
+		t.Fatal("recovery accepted canvas unavailable in the product")
+	}
+}
+
 func TestRuntimeRecordsAcceptedCellsThroughCellTape(t *testing.T) {
-	ffmpeg, err := filepath.Abs(filepath.Join("..", "..", ".tools", "ffmpeg", "bin", "ffmpeg.exe"))
+	ffmpeg, err := filepath.Abs(ffmpegexe.BundledPath(filepath.Join("..", "..")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +275,7 @@ func TestRuntimeRecordsAcceptedCellsThroughCellTape(t *testing.T) {
 			pixels[i], pixels[i+1], pixels[i+2] = byte(sequence*31), byte(i/3), byte(255-sequence*17)
 		}
 		frame, solveErr := solver.SolveRGB24(cellframe.RGB24{Pix: pixels, Width: 16, Height: 8, Stride: 48}, cellframe.SourceMeta{
-			GeometryEpoch: 1, SourceSequence: sequence, CapturedAt: time.Now(), PTS: time.Duration(sequence) * 30 * time.Millisecond,
+			GeometryEpoch: 1, SourceSequence: sequence, PTS: time.Duration(sequence) * 30 * time.Millisecond,
 		})
 		if solveErr != nil {
 			t.Fatal(solveErr)
@@ -221,7 +320,7 @@ func TestRuntimeRecordsAcceptedCellsThroughCellTape(t *testing.T) {
 }
 
 func TestRejectedPreviewIsNotRecordedAndFailedExportKeepsRecoverableTape(t *testing.T) {
-	ffmpeg, err := filepath.Abs(filepath.Join("..", "..", ".tools", "ffmpeg", "bin", "ffmpeg.exe"))
+	ffmpeg, err := filepath.Abs(ffmpegexe.BundledPath(filepath.Join("..", "..")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +342,7 @@ func TestRejectedPreviewIsNotRecordedAndFailedExportKeepsRecoverableTape(t *test
 			pixels[i], pixels[i+1], pixels[i+2] = byte(sequence*31), byte(i/3), byte(255-sequence*17)
 		}
 		frame, solveErr := solver.SolveRGB24(cellframe.RGB24{Pix: pixels, Width: 16, Height: 8, Stride: 48}, cellframe.SourceMeta{
-			GeometryEpoch: 1, SourceSequence: sequence, CapturedAt: time.Now(), PTS: time.Duration(sequence) * 30 * time.Millisecond,
+			GeometryEpoch: 1, SourceSequence: sequence, PTS: time.Duration(sequence) * 30 * time.Millisecond,
 		})
 		if solveErr != nil {
 			t.Fatal(solveErr)

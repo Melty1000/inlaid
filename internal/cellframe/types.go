@@ -145,13 +145,10 @@ func (c Cell) ColorAt(quadrant int) RGB {
 	return c.Background()
 }
 
-// SourceMeta identifies the source image without making volatile timing part
-// of the visual hash. CapturedAt is wall-clock capture time; PTS is the source
-// presentation timestamp on its media timeline.
+// SourceMeta identifies the source image and its presentation timestamp.
 type SourceMeta struct {
 	GeometryEpoch  uint64
 	SourceSequence uint64
-	CapturedAt     time.Time
 	PTS            time.Duration
 }
 
@@ -163,12 +160,10 @@ type CellFrame struct {
 	pool *framePool
 	refs atomic.Int32
 
-	meta                SourceMeta
-	columns             int
-	rows                int
-	cells               []Cell
-	hash                uint64
-	reconstructionError uint64
+	meta    SourceMeta
+	columns int
+	rows    int
+	cells   []Cell
 }
 
 type framePool struct {
@@ -259,9 +254,6 @@ func (f *CellFrame) GeometryEpoch() uint64 { return f.meta.GeometryEpoch }
 // SourceSequence returns the upstream source sequence.
 func (f *CellFrame) SourceSequence() uint64 { return f.meta.SourceSequence }
 
-// SourceCapturedAt returns the wall-clock source capture timestamp.
-func (f *CellFrame) SourceCapturedAt() time.Time { return f.meta.CapturedAt }
-
 // SourcePTS returns the media presentation timestamp.
 func (f *CellFrame) SourcePTS() time.Duration { return f.meta.PTS }
 
@@ -273,14 +265,6 @@ func (f *CellFrame) Rows() int { return f.rows }
 
 // Len returns Columns times Rows.
 func (f *CellFrame) Len() int { return len(f.cells) }
-
-// Hash returns a deterministic FNV-1a hash of geometry epoch, dimensions, and
-// canonical packed cells. Volatile sequence and timestamps are excluded.
-func (f *CellFrame) Hash() uint64 { return f.hash }
-
-// ReconstructionError is total squared RGB-channel error over all input
-// samples represented by this frame.
-func (f *CellFrame) ReconstructionError() uint64 { return f.reconstructionError }
 
 // Cell returns the cell at a row-major index.
 func (f *CellFrame) Cell(index int) (Cell, bool) {
@@ -301,27 +285,3 @@ func (f *CellFrame) CellAt(x, y int) (Cell, bool) {
 // CopyCells copies row-major canonical cells into dst and returns the number
 // copied. It never exposes the frame's mutable backing storage.
 func (f *CellFrame) CopyCells(dst []Cell) int { return copy(dst, f.cells) }
-
-func visualHash(epoch uint64, columns, rows int, cells []Cell) uint64 {
-	const (
-		offset = uint64(14695981039346656037)
-		prime  = uint64(1099511628211)
-	)
-	h := offset
-	add := func(value uint64) {
-		for range 8 {
-			h ^= value & 0xff
-			h *= prime
-			value >>= 8
-		}
-	}
-	// Schema marker prevents accidental equivalence with another FNV payload.
-	add(0x43454c4c46524d31) // "CELLFRM1"
-	add(epoch)
-	add(uint64(columns))
-	add(uint64(rows))
-	for _, cell := range cells {
-		add(cell.Packed())
-	}
-	return h
-}

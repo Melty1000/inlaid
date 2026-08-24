@@ -1,6 +1,6 @@
 //go:build windows
 
-package mfcapture
+package capture
 
 import (
 	"context"
@@ -124,8 +124,6 @@ type wicDecoder struct {
 	done          chan struct{}
 	closeOnce     sync.Once
 	decodeMu      sync.Mutex
-	closeMu       sync.Mutex
-	closeErr      error
 	decodeCount   atomic.Uint64
 	decodeTotalNS atomic.Uint64
 	decodeMaxNS   atomic.Uint64
@@ -173,9 +171,7 @@ func (d *wicDecoder) Decode(ctx context.Context, packet Packet) (*Frame, error) 
 func (d *wicDecoder) Close() error {
 	d.closeOnce.Do(func() { close(d.stop) })
 	<-d.done
-	d.closeMu.Lock()
-	defer d.closeMu.Unlock()
-	return d.closeErr
+	return nil
 }
 
 func (d *wicDecoder) control(ready chan<- error) {
@@ -194,12 +190,17 @@ func (d *wicDecoder) control(ready chan<- error) {
 		case <-d.stop:
 			return
 		case request := <-d.requests:
-			started := time.Now()
+			var started time.Time
+			if d.cfg.Diagnostics {
+				started = time.Now()
+			}
 			frame, decodeErr := d.decodePacket(request.ctx, factory, request.packet)
-			elapsed := uint64(time.Since(started))
-			d.decodeCount.Add(1)
-			d.decodeTotalNS.Add(elapsed)
-			atomicMax(&d.decodeMaxNS, elapsed)
+			if d.cfg.Diagnostics {
+				elapsed := uint64(time.Since(started))
+				d.decodeCount.Add(1)
+				d.decodeTotalNS.Add(elapsed)
+				atomicMax(&d.decodeMaxNS, elapsed)
+			}
 			response := decodeResponse{frame: frame, err: decodeErr}
 			select {
 			case d.responses <- response:
@@ -271,8 +272,8 @@ func (d *wicDecoder) decodePacket(ctx context.Context, factory comObject, packet
 	planar := comObject{planarPtr}
 	defer planar.release()
 
-	width := uint32(reducedDimension(d.cfg.Width, d.cfg.Lowres))
-	height := uint32(reducedDimension(d.cfg.Height, d.cfg.Lowres))
+	width := uint32(reducedDimension(d.cfg.Width, d.cfg.Downsample))
+	height := uint32(reducedDimension(d.cfg.Height, d.cfg.Downsample))
 	requestedWidth, requestedHeight := width, height
 	formats := [3]windows.GUID{wicPixelFormatY, wicPixelFormatCb, wicPixelFormatCr}
 	var descriptions [3]wicPlaneDescription
@@ -282,7 +283,7 @@ func (d *wicDecoder) decodePacket(ctx context.Context, factory comObject, packet
 		return nil, hrError("IWICPlanarBitmapSourceTransform.DoesSupportTransform", hr)
 	}
 	if supported == 0 {
-		return nil, fmt.Errorf("built-in WIC JPEG decoder does not support planar lowres=%d", d.cfg.Lowres)
+		return nil, fmt.Errorf("built-in WIC JPEG decoder does not support 1/%d planar output", d.cfg.Downsample)
 	}
 	if width != requestedWidth || height != requestedHeight {
 		return nil, fmt.Errorf("WIC reduced geometry is %dx%d, want %dx%d", width, height, requestedWidth, requestedHeight)
@@ -328,14 +329,13 @@ func (d *wicDecoder) decodePacket(ctx context.Context, factory comObject, packet
 	runtime.KeepAlive(packet.Data)
 	runtime.KeepAlive(buffers)
 	result := &Frame{
-		Y:                    Plane{Pix: buffers[0], Width: layout[0].width, Height: layout[0].height, Stride: layout[0].stride},
-		Cb:                   Plane{Pix: buffers[1], Width: layout[1].width, Height: layout[1].height, Stride: layout[1].stride},
-		Cr:                   Plane{Pix: buffers[2], Width: layout[2].width, Height: layout[2].height, Stride: layout[2].stride},
-		ReaderTimestamp100ns: packet.ReaderTimestamp100ns,
-		SampleTimestamp100ns: packet.SampleTimestamp100ns,
-		SampleDuration100ns:  packet.SampleDuration100ns,
-		DurationKnown:        packet.DurationKnown,
-		ReaderFlags:          packet.ReaderFlags, SampleFlags: packet.SampleFlags, SourceBufferCount: packet.BufferCount,
+		Layout:  PixelLayoutPlanarYCbCr,
+		Range:   ColorRangeFull,
+		Matrix:  ColorMatrixBT601,
+		Y:       Plane{Pix: buffers[0], Width: layout[0].width, Height: layout[0].height, Stride: layout[0].stride},
+		Cb:      Plane{Pix: buffers[1], Width: layout[1].width, Height: layout[1].height, Stride: layout[1].stride},
+		Cr:      Plane{Pix: buffers[2], Width: layout[2].width, Height: layout[2].height, Stride: layout[2].stride},
+		PTS:     packet.PTS,
 		release: func() { d.pool.release(buffers) },
 	}
 	releaseBuffers = false

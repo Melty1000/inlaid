@@ -9,6 +9,7 @@ import (
 )
 
 var benchmarkEncodedBytes int
+var benchmarkReplaySequence uint64
 
 func BenchmarkEncodeDelta(b *testing.B) {
 	prev := make([]Cell, 1920)
@@ -26,6 +27,75 @@ func BenchmarkEncodeDelta(b *testing.B) {
 		if _, err := encodeDelta(prev, next, 1); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkReplayIteration isolates the caller-copy cost removed from export.
+// Both paths still decode and validate the same 300x84 state; Borrowed differs
+// only by lending Replay's current state to the callback.
+func BenchmarkReplayIteration(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "replay.celltape")
+	file, err := os.Create(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	recorder, err := New(context.Background(), file, Config{QueueCapacity: 1, Compression: CompressionNone})
+	if err != nil {
+		_ = file.Close()
+		b.Fatal(err)
+	}
+	if err = recorder.Submit(Input{
+		GeometryEpoch: 1,
+		ConfigEpoch:   1,
+		Columns:       300,
+		Rows:          84,
+		Config:        []byte("benchmark"),
+		Cells:         noisyCells(300*84, 0x12345678),
+	}, 0); err == nil {
+		err = recorder.Close()
+	}
+	if err != nil {
+		b.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, benchmark := range []struct {
+		name     string
+		borrowed bool
+	}{
+		{name: "Copied"},
+		{name: "Borrowed", borrowed: true},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			replay, openErr := Open(path, OpenOptions{})
+			if openErr != nil {
+				b.Fatal(openErr)
+			}
+			defer replay.Close()
+			b.ReportAllocs()
+			b.SetBytes(info.Size())
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				replay.Rewind()
+				var iterateErr error
+				if benchmark.borrowed {
+					iterateErr = replay.IterateBorrowed(context.Background(), func(frame Frame) error {
+						benchmarkReplaySequence = frame.Sequence
+						return nil
+					})
+				} else {
+					iterateErr = replay.Iterate(context.Background(), func(frame Frame) error {
+						benchmarkReplaySequence = frame.Sequence
+						return nil
+					})
+				}
+				if iterateErr != nil {
+					b.Fatal(iterateErr)
+				}
+			}
+		})
 	}
 }
 
@@ -82,7 +152,7 @@ func BenchmarkRecorder30FPS300x84CompressionFast(b *testing.B) {
 		if err = recorder.Submit(input, uint64(i)*uint64(framePeriod)); err != nil {
 			b.Fatalf("frame %d: %v", i, err)
 		}
-		if depth := cap(recorder.free) - len(recorder.free); depth > maxDepth {
+		if depth := recorder.free.capacity() - recorder.free.available(); depth > maxDepth {
 			maxDepth = depth
 		}
 	}

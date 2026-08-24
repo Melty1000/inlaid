@@ -8,22 +8,39 @@ import (
 	"image"
 	"image/png"
 	"os"
-	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Melty1000/inlaid/internal/capture"
 	"github.com/Melty1000/inlaid/internal/cellframe"
 	"github.com/Melty1000/inlaid/internal/celllive"
 	"github.com/Melty1000/inlaid/internal/cellrender"
 	"github.com/Melty1000/inlaid/internal/celltape"
 	ffmpegexe "github.com/Melty1000/inlaid/internal/ffmpeg"
-	"github.com/Melty1000/inlaid/internal/mfcapture"
 	"github.com/Melty1000/inlaid/internal/recording"
+	"github.com/Melty1000/inlaid/internal/supportreport"
 	"github.com/Melty1000/inlaid/internal/taperecovery"
 )
+
+type cameraSession interface {
+	close() error
+	errors() <-chan error
+	results() <-chan celllive.Result
+	update(celllive.ViewConfig)
+}
+
+type cellLiveCameraSession struct {
+	session *celllive.Session
+}
+
+func (s *cellLiveCameraSession) close() error                    { return s.session.Close() }
+func (s *cellLiveCameraSession) errors() <-chan error            { return s.session.Errors }
+func (s *cellLiveCameraSession) results() <-chan celllive.Result { return s.session.Results }
+func (s *cellLiveCameraSession) update(view celllive.ViewConfig) { s.session.Update(view) }
 
 // Runtime owns one camera and every non-visual operation behind the dashboard.
 // It is deliberately independent from Bubble Tea: all public actions return
@@ -37,7 +54,9 @@ type Runtime struct {
 	events               chan RuntimeEvent
 	startOnce, closeOnce sync.Once
 	closed               atomic.Bool
+	actionMu             sync.Mutex
 	wg                   sync.WaitGroup
+	closeErr             error
 
 	settingsMu sync.RWMutex
 	settings   Settings
@@ -46,18 +65,30 @@ type Runtime struct {
 	looksMu    sync.RWMutex
 	looks      lookCatalog
 
-	ffmpegMu         sync.RWMutex
-	ffmpeg           string
-	devicesMu        sync.RWMutex
-	deviceIDs        map[string]string
-	cameraGeneration atomic.Uint64
-	cameraOpMu       sync.Mutex
-	sessionMu        sync.RWMutex
-	session          *celllive.Session
+	ffmpegMu          sync.RWMutex
+	ffmpeg            string
+	findFFmpeg        func(context.Context, string) (string, error)
+	openFolder        func(context.Context, string) error
+	enumerateCameras  func(context.Context) ([]capture.Device, error)
+	startCamera       func(context.Context, capture.Config, celllive.ViewConfig) (*celllive.Session, error)
+	devicesMu         sync.RWMutex
+	deviceIDs         map[string]string
+	cameraGeneration  atomic.Uint64
+	cameraSelectMu    sync.Mutex
+	cameraOpMu        sync.Mutex
+	cameraLifetimeMu  sync.Mutex
+	cameraLifetimeGen uint64
+	cameraCancel      context.CancelFunc
+	sessionMu         sync.RWMutex
+	session           cameraSession
+	cameraShutdownErr error
 
 	recordMu                                      sync.Mutex
 	tape                                          *celltape.Recorder
+	tapeReservation                               taperecovery.Reservation
 	tapeStarted                                   time.Time
+	recordDuration                                time.Duration
+	recordResult                                  supportreport.Code
 	tapeFinal                                     string
 	tapeConfig                                    []byte
 	recordOptions                                 RecordOptions
@@ -81,11 +112,18 @@ type Runtime struct {
 	saveDone       chan struct{}
 	saveErr        error
 
-	deliveryMu      sync.Mutex
-	deliveryStarted time.Time
-	deliveryCount   uint64
-	deliveryFPS     float64
-	deliveryDropped uint64
+	deliveryMu       sync.Mutex
+	deliveryStarted  time.Time
+	deliveryCount    uint64
+	deliveryFPS      float64
+	deliveryDropped  uint64
+	deliveryAccepted uint64
+
+	support         *supportreport.Collector
+	supportMu       sync.Mutex
+	supportSource   celllive.SourceInfo
+	supportCamera   string
+	supportSampleAt time.Time
 }
 
 type snapshotRequest struct {
@@ -106,14 +144,17 @@ var canonicalTapeLimits = celltape.Limits{
 }
 
 const (
-	recordingStallBudgetSeconds = 4
-	maxRecordingQueueFrames     = 240
+	recordingStallBudgetSeconds  = 4
+	maxRecordingQueueFrames      = 240
+	maxAutomaticRecoveryDuration = 7 * 24 * time.Hour
 )
 
+var errCameraRestartRequired = errors.New("camera restart required")
+
 // recordingQueueCapacity gives the lossless tape writer a bounded cushion for
-// ordinary filesystem, antivirus, scheduler, and compression stalls. Buffers
-// allocate cell storage as the bounded FIFO circulates, then reuse it for the
-// rest of the recording. At normal 30-60 FPS the queue covers four seconds;
+// ordinary filesystem, antivirus, scheduler, and compression stalls. Its LIFO
+// free list allocates cell storage only as actual in-flight depth grows, then
+// reuses the hottest backing. At normal 30-60 FPS the queue covers four seconds;
 // its memory can never grow beyond the 240-frame ceiling.
 func recordingQueueCapacity(targetFPS int) int {
 	if targetFPS <= 0 {
@@ -123,7 +164,18 @@ func recordingQueueCapacity(targetFPS int) int {
 	return min(max(targetFPS*recordingStallBudgetSeconds, 8), maxRecordingQueueFrames)
 }
 
+func recordingRecoveryEngine(directory string) (*taperecovery.Engine, error) {
+	return taperecovery.New(directory, taperecovery.Options{
+		MaxConfigBytes: int(canonicalTapeLimits.MaxConfigBytes),
+		TapeLimits:     canonicalTapeLimits,
+	})
+}
+
 func NewRuntime(cfg Settings, settingsPath, root string) *Runtime {
+	return NewRuntimeWithBuild(cfg, settingsPath, root, supportreport.BuildFacts{Version: "dev"})
+}
+
+func NewRuntimeWithBuild(cfg Settings, settingsPath, root string, build supportreport.BuildFacts) *Runtime {
 	ctx, cancel := context.WithCancel(context.Background())
 	if strings.TrimSpace(root) == "" {
 		root, _ = os.Getwd()
@@ -136,9 +188,14 @@ func NewRuntime(cfg Settings, settingsPath, root string) *Runtime {
 		// roughly 27 FPS preview. One latest-wins slot removes that scheduling race
 		// without allowing latency to accumulate.
 		previews: make(chan PreviewUpdate, 1), events: make(chan RuntimeEvent, 64),
-		deviceIDs: make(map[string]string),
-		looks:     builtInLookCatalog(),
-		saveWake:  make(chan struct{}, 1), saveStop: make(chan struct{}), saveDone: make(chan struct{}),
+		deviceIDs:        make(map[string]string),
+		looks:            builtInLookCatalog(),
+		findFFmpeg:       ffmpegexe.FindContext,
+		openFolder:       openFolder,
+		enumerateCameras: capture.Enumerate,
+		startCamera:      celllive.StartCamera,
+		support:          supportreport.New(build),
+		saveWake:         make(chan struct{}, 1), saveStop: make(chan struct{}), saveDone: make(chan struct{}),
 	}
 	runtime.wg.Add(1)
 	go func() {
@@ -149,12 +206,17 @@ func NewRuntime(cfg Settings, settingsPath, root string) *Runtime {
 }
 
 func (r *Runtime) Start(view ViewOptions) {
+	if !r.beginAction() {
+		return
+	}
+	defer r.wg.Done()
 	r.viewMu.Lock()
 	r.view = view
 	r.viewMu.Unlock()
 	r.startOnce.Do(func() {
-		r.wg.Add(2)
+		r.wg.Add(3)
 		go func() { defer r.wg.Done(); r.discover() }()
+		go func() { defer r.wg.Done(); r.discoverRecovery() }()
 		go func() { defer r.wg.Done(); r.discoverLooks() }()
 	})
 }
@@ -164,26 +226,10 @@ func (r *Runtime) Events() <-chan RuntimeEvent    { return r.events }
 
 func (r *Runtime) discover() {
 	r.publishEvent(RuntimeEvent{Kind: RuntimeFindingCameras})
-	// FFmpeg is now only an offline export dependency. Camera discovery and
-	// capture use Media Foundation's stable symbolic links directly.
-	ffmpegPath, ffmpegErr := ffmpegexe.Find(filepath.Join(r.root, ".tools", "ffmpeg", "bin", "ffmpeg.exe"))
-	if ffmpegErr == nil {
-		r.ffmpegMu.Lock()
-		r.ffmpeg = ffmpegPath
-		r.ffmpegMu.Unlock()
-	}
-	// Recovery is independent of camera opening. Run it off-thread so even a
-	// long prior recording can be repaired/exported without delaying the live
-	// preview. discover itself still owns a WaitGroup slot while adding this one.
-	r.wg.Add(1)
-	go func() {
-		defer r.wg.Done()
-		r.recoverRecordings(ffmpegPath, ffmpegErr)
-	}()
-
-	ctx, cancel := context.WithTimeout(r.ctx, 8*time.Second)
-	nativeDevices, listErr := mfcapture.Enumerate(ctx)
-	cancel()
+	// Camera permission belongs to the user, not an arbitrary startup deadline.
+	// In particular, the first macOS prompt may remain open while the user reads
+	// it. Runtime cancellation still ends discovery when Inlaid closes.
+	nativeDevices, listErr := r.enumerateCameras(r.ctx)
 	devices := make([]string, 0, len(nativeDevices))
 	ids := make(map[string]string, len(nativeDevices))
 	for _, device := range nativeDevices {
@@ -237,8 +283,18 @@ func (r *Runtime) discover() {
 	if selected == "" {
 		selected = "DEMO"
 	}
-	r.publishEvent(RuntimeEvent{Kind: RuntimeDevicesFound, Devices: devices, Device: selected})
+	r.publishEvent(RuntimeEvent{Kind: RuntimeDevicesFound, Devices: devices, Device: selected, Err: listErr})
 	r.SelectCamera(selected)
+}
+
+func (r *Runtime) discoverRecovery() {
+	ffmpegPath, ffmpegErr := r.findFFmpeg(r.ctx, "")
+	if ffmpegErr == nil {
+		r.ffmpegMu.Lock()
+		r.ffmpeg = ffmpegPath
+		r.ffmpegMu.Unlock()
+	}
+	r.recoverRecordings(ffmpegPath, ffmpegErr)
 }
 
 func (r *Runtime) discoverLooks() {
@@ -256,6 +312,12 @@ func (r *Runtime) discoverLooks() {
 }
 
 func (r *Runtime) SelectCamera(device string) {
+	if !r.beginAction() {
+		return
+	}
+	defer r.wg.Done()
+	r.cameraSelectMu.Lock()
+	defer r.cameraSelectMu.Unlock()
 	if r.closed.Load() {
 		return
 	}
@@ -273,12 +335,22 @@ func (r *Runtime) SelectCamera(device string) {
 		r.settings.Device, r.settings.DeviceID = device, deviceID
 	}
 	r.settingsMu.Unlock()
+	r.supportMu.Lock()
+	r.supportCamera = device
+	r.supportSource = celllive.SourceInfo{}
+	r.supportMu.Unlock()
 	generation := r.advanceCameraGeneration()
+	cameraContext, current := r.replaceCameraLifetime(generation)
+	if !current {
+		return
+	}
 	r.publishEvent(RuntimeEvent{Kind: RuntimeConnecting, Device: device})
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		r.switchCamera(generation, device)
+		if !r.switchCameraContext(cameraContext, generation, device) {
+			r.finishCameraLifetime(generation)
+		}
 	}()
 }
 
@@ -309,19 +381,103 @@ func (r *Runtime) advanceCameraGeneration() uint64 {
 	return generation
 }
 
-func (r *Runtime) switchCamera(generation uint64, device string) {
+func (r *Runtime) replaceCameraLifetime(generation uint64) (context.Context, bool) {
+	ctx, cancel := context.WithCancel(r.ctx)
+	r.cameraLifetimeMu.Lock()
+	if r.closed.Load() || generation != r.cameraGeneration.Load() {
+		r.cameraLifetimeMu.Unlock()
+		cancel()
+		return ctx, false
+	}
+	previous := r.cameraCancel
+	r.cameraLifetimeGen = generation
+	r.cameraCancel = cancel
+	r.cameraLifetimeMu.Unlock()
+	if previous != nil {
+		previous()
+	}
+	return ctx, true
+}
+
+func (r *Runtime) finishCameraLifetime(generation uint64) {
+	r.cameraLifetimeMu.Lock()
+	if r.cameraLifetimeGen != generation {
+		r.cameraLifetimeMu.Unlock()
+		return
+	}
+	cancel := r.cameraCancel
+	r.cameraLifetimeGen = 0
+	r.cameraCancel = nil
+	r.cameraLifetimeMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (r *Runtime) cancelCameraLifetime() {
+	r.cameraLifetimeMu.Lock()
+	cancel := r.cameraCancel
+	r.cameraLifetimeGen = 0
+	r.cameraCancel = nil
+	r.cameraLifetimeMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (r *Runtime) closeCameraSession(session cameraSession) error {
+	if session == nil {
+		return nil
+	}
+	err := session.close()
+	if err == nil {
+		return nil
+	}
+	return r.rememberCameraShutdownFailure(err)
+}
+
+func (r *Runtime) rememberCameraShutdownFailure(err error) error {
+	if !errors.Is(err, capture.ErrShutdownUncertain) {
+		return err
+	}
+	r.sessionMu.Lock()
+	if r.cameraShutdownErr == nil {
+		r.cameraShutdownErr = err
+	}
+	err = r.cameraShutdownErr
+	r.sessionMu.Unlock()
+	return err
+}
+
+func (r *Runtime) cameraShutdownFailure() error {
+	r.sessionMu.RLock()
+	defer r.sessionMu.RUnlock()
+	return r.cameraShutdownErr
+}
+
+func cameraRestartBlockedError(err error) error {
+	return errors.Join(
+		errCameraRestartRequired,
+		fmt.Errorf("cannot open another camera because the previous capture did not shut down cleanly; restart Inlaid first: %w", err),
+	)
+}
+
+func (r *Runtime) switchCameraContext(cameraContext context.Context, generation uint64, device string) bool {
 	r.cameraOpMu.Lock()
 	defer r.cameraOpMu.Unlock()
-	if r.closed.Load() || generation != r.cameraGeneration.Load() {
-		return
+	if r.closed.Load() || cameraContext.Err() != nil || generation != r.cameraGeneration.Load() {
+		return false
 	}
 
 	r.sessionMu.Lock()
 	old := r.session
 	r.session = nil
+	shutdownErr := r.cameraShutdownErr
 	r.sessionMu.Unlock()
 	if old != nil {
-		old.Close()
+		if closeErr := r.closeCameraSession(old); errors.Is(closeErr, capture.ErrShutdownUncertain) {
+			shutdownErr = closeErr
+		}
 	}
 	r.previewMu.Lock()
 	staleFrame := r.latestFrame
@@ -332,58 +488,74 @@ func (r *Runtime) switchCamera(generation uint64, device string) {
 	if staleFrame != nil {
 		staleFrame.Release()
 	}
-	if r.closed.Load() || generation != r.cameraGeneration.Load() {
-		return
+	if r.closed.Load() || cameraContext.Err() != nil || generation != r.cameraGeneration.Load() {
+		return false
+	}
+	if shutdownErr == nil {
+		shutdownErr = r.cameraShutdownFailure()
+	}
+	if shutdownErr != nil {
+		r.publishEvent(RuntimeEvent{Kind: RuntimeCameraError, Device: device, Err: cameraRestartBlockedError(shutdownErr)})
+		return false
 	}
 
 	view := r.currentView()
 	liveView := r.toCellLiveView(view)
 	settings := r.currentSettings()
-	var session *celllive.Session
+	var opened *celllive.Session
 	var err error
 	if strings.EqualFold(device, "DEMO") {
-		session, err = celllive.StartSynthetic(r.ctx, settings.CaptureWidth, settings.CaptureHeight, settings.CaptureFPS, liveView)
+		opened, err = celllive.StartSynthetic(cameraContext, settings.CaptureWidth, settings.CaptureHeight, settings.CaptureFPS, liveView)
 	} else {
 		r.devicesMu.RLock()
 		deviceID := r.deviceIDs[device]
 		r.devicesMu.RUnlock()
 		if deviceID == "" {
-			err = fmt.Errorf("camera %q no longer has a Media Foundation device ID", safeTerminalText(device))
+			err = fmt.Errorf("camera %q is no longer available", safeTerminalText(device))
 		} else {
-			cfg := mfcapture.DefaultConfig()
+			cfg := capture.DefaultConfig()
 			cfg.DeviceID = deviceID
 			cfg.Width, cfg.Height, cfg.FPS = settings.CaptureWidth, settings.CaptureHeight, settings.CaptureFPS
-			// Quarter-size WIC decode still supplies the full 2x2 sample grid
-			// for ordinary terminals up to 240 columns, while cutting full-HD
-			// pixel traffic by 93.75%. Larger grids interpolate the same source
-			// information instead of pretending to add detail.
-			cfg.Lowres = 2
-			session, err = celllive.StartMediaFoundation(r.ctx, cfg, liveView)
+			// Quarter-size capture still supplies the full 2x2 sample grid for
+			// ordinary terminals while sharply reducing native pixel traffic.
+			cfg.Downsample = 4
+			opened, err = r.startCamera(cameraContext, cfg, liveView)
 		}
 	}
 	if err != nil {
+		if errors.Is(err, capture.ErrShutdownUncertain) {
+			err = cameraRestartBlockedError(r.rememberCameraShutdownFailure(err))
+		}
+		if r.closed.Load() || cameraContext.Err() != nil || generation != r.cameraGeneration.Load() {
+			return false
+		}
 		r.publishEvent(RuntimeEvent{Kind: RuntimeCameraError, Device: device, Err: err})
-		return
+		return false
 	}
-	if r.closed.Load() || generation != r.cameraGeneration.Load() {
-		session.Close()
-		return
+	session := &cellLiveCameraSession{session: opened}
+	if r.closed.Load() || cameraContext.Err() != nil || generation != r.cameraGeneration.Load() {
+		r.closeCameraSession(session)
+		return false
 	}
 	// Install and reconcile under one session lock. A WindowSizeMsg can update
-	// the requested view while Media Foundation is still opening. Without this
+	// the requested view while the native camera is still opening. Without this
 	// second read, the newly opened session can keep emitting the stale version
 	// forever while the model correctly rejects every frame.
 	r.installSession(session)
-	sourceInfo := session.SourceInfo()
+	sourceInfo := opened.SourceInfo()
+	r.supportMu.Lock()
+	r.supportCamera, r.supportSource = device, sourceInfo
+	r.supportMu.Unlock()
 	r.publishEvent(RuntimeEvent{
 		Kind: RuntimeCameraLive, Device: device,
-		Width: sourceInfo.Width, Height: sourceInfo.Height, FPS: sourceInfo.FPS, Backend: sourceInfo.Backend,
+		Width: sourceInfo.Width, Height: sourceInfo.Height, FPS: sourceInfo.FPS,
 	})
 	r.wg.Add(1)
 	go func() { defer r.wg.Done(); r.forwardSession(generation, device, session) }()
+	return true
 }
 
-func (r *Runtime) installSession(session *celllive.Session) {
+func (r *Runtime) installSession(session cameraSession) {
 	r.sessionMu.Lock()
 	r.session = session
 	r.sessionMu.Unlock()
@@ -392,17 +564,17 @@ func (r *Runtime) installSession(session *celllive.Session) {
 		// closes both sides of the camera-open race without nesting sessionMu
 		// and viewMu: an UpdateView either sees no session and this read catches
 		// its value, or it sees the session and sends its own newer update.
-		session.Update(r.toCellLiveView(r.currentView()))
+		session.update(r.toCellLiveView(r.currentView()))
 	}
 }
 
-func (r *Runtime) forwardSession(generation uint64, device string, session *celllive.Session) {
+func (r *Runtime) forwardSession(generation uint64, device string, session cameraSession) {
 	terminalReported := false
 	defer func() {
 		// A session that ends owns native buffers and callbacks until Close has
 		// drained them. Detach only if this is still the installed generation;
 		// a newer camera must never be cleared by an older forwarder.
-		session.Close()
+		closeErr := r.closeCameraSession(session)
 		r.sessionMu.Lock()
 		wasCurrent := r.session == session
 		if wasCurrent {
@@ -410,13 +582,20 @@ func (r *Runtime) forwardSession(generation uint64, device string, session *cell
 		}
 		r.sessionMu.Unlock()
 		if wasCurrent && !terminalReported && generation == r.cameraGeneration.Load() && !r.closed.Load() {
+			terminalErr := errors.New("camera stream ended unexpectedly")
+			if errors.Is(closeErr, capture.ErrShutdownUncertain) {
+				terminalErr = cameraRestartBlockedError(closeErr)
+			} else if closeErr != nil {
+				terminalErr = errors.Join(terminalErr, closeErr)
+			}
 			r.publishEvent(RuntimeEvent{
 				Kind: RuntimeCameraError, Device: device,
-				Err: errors.New("camera stream ended unexpectedly"),
+				Err: terminalErr,
 			})
 		}
+		r.finishCameraLifetime(generation)
 	}()
-	results, errorsCh := session.Results, session.Errors
+	results, errorsCh := session.results(), session.errors()
 	for results != nil || errorsCh != nil {
 		select {
 		case <-r.ctx.Done():
@@ -435,18 +614,27 @@ func (r *Runtime) forwardSession(generation uint64, device string, session *cell
 			update := PreviewUpdate{
 				Version: result.Version, ANSI: result.ANSI, Columns: result.Columns, Rows: result.Rows,
 				Sequence: result.Sequence, SourceFPS: result.SourceFPS, ShownFPS: result.ShownFPS,
-				Dropped: result.Dropped, RenderDuration: result.SolveDuration,
+				Dropped:          result.Dropped,
 				cameraGeneration: generation,
 			}
-			if result.Frame != nil {
-				update.CapturedAt = result.Frame.SourceCapturedAt()
-			}
+			r.observeSupportSample(result)
 			var acknowledgeOnce sync.Once
 			acceptedUpdate := update
 			canonical := result.Frame
 			prepared, preparedTape, tapeStarted, preparedOK := r.prepareCanonicalFrame(canonical)
 			update.acknowledge = func(accepted bool) {
 				acknowledgeOnce.Do(func() {
+					if !r.beginAction() {
+						r.observePreviewOutcome(false)
+						if preparedOK {
+							prepared.Abort()
+						}
+						if canonical != nil {
+							canonical.Release()
+						}
+						return
+					}
+					defer r.wg.Done()
 					accepted = accepted && !r.closed.Load() && generation == r.cameraGeneration.Load() && r.acceptCanonicalFrame(acceptedUpdate, canonical)
 					r.observePreviewOutcome(accepted)
 					if !accepted {
@@ -473,7 +661,7 @@ func (r *Runtime) forwardSession(generation uint64, device string, session *cell
 				continue
 			}
 			if err != nil && generation == r.cameraGeneration.Load() && !r.closed.Load() {
-				if mfcapture.IsTemporary(err) {
+				if capture.IsTemporary(err) {
 					continue
 				}
 				terminalReported = true
@@ -500,12 +688,18 @@ func (r *Runtime) prepareCanonicalFrame(frame *cellframe.CellFrame) (celltape.Pr
 	}
 	prepared, err := tape.PrepareCellFrame(frame, 1, r.tapeConfig, 0)
 	broken := err != nil && !errors.Is(err, celltape.ErrClosed) && r.tape == tape
+	reservation := taperecovery.Reservation{}
 	if broken {
+		reservation = r.tapeReservation
+		r.tapeReservation = taperecovery.Reservation{}
+		r.recordDuration = max(time.Since(r.tapeStarted), 0)
+		r.recordResult = supportreport.CodeSaveFailed
+		r.tapeStarted = time.Time{}
 		r.tape, r.tapeConfig, r.recordClosing = nil, nil, true
 	}
 	r.recordMu.Unlock()
 	if broken {
-		r.finishBrokenTape(tape, err)
+		r.finishBrokenTape(tape, reservation, err)
 	}
 	if err != nil {
 		return celltape.PreparedCellFrame{}, nil, time.Time{}, false
@@ -530,7 +724,13 @@ func (r *Runtime) commitCanonicalFrame(prepared celltape.PreparedCellFrame, tape
 	}
 	err := prepared.Commit(uint64(max(time.Since(started), 0)))
 	broken := err != nil && !errors.Is(err, celltape.ErrClosed) && r.tape == tape
+	reservation := taperecovery.Reservation{}
 	if broken {
+		reservation = r.tapeReservation
+		r.tapeReservation = taperecovery.Reservation{}
+		r.recordDuration = max(time.Since(r.tapeStarted), 0)
+		r.recordResult = supportreport.CodeSaveFailed
+		r.tapeStarted = time.Time{}
 		r.tape, r.tapeConfig, r.recordClosing = nil, nil, true
 	}
 	r.recordMu.Unlock()
@@ -538,11 +738,15 @@ func (r *Runtime) commitCanonicalFrame(prepared celltape.PreparedCellFrame, tape
 		prepared.Abort()
 	}
 	if broken {
-		r.finishBrokenTape(tape, err)
+		r.finishBrokenTape(tape, reservation, err)
 	}
 }
 
 func (r *Runtime) UpdateView(view ViewOptions) {
+	if !r.beginAction() {
+		return
+	}
+	defer r.wg.Done()
 	r.viewMu.Lock()
 	r.view = view
 	r.viewMu.Unlock()
@@ -550,7 +754,7 @@ func (r *Runtime) UpdateView(view ViewOptions) {
 	session := r.session
 	r.sessionMu.RUnlock()
 	if session != nil {
-		session.Update(r.toCellLiveView(view))
+		session.update(r.toCellLiveView(view))
 	}
 }
 
@@ -605,9 +809,10 @@ func (r *Runtime) currentCanonicalFrame() (*cellframe.CellFrame, bool) {
 }
 
 func (r *Runtime) StartRecording(options RecordOptions) {
-	if r.closed.Load() {
+	if !r.beginAction() {
 		return
 	}
+	defer r.wg.Done()
 	r.recordMu.Lock()
 	if r.tape != nil || r.recordStarting || r.recordClosing || r.recoveryRunning {
 		recovering := r.recoveryRunning
@@ -619,6 +824,9 @@ func (r *Runtime) StartRecording(options RecordOptions) {
 	}
 	r.recordStarting = true
 	r.recordFormat = strings.ToLower(options.Format)
+	r.recordOptions = options
+	r.recordDuration = 0
+	r.recordResult = supportreport.CodeUnknown
 	r.recordMu.Unlock()
 	r.publishEvent(RuntimeEvent{Kind: RuntimeRecordingStarting, Format: options.Format})
 	r.wg.Add(1)
@@ -642,7 +850,7 @@ func (r *Runtime) startRecording(options RecordOptions) {
 	ffmpeg := r.ffmpeg
 	r.ffmpegMu.RUnlock()
 	if ffmpeg == "" {
-		ffmpeg, err = ffmpegexe.Find(filepath.Join(r.root, ".tools", "ffmpeg", "bin", "ffmpeg.exe"))
+		ffmpeg, err = r.findFFmpeg(r.ctx, "")
 	}
 	if err != nil {
 		r.recordStartFailed(options.Format, err)
@@ -665,12 +873,24 @@ func (r *Runtime) startRecording(options RecordOptions) {
 		r.recordStartFailed(options.Format, err)
 		return
 	}
+	engine, err := recordingRecoveryEngine(recoveryDirectory)
+	if err != nil {
+		err = errors.Join(err, tape.Close())
+		r.recordStartFailed(options.Format, err)
+		return
+	}
+	reservation, err := engine.Reserve(tape.StagingPath())
+	if err != nil {
+		err = errors.Join(err, tape.Close())
+		r.recordStartFailed(options.Format, err)
+		return
+	}
 	configBlob, err := json.Marshal(tapeRecordingConfig{Version: 1, View: r.currentView(), Output: options})
 	if err == nil {
 		err = tape.SubmitCellFrame(firstFrame, 1, configBlob, celltape.BoundaryDiscontinuity, 0)
 	}
 	if err != nil {
-		_ = tape.Close()
+		err = errors.Join(err, tape.Close(), reservation.Release())
 		r.recordStartFailed(options.Format, err)
 		return
 	}
@@ -679,11 +899,12 @@ func (r *Runtime) startRecording(options RecordOptions) {
 	if r.closed.Load() {
 		r.recordStarting = false
 		r.recordMu.Unlock()
-		_ = tape.Close()
-		_ = celltape.Publish(tape.StagingPath(), tapeFinal)
+		claim, publishErr := closeAndPublishReservedTape(tape, reservation, tapeFinal)
+		_ = errors.Join(publishErr, claim.Release())
 		return
 	}
-	r.tape, r.tapeStarted, r.tapeFinal, r.tapeConfig = tape, time.Now(), tapeFinal, configBlob
+	r.tape, r.tapeReservation, r.tapeStarted, r.tapeFinal, r.tapeConfig = tape, reservation, time.Now(), tapeFinal, configBlob
+	r.recordDuration, r.recordResult = 0, supportreport.CodeUnknown
 	r.recordOptions, r.recordOutput, r.recordStarting = options, output, false
 	stopNow := r.stopAfterStart
 	r.stopAfterStart = false
@@ -698,11 +919,17 @@ func (r *Runtime) recordStartFailed(format string, err error) {
 	r.recordMu.Lock()
 	r.recordStarting = false
 	r.stopAfterStart = false
+	r.recordDuration = 0
+	r.recordResult = supportreport.CodeSaveFailed
 	r.recordMu.Unlock()
 	r.publishEvent(RuntimeEvent{Kind: RuntimeRecordingError, Format: format, Err: err})
 }
 
 func (r *Runtime) StopRecording() {
+	if !r.beginAction() {
+		return
+	}
+	defer r.wg.Done()
 	r.recordMu.Lock()
 	if r.recordStarting {
 		r.stopAfterStart = true
@@ -714,24 +941,26 @@ func (r *Runtime) StopRecording() {
 		r.recordMu.Unlock()
 		return
 	}
-	tape, output, format := r.tape, r.recordOutput, r.recordFormat
+	tape, reservation, output, format := r.tape, r.tapeReservation, r.recordOutput, r.recordFormat
 	started, tapeFinal, options := r.tapeStarted, r.tapeFinal, r.recordOptions
-	endHostNanos := uint64(max(time.Since(started), 0))
-	r.tape, r.tapeConfig, r.recordClosing = nil, nil, true
+	duration := max(time.Since(started), 0)
+	endHostNanos := uint64(duration)
+	r.recordDuration = duration
+	r.tapeStarted = time.Time{}
+	r.tape, r.tapeReservation, r.tapeConfig, r.recordClosing = nil, taperecovery.Reservation{}, nil, true
 	r.recordMu.Unlock()
 	r.publishEvent(RuntimeEvent{Kind: RuntimeRecordingSaving, Format: format, Path: output})
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		r.finishTape(tape, endHostNanos, tapeFinal, output, format, options)
+		r.finishTape(tape, reservation, endHostNanos, tapeFinal, output, format, options)
 	}()
 }
 
-func (r *Runtime) finishTape(tape *celltape.Recorder, endHostNanos uint64, tapeFinal, output, format string, options RecordOptions) {
-	err := tape.Close()
-	if publishErr := celltape.Publish(tape.StagingPath(), tapeFinal); publishErr != nil {
-		err = errors.Join(err, fmt.Errorf("publish recoverable recording tape: %w", publishErr))
-	}
+func (r *Runtime) finishTape(tape *celltape.Recorder, reservation taperecovery.Reservation, endHostNanos uint64, tapeFinal, output, format string, options RecordOptions) {
+	staging := tape.StagingPath()
+	claim, err := closeAndPublishReservedTape(tape, reservation, tapeFinal)
+	claimed := claim.Path != ""
 	if err == nil {
 		r.ffmpegMu.RLock()
 		ffmpeg := r.ffmpeg
@@ -740,44 +969,95 @@ func (r *Runtime) finishTape(tape *celltape.Recorder, endHostNanos uint64, tapeF
 		if strings.EqualFold(options.Quality, "standard") {
 			crf, gifColors = 20, 192
 		}
-		_, err = recording.ExportCellTape(r.ctx, recording.CellTapeExportConfig{
-			TapePath: tapeFinal, EndHostNanos: endHostNanos,
-			Writer: recording.Config{
-				FFmpeg: ffmpeg, Output: output, Width: options.Width, Height: options.Height,
-				FPS: options.FPS, Format: recording.Format(format), CRF: crf, GIFColors: gifColors,
-			},
-		})
+		replay, openErr := claim.OpenReplayContext(r.ctx, celltape.OpenOptions{Limits: canonicalTapeLimits})
+		if openErr != nil {
+			err = fmt.Errorf("open claimed recording CellTape: %w", openErr)
+		} else {
+			_, err = recording.ExportCellTapeReplay(r.ctx, replay, recording.CellTapeExportConfig{
+				TapePath: claim.Path, EndHostNanos: endHostNanos,
+				TapeLimits: canonicalTapeLimits,
+				Writer: recording.Config{
+					FFmpeg: ffmpeg, Output: output, Width: options.Width, Height: options.Height,
+					FPS: options.FPS, Format: recording.Format(format), CRF: crf, GIFColors: gifColors,
+				},
+			})
+			err = errors.Join(err, replay.Close())
+		}
+		if identityErr := claim.VerifyIdentity(); identityErr != nil {
+			err = errors.Join(err, fmt.Errorf("recording CellTape identity changed during export: %w", identityErr))
+		}
 	}
 	if err == nil {
 		err = requireNonEmpty(output)
+	}
+	var retireErr error
+	if claimed {
+		if err == nil {
+			retireErr = claim.Retire()
+			if releaseErr := claim.Release(); releaseErr != nil && !errors.Is(retireErr, releaseErr) {
+				retireErr = errors.Join(retireErr, releaseErr)
+			}
+		} else {
+			err = errors.Join(err, claim.Release())
+		}
 	}
 	r.recordMu.Lock()
 	r.recordClosing = false
 	if err == nil {
 		r.lastSaved = output
+		r.recordResult = supportreport.CodeCompleted
+	} else {
+		r.recordResult = supportreport.CodeSaveFailed
 	}
 	r.recordMu.Unlock()
 	if err != nil {
-		r.publishEvent(RuntimeEvent{Kind: RuntimeRecordingError, Format: format, Path: output, Err: fmt.Errorf("%w (recoverable cells kept at %s)", err, tapeFinal)})
+		retained := retainedTapePath(staging, tapeFinal)
+		r.publishEvent(RuntimeEvent{Kind: RuntimeRecordingError, Format: format, Path: output, Err: fmt.Errorf("%w (recoverable cells kept at %s)", err, retained)})
 		return
 	}
-	_ = os.Remove(tapeFinal)
-	r.publishEvent(RuntimeEvent{Kind: RuntimeRecordingSaved, Format: format, Path: output})
+	if retireErr != nil {
+		retireErr = fmt.Errorf("recording saved at %s, but its recovery tape could not be removed: %w", output, retireErr)
+	}
+	r.publishEvent(RuntimeEvent{Kind: RuntimeRecordingSaved, Format: format, Path: output, Err: retireErr})
 }
 
-func (r *Runtime) finishBrokenTape(tape *celltape.Recorder, submitErr error) {
+func (r *Runtime) finishBrokenTape(tape *celltape.Recorder, reservation taperecovery.Reservation, submitErr error) {
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		closeErr := tape.Close()
+		staging := tape.StagingPath()
 		r.recordMu.Lock()
 		format, output, tapeFinal := r.recordFormat, r.recordOutput, r.tapeFinal
-		r.recordClosing = false
 		r.recordMu.Unlock()
-		publishErr := celltape.Publish(tape.StagingPath(), tapeFinal)
-		err := errors.Join(submitErr, closeErr, publishErr)
-		r.publishEvent(RuntimeEvent{Kind: RuntimeRecordingError, Format: format, Path: output, Err: fmt.Errorf("%w (recoverable cells kept at %s)", err, tapeFinal)})
+		claim, publishErr := closeAndPublishReservedTape(tape, reservation, tapeFinal)
+		err := errors.Join(submitErr, publishErr, claim.Release())
+		r.recordMu.Lock()
+		r.recordClosing = false
+		r.recordResult = supportreport.CodeSaveFailed
+		r.recordMu.Unlock()
+		retained := retainedTapePath(staging, tapeFinal)
+		r.publishEvent(RuntimeEvent{Kind: RuntimeRecordingError, Format: format, Path: output, Err: fmt.Errorf("%w (recoverable cells kept at %s)", err, retained)})
 	}()
+}
+
+func closeAndPublishReservedTape(tape *celltape.Recorder, reservation taperecovery.Reservation, tapeFinal string) (taperecovery.Claim, error) {
+	closeErr := tape.Close()
+	engine, engineErr := recordingRecoveryEngine(filepath.Dir(tapeFinal))
+	if engineErr != nil {
+		return taperecovery.Claim{}, errors.Join(closeErr, engineErr, reservation.Release())
+	}
+	claim, publishErr := engine.PublishReserved(&reservation, tapeFinal)
+	if publishErr != nil {
+		publishErr = errors.Join(publishErr, reservation.Release())
+	}
+	return claim, errors.Join(closeErr, publishErr)
+}
+
+func retainedTapePath(staging, published string) string {
+	if _, err := os.Lstat(staging); !errors.Is(err, os.ErrNotExist) {
+		return staging
+	}
+	return published
 }
 
 // recoverRecordings turns both atomically published failure tapes and
@@ -787,7 +1067,10 @@ func (r *Runtime) finishBrokenTape(tape *celltape.Recorder, submitErr error) {
 // tape for a later retry.
 func (r *Runtime) recoverRecordings(ffmpeg string, ffmpegErr error) {
 	recoveryDirectory := filepath.Join(r.root, "recordings", ".recovery")
-	engine, err := taperecovery.New(recoveryDirectory, taperecovery.Options{})
+	engine, err := taperecovery.New(recoveryDirectory, taperecovery.Options{
+		MaxConfigBytes: int(canonicalTapeLimits.MaxConfigBytes),
+		TapeLimits:     canonicalTapeLimits,
+	})
 	if errors.Is(err, os.ErrNotExist) {
 		return
 	}
@@ -824,7 +1107,7 @@ func (r *Runtime) recoverRecordings(ffmpeg string, ffmpegErr error) {
 		if err := r.ctx.Err(); err != nil {
 			return
 		}
-		tape, claimErr := engine.Claim(candidate)
+		tape, claimErr := engine.ClaimContext(r.ctx, candidate)
 		if errors.Is(claimErr, taperecovery.ErrBusy) {
 			continue
 		}
@@ -879,12 +1162,12 @@ func (r *Runtime) recoverClaimedTape(tape taperecovery.Tape, ffmpeg string, ffmp
 	if format != string(recording.FormatMP4) && format != string(recording.FormatGIF) {
 		return "", false, fmt.Errorf("recover %s: unsupported output format %q", filepath.Base(tape.Path), safeTerminalText(format))
 	}
-	output, alreadyPublished, outputErr := r.recoveryOutput(tape.Path, format)
+	if validationErr := validateRecoveredOutput(stored.Output, format); validationErr != nil {
+		return "", false, fmt.Errorf("recover %s: %w", filepath.Base(tape.Path), validationErr)
+	}
+	output, outputErr := r.recoveryOutput(tape.Path, format)
 	if outputErr != nil {
 		return "", false, fmt.Errorf("choose recovered output: %w", outputErr)
-	}
-	if alreadyPublished {
-		return output, true, retireRecoveryTape(tape.Path)
 	}
 	if ffmpegErr != nil || strings.TrimSpace(ffmpeg) == "" {
 		if ffmpegErr == nil {
@@ -897,13 +1180,27 @@ func (r *Runtime) recoverClaimedTape(tape taperecovery.Tape, ffmpeg string, ffmp
 	if strings.EqualFold(stored.Output.Quality, "standard") {
 		crf, gifColors = 20, 192
 	}
-	_, exportErr := recording.ExportCellTape(r.ctx, recording.CellTapeExportConfig{
-		TapePath: tape.Path, RepairTail: false,
+	replay, openErr := tape.OpenReplayContext(r.ctx, celltape.OpenOptions{Limits: canonicalTapeLimits})
+	if openErr != nil {
+		return "", false, fmt.Errorf("recover %s: open claimed CellTape: %w", filepath.Base(tape.Path), openErr)
+	}
+	_, exportErr := recording.ExportCellTapeReplay(r.ctx, replay, recording.CellTapeExportConfig{
+		TapePath:        tape.Path,
+		TapeLimits:      canonicalTapeLimits,
+		MaxOutputFrames: uint64(maxAutomaticRecoveryDuration/time.Second) * uint64(stored.Output.FPS),
 		Writer: recording.Config{
 			FFmpeg: ffmpeg, Output: output, Width: stored.Output.Width, Height: stored.Output.Height,
 			FPS: stored.Output.FPS, Format: recording.Format(format), CRF: crf, GIFColors: gifColors,
 		},
 	})
+	exportErr = errors.Join(exportErr, replay.Close())
+	if identityErr := tape.VerifyIdentity(); identityErr != nil {
+		return output, false, fmt.Errorf(
+			"recover %s: CellTape identity changed during export: %w",
+			filepath.Base(tape.Path),
+			errors.Join(exportErr, identityErr),
+		)
+	}
 	if exportErr == nil {
 		exportErr = requireNonEmpty(output)
 	}
@@ -912,39 +1209,54 @@ func (r *Runtime) recoverClaimedTape(tape taperecovery.Tape, ffmpeg string, ffmp
 	}
 	// The media is already an atomically published, validated success. A tape
 	// cleanup failure is diagnostic, but this recovery still counts as complete.
-	return output, true, retireRecoveryTape(tape.Path)
+	return output, true, retireClaimedRecoveryTape(&tape)
 }
 
-func (r *Runtime) recoveryOutput(tapePath, format string) (string, bool, error) {
+func (r *Runtime) recoveryOutput(tapePath, format string) (string, error) {
 	name := strings.TrimSuffix(filepath.Base(tapePath), filepath.Ext(tapePath)) + "." + format
 	preferred := filepath.Join(r.root, "recordings", name)
-	if info, err := os.Stat(preferred); errors.Is(err, os.ErrNotExist) {
-		return preferred, false, nil
+	if _, err := os.Lstat(preferred); errors.Is(err, os.ErrNotExist) {
+		return preferred, nil
 	} else if err != nil {
-		return "", false, err
-	} else if info.Mode().IsRegular() && info.Size() > 0 {
-		// A prior recovery may have published successfully and then crashed
-		// before deleting its canonical tape. Treat the validated final as the
-		// completion marker instead of creating a duplicate every launch.
-		return preferred, true, nil
+		return "", err
 	}
 	output, err := r.nextOutput("recordings", format)
-	return output, false, err
+	return output, err
 }
 
-func retireRecoveryTape(path string) error {
-	if err := os.Remove(path); err == nil || errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else {
-		// Leave the known canonical name in the scan set. On the next launch the
-		// already-published media is the completion marker, so recovery retries
-		// only this deletion and never creates a duplicate or strands an
-		// untracked multi-gigabyte renamed tape.
-		return fmt.Errorf("remove recovered CellTape %s: %w", path, err)
+func validateRecoveredOutput(options RecordOptions, format string) error {
+	maximumWidth, maximumHeight := 3840, 2160
+	if format == string(recording.FormatGIF) {
+		maximumWidth, maximumHeight = 1920, 1080
 	}
+	if options.Width < 1 || options.Height < 1 || options.Width > maximumWidth || options.Height > maximumHeight {
+		return fmt.Errorf("recovery output size %dx%d is outside the product limit %dx%d", options.Width, options.Height, maximumWidth, maximumHeight)
+	}
+	maximumFPS := 60
+	if format == string(recording.FormatGIF) {
+		maximumFPS = 30
+	}
+	if options.FPS < 1 || options.FPS > maximumFPS {
+		return fmt.Errorf("recovery output FPS %d is outside 1..%d", options.FPS, maximumFPS)
+	}
+	if !strings.EqualFold(options.Quality, "standard") && !strings.EqualFold(options.Quality, "high") {
+		return fmt.Errorf("recovery output quality %q is invalid", safeTerminalText(options.Quality))
+	}
+	return nil
+}
+
+func retireClaimedRecoveryTape(tape *taperecovery.Tape) error {
+	if err := tape.Retire(); err != nil {
+		return fmt.Errorf("retire claimed CellTape %s: %w", tape.Path, err)
+	}
+	return nil
 }
 
 func (r *Runtime) Snapshot(options RecordOptions) {
+	if !r.beginAction() {
+		return
+	}
+	defer r.wg.Done()
 	frame, ok := r.currentCanonicalFrame()
 	if !ok {
 		r.publishEvent(RuntimeEvent{Kind: RuntimeSnapshotError, Err: errors.New("the terminal preview is not ready yet")})
@@ -994,6 +1306,10 @@ func (r *Runtime) writeSnapshot(request snapshotRequest) {
 }
 
 func (r *Runtime) OpenFolder() {
+	if !r.beginAction() {
+		return
+	}
+	defer r.wg.Done()
 	r.recordMu.Lock()
 	last := r.lastSaved
 	r.recordMu.Unlock()
@@ -1008,7 +1324,7 @@ func (r *Runtime) OpenFolder() {
 			r.publishEvent(RuntimeEvent{Kind: RuntimeFolderError, Err: err})
 			return
 		}
-		if err := exec.Command("explorer.exe", directory).Start(); err != nil {
+		if err := r.openFolder(r.ctx, directory); err != nil {
 			r.publishEvent(RuntimeEvent{Kind: RuntimeFolderError, Err: err})
 			return
 		}
@@ -1016,9 +1332,195 @@ func (r *Runtime) OpenFolder() {
 	}()
 }
 
+func (r *Runtime) CreateSupportReport() {
+	if !r.beginAction() {
+		return
+	}
+	go func() {
+		defer r.wg.Done()
+		prepared, _, err := r.support.Prepare(r.currentSupportFacts(), supportreport.Include{})
+		if err == nil {
+			var saved supportreport.Saved
+			saved, err = r.support.Save(r.root, prepared)
+			if err == nil {
+				r.publishEvent(RuntimeEvent{Kind: RuntimeSupportReportSaved, Path: saved.Path})
+				return
+			}
+		}
+		r.publishEvent(RuntimeEvent{Kind: RuntimeSupportReportError, Err: err})
+	}()
+}
+
+func (r *Runtime) currentSupportFacts() supportreport.Current {
+	settings := r.currentSettings()
+	view := r.currentView()
+
+	r.supportMu.Lock()
+	cameraName, source := r.supportCamera, r.supportSource
+	r.supportMu.Unlock()
+	r.devicesMu.RLock()
+	deviceCount := len(r.deviceIDs)
+	r.devicesMu.RUnlock()
+
+	r.previewMu.RLock()
+	columns, rows := r.latestPreview.Columns, r.latestPreview.Rows
+	r.previewMu.RUnlock()
+	if columns <= 0 || rows <= 0 {
+		columns, rows = view.MaxColumns, view.MaxRows
+	}
+
+	r.recordMu.Lock()
+	state := "idle"
+	switch {
+	case r.recordStarting:
+		state = "starting"
+	case r.tape != nil:
+		state = "recording"
+	case r.recordClosing || r.recoveryRunning:
+		state = "saving"
+	}
+	recordOptions, recordStarted := r.recordOptions, r.tapeStarted
+	duration, recordResult := r.recordDuration, r.recordResult
+	if recordOptions.Format == "" {
+		recordOptions = RecordOptions{
+			Format: settings.SaveFormat, Quality: settings.ExportQuality,
+			Width: settings.RecordingWidth, Height: settings.RecordingHeight, FPS: settings.RecordingFPS,
+		}
+	}
+	r.recordMu.Unlock()
+	if !recordStarted.IsZero() {
+		duration = max(time.Since(recordStarted), 0)
+	}
+	r.ffmpegMu.RLock()
+	ffmpegAvailable := r.ffmpeg != ""
+	r.ffmpegMu.RUnlock()
+
+	backend, requestedFormat := supportCameraBackend(cameraName)
+	look := "custom"
+	switch strings.ToLower(strings.TrimSpace(view.ColorLook)) {
+	case "", "none":
+		look = "none"
+	case "warm", "cool", "mono":
+		look = "built-in"
+	}
+	detail := "balanced"
+	switch strings.ToLower(strings.TrimSpace(view.Detail)) {
+	case "smooth", "soft":
+		detail = "soft"
+	case "sharp", "crisp":
+		detail = "crisp"
+	}
+	framing := "whole"
+	if view.Fill {
+		framing = "fill"
+	}
+	downsample := 4
+	pixelLayout := "planar-ycbcr"
+	if backend == "demo" {
+		downsample = 0
+		pixelLayout = "demo"
+	} else if backend == "avfoundation" {
+		pixelLayout = "nv12"
+	} else if backend == "unknown" {
+		pixelLayout = "unknown"
+	}
+	return supportreport.Current{
+		Camera: supportreport.CameraFacts{
+			Model: cameraName, Backend: backend, DeviceCount: deviceCount,
+			Requested: supportreport.ModeFacts{
+				Width: settings.CaptureWidth, Height: settings.CaptureHeight,
+				FPSNumerator: uint32(max(settings.CaptureFPS, 0)), FPSDenominator: 1, Format: requestedFormat,
+			},
+			Selected: supportreport.ModeFacts{
+				Width: source.Width, Height: source.Height,
+				FPSNumerator: source.FPSNumerator, FPSDenominator: source.FPSDenominator, Format: source.Format,
+			},
+			Downsample: downsample, PixelLayout: pixelLayout, Permission: "unknown",
+		},
+		View: supportreport.ViewFacts{
+			GridColumns: columns, GridRows: rows, Framing: framing, Mirror: view.Mirror,
+			Detail: detail, Look: look, LookMix: view.LookStrength, TargetFPS: view.TargetFPS,
+		},
+		Recording: supportreport.RecordingFacts{
+			State: state, Format: strings.ToLower(recordOptions.Format), Width: recordOptions.Width,
+			Height: recordOptions.Height, FPS: recordOptions.FPS, Quality: strings.ToLower(recordOptions.Quality),
+			DurationMillis: duration.Milliseconds(), Result: recordResult,
+			FFmpeg: supportreport.FFmpegFacts{Available: ffmpegAvailable},
+		},
+	}
+}
+
+func supportCameraBackend(camera string) (backend, requestedFormat string) {
+	if strings.EqualFold(strings.TrimSpace(camera), "DEMO") {
+		return "demo", "DEMO"
+	}
+	switch goruntime.GOOS {
+	case "windows":
+		return "media-foundation", "MJPG"
+	case "linux":
+		return "v4l2", "MJPG"
+	case "darwin":
+		return "avfoundation", "NV12"
+	default:
+		return "unknown", "unknown"
+	}
+}
+
+func (r *Runtime) observeSupportSample(result celllive.Result) {
+	if r.support == nil {
+		return
+	}
+	now := time.Now()
+	r.supportMu.Lock()
+	if !r.supportSampleAt.IsZero() && now.Sub(r.supportSampleAt) < 5*time.Second {
+		r.supportMu.Unlock()
+		return
+	}
+	r.supportSampleAt = now
+	r.supportMu.Unlock()
+
+	var memory goruntime.MemStats
+	goruntime.ReadMemStats(&memory)
+	r.deliveryMu.Lock()
+	accepted, dropped, shownFPS := r.deliveryAccepted, r.deliveryDropped, r.deliveryFPS
+	r.deliveryMu.Unlock()
+	queue := supportreport.QueueHealth{}
+	r.recordMu.Lock()
+	if r.tape != nil {
+		pressure := r.tape.QueuePressure()
+		queue = supportreport.QueueHealth{
+			Active: true, InFlight: pressure.InFlight, HighWater: pressure.HighWater, Capacity: pressure.Capacity,
+		}
+	}
+	r.recordMu.Unlock()
+	captureDropped := result.Capture.DroppedPackets + result.Capture.DroppedFrames + result.Capture.DecodeErrors
+	presentationDropped := uint64(0)
+	if result.Dropped > captureDropped {
+		presentationDropped = result.Dropped - captureDropped
+	}
+	r.support.Observe(supportreport.Sample{
+		ObservedAt: now, SourceFPS: result.SourceFPS, ShownFPS: shownFPS,
+		GridColumns: result.Columns, GridRows: result.Rows,
+		Capture: supportreport.CaptureHealth{
+			Packets: result.Capture.Packets, Decoded: result.Capture.Decoded,
+			DroppedPackets: result.Capture.DroppedPackets, DroppedFrames: result.Capture.DroppedFrames,
+			DecodeErrors: result.Capture.DecodeErrors, TemporaryErrors: result.Capture.TemporaryErrors,
+		},
+		Presentation: supportreport.PresentationHealth{Accepted: accepted, Dropped: dropped + presentationDropped},
+		Queue:        queue,
+		Process: supportreport.ProcessHealth{
+			HeapBytes: memory.HeapAlloc, Goroutines: goruntime.NumGoroutine(), GCCycles: memory.NumGC,
+		},
+	})
+}
+
 const settingsSaveDebounce = 35 * time.Millisecond
 
 func (r *Runtime) Save(settings Settings) {
+	if !r.beginAction() {
+		return
+	}
+	defer r.wg.Done()
 	// saveMu is an admission gate as well as the one-slot pending state. Close
 	// takes the same gate before choosing its final snapshot, so a Save either
 	// becomes part of that snapshot or is cleanly rejected after shutdown.
@@ -1121,10 +1623,14 @@ func (r *Runtime) stopSettingsSaver() error {
 }
 
 func (r *Runtime) Close() error {
-	var closeErr error
 	r.closeOnce.Do(func() {
+		r.actionMu.Lock()
 		r.closed.Store(true)
+		r.actionMu.Unlock()
+		r.cameraSelectMu.Lock()
 		r.advanceCameraGeneration()
+		r.cancelCameraLifetime()
+		r.cameraSelectMu.Unlock()
 		r.cancel()
 		settingsErr := r.stopSettingsSaver()
 		r.cameraOpMu.Lock()
@@ -1132,21 +1638,23 @@ func (r *Runtime) Close() error {
 		session := r.session
 		r.session = nil
 		r.sessionMu.Unlock()
+		var cameraCloseErr error
 		if session != nil {
-			session.Close()
+			cameraCloseErr = r.closeCameraSession(session)
 		}
+		r.sessionMu.RLock()
+		cameraShutdownErr := r.cameraShutdownErr
+		r.sessionMu.RUnlock()
 		r.cameraOpMu.Unlock()
 
 		r.recordMu.Lock()
-		tape, tapeFinal := r.tape, r.tapeFinal
-		r.tape, r.tapeConfig = nil, nil
+		tape, reservation, tapeFinal := r.tape, r.tapeReservation, r.tapeFinal
+		r.tape, r.tapeReservation, r.tapeConfig = nil, taperecovery.Reservation{}, nil
 		r.snapshotSaving = false
 		r.recordMu.Unlock()
 		if tape != nil {
-			closeErr = tape.Close()
-			if publishErr := celltape.Publish(tape.StagingPath(), tapeFinal); publishErr != nil {
-				closeErr = errors.Join(closeErr, publishErr)
-			}
+			claim, publishErr := closeAndPublishReservedTape(tape, reservation, tapeFinal)
+			r.closeErr = errors.Join(r.closeErr, publishErr, claim.Release())
 		}
 		r.previewMu.Lock()
 		latest := r.latestFrame
@@ -1156,12 +1664,28 @@ func (r *Runtime) Close() error {
 		if latest != nil {
 			latest.Release()
 		}
-		closeErr = errors.Join(closeErr, settingsErr)
+		if errors.Is(cameraCloseErr, capture.ErrShutdownUncertain) {
+			cameraCloseErr = nil
+		}
+		r.closeErr = errors.Join(r.closeErr, settingsErr, cameraCloseErr, cameraShutdownErr)
 		r.wg.Wait()
 		close(r.previews)
 		close(r.events)
 	})
-	return closeErr
+	return r.closeErr
+}
+
+func (r *Runtime) beginAction() bool {
+	if r == nil {
+		return false
+	}
+	r.actionMu.Lock()
+	defer r.actionMu.Unlock()
+	if r.closed.Load() {
+		return false
+	}
+	r.wg.Add(1)
+	return true
 }
 
 func (r *Runtime) currentSettings() Settings {
@@ -1229,6 +1753,7 @@ func (r *Runtime) observePreviewOutcome(accepted bool) {
 	}
 	if accepted {
 		r.deliveryCount++
+		r.deliveryAccepted++
 	} else {
 		r.deliveryDropped++
 	}
@@ -1240,10 +1765,49 @@ func (r *Runtime) observePreviewOutcome(accepted bool) {
 }
 
 func (r *Runtime) publishEvent(event RuntimeEvent) {
+	r.recordSupportEvent(event)
 	select {
 	case r.events <- event:
 	case <-r.ctx.Done():
 	}
+}
+
+func (r *Runtime) recordSupportEvent(event RuntimeEvent) {
+	if r.support == nil {
+		return
+	}
+	record := supportreport.Event{OccurredAt: time.Now(), Severity: supportreport.SeverityError}
+	switch event.Kind {
+	case RuntimeDevicesFound:
+		if event.Err == nil {
+			return
+		}
+		record.Area, record.Code = supportreport.AreaCamera, supportreport.CodeDiscoveryFailed
+	case RuntimeCameraLive:
+		record.Area, record.Code, record.Severity = supportreport.AreaCamera, supportreport.CodeCompleted, supportreport.SeverityInfo
+	case RuntimeCameraError:
+		record.Area, record.Code = supportreport.AreaCamera, supportreport.CodeStreamEnded
+	case RuntimeRecordingSaved:
+		record.Area, record.Code, record.Severity = supportreport.AreaRecording, supportreport.CodeCompleted, supportreport.SeverityInfo
+	case RuntimeRecordingError:
+		record.Area, record.Code = supportreport.AreaRecording, supportreport.CodeSaveFailed
+	case RuntimeRecoveryError:
+		record.Area, record.Code = supportreport.AreaRecovery, supportreport.CodeRecoveryFailed
+	case RuntimeSnapshotSaved:
+		record.Area, record.Code, record.Severity = supportreport.AreaRecording, supportreport.CodeCompleted, supportreport.SeverityInfo
+	case RuntimeSnapshotError, RuntimeFolderError:
+		record.Area, record.Code = supportreport.AreaRecording, supportreport.CodeSaveFailed
+	case RuntimeSettingsError:
+		record.Area, record.Code = supportreport.AreaSettings, supportreport.CodeSettingsFailed
+	case RuntimeLooksFound:
+		if event.Err == nil {
+			return
+		}
+		record.Area, record.Code = supportreport.AreaLooks, supportreport.CodeLookRejected
+	default:
+		return
+	}
+	r.support.Record(record)
 }
 
 func (r *Runtime) nextOutput(folder, extension string) (string, error) {

@@ -97,10 +97,6 @@ type chunkMeta struct {
 	rawLen, storedLen                                            uint32
 }
 
-func marshalChunkHeader(m chunkMeta) []byte {
-	return marshalChunkHeaderInto(nil, m)
-}
-
 func marshalChunkHeaderInto(b []byte, m chunkMeta) []byte {
 	if cap(b) < ChunkHeaderBytes {
 		b = make([]byte, ChunkHeaderBytes)
@@ -141,10 +137,6 @@ func parseChunkHeader(b []byte, max uint32) (chunkMeta, error) {
 		return chunkMeta{}, fmt.Errorf("%w: invalid or oversized chunk fields", ErrCorrupt)
 	}
 	return m, nil
-}
-
-func marshalCommit(sequence uint64, stored []byte) []byte {
-	return marshalCommitInto(nil, sequence, stored)
 }
 
 func marshalCommitInto(b []byte, sequence uint64, stored []byte) []byte {
@@ -208,10 +200,6 @@ func readUvarint(b []byte, at *int) (uint64, error) {
 	}
 	*at += n
 	return v, nil
-}
-
-func encodeKeyframe(in Input) ([]byte, error) {
-	return encodeKeyframeInto(nil, in)
 }
 
 func encodeKeyframeInto(b []byte, in Input) ([]byte, error) {
@@ -306,11 +294,6 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 		return 0, io.ErrShortBuffer
 	}
 	return b.Buffer.Write(p)
-}
-
-func maybeCompress(raw []byte, mode Compression) ([]byte, uint8) {
-	var compressor fastCompressor
-	return compressor.compress(raw, mode)
 }
 
 type fastCompressor struct {

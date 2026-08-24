@@ -1,23 +1,27 @@
 # Third-party notices
 
-This file covers the Go code linked into the Windows executable for `v0.1.0-beta.1` and the external FFmpeg executable used for MP4/GIF export.
+This file covers the Go code linked into the current Windows executable, the
+source dependency graph, the system libjpeg-turbo used by experimental Linux
+builds, and the external FFmpeg executable used for MP4/GIF export.
 
 Inlaid itself is licensed under the MIT License in [LICENSE](LICENSE).
 
 ## Linked Go software
 
-The Windows executable contains the Go runtime and code from these modules:
+Inlaid contains the Go runtime and code selected from these modules. Platform
+build tags omit modules that a particular executable does not use.
 
 | Module | Version | License / copyright notice |
 |---|---|---|
 | [charm.land/bubbles/v2](https://github.com/charmbracelet/bubbles) | 2.1.1 | MIT; © 2020–2026 Charmbracelet, Inc. |
-| [charm.land/bubbletea/v2](https://github.com/charmbracelet/bubbletea) | 2.0.8 | MIT; © 2020–2026 Charmbracelet, Inc. |
+| [charm.land/bubbletea/v2](https://github.com/charmbracelet/bubbletea) | 2.0.9 | MIT; © 2020–2026 Charmbracelet, Inc. |
 | [charm.land/lipgloss/v2](https://github.com/charmbracelet/lipgloss) | 2.0.6 | MIT; © 2021–2026 Charmbracelet, Inc. |
 | [github.com/charmbracelet/colorprofile](https://github.com/charmbracelet/colorprofile) | 0.4.3 | MIT; © 2020–2024 Charmbracelet, Inc. |
 | [github.com/charmbracelet/ultraviolet](https://github.com/charmbracelet/ultraviolet) | 0.0.0-20260811164956-006e29f97886 | MIT; © 2025 Charmbracelet, Inc. |
 | [github.com/charmbracelet/x/ansi](https://github.com/charmbracelet/x/tree/main/ansi) | 0.11.8 | MIT; © 2023 Charmbracelet, Inc. |
 | [github.com/charmbracelet/x/mosaic](https://github.com/charmbracelet/x/tree/main/mosaic) | 0.0.0-20260816001655-68d539dca504 | MIT; © 2023 Charmbracelet, Inc. |
 | [github.com/charmbracelet/x/term](https://github.com/charmbracelet/x/tree/main/term) | 0.2.2 | MIT; © 2023 Charmbracelet, Inc. |
+| [github.com/charmbracelet/x/termios](https://github.com/charmbracelet/x/tree/main/termios) | 0.1.1 | MIT; © 2023 Charmbracelet, Inc. |
 | [github.com/charmbracelet/x/windows](https://github.com/charmbracelet/x/tree/main/windows) | 0.2.2 | MIT; © 2023 Charmbracelet, Inc. |
 | [github.com/clipperhouse/displaywidth](https://github.com/clipperhouse/displaywidth) | 0.11.0 | MIT; © 2025 Matt Sherman |
 | [github.com/clipperhouse/uax29/v2](https://github.com/clipperhouse/uax29) | 2.7.0 | MIT; © 2020 Matt Sherman |
@@ -33,6 +37,21 @@ The Windows executable contains the Go runtime and code from these modules:
 
 The exact module graph for a source checkout is recorded in `go.mod` and `go.sum`. The launcher and setup script do not download a Go toolchain; source builds use Go already installed by the user or already present at `.tools\go\bin\go.exe`.
 
+## Linux libjpeg-turbo
+
+The experimental Linux camera backend uses the TurboJPEG API from a
+system-installed libjpeg-turbo. Inlaid does not bundle that library. The
+libjpeg-turbo project states that its TurboJPEG API is covered by the IJG
+License and the Modified 3-Clause BSD License. Its complete notices and source
+are available in the project's
+[license file](https://github.com/libjpeg-turbo/libjpeg-turbo/blob/main/LICENSE.md)
+and [source repository](https://github.com/libjpeg-turbo/libjpeg-turbo).
+
+This software is based in part on the work of the Independent JPEG Group.
+Anyone distributing a Linux binary must also provide the libjpeg-turbo notices
+required by the exact library they distribute or link. Inlaid's current beta
+does not publish a Linux binary.
+
 ## External FFmpeg
 
 FFmpeg is **not bundled** in the source repository, Inlaid executable, or release ZIP.
@@ -45,7 +64,9 @@ That Gyan Essentials build reports `--enable-gpl --enable-version3` and includes
 - [FFmpeg source code](https://ffmpeg.org/download.html#get-sources)
 - [Gyan Windows builds](https://www.gyan.dev/ffmpeg/builds/)
 
-Users may instead set `INLAID_FFMPEG` or place another compatible `ffmpeg.exe` on `PATH`. The license of that chosen build depends on how it was configured.
+Users may instead set `INLAID_FFMPEG` or place another compatible `ffmpeg`
+executable on `PATH`. The license of that chosen build depends on how it was
+configured.
 
 ## MIT License text
 

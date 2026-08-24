@@ -34,8 +34,7 @@ type Config struct {
 	Rows    int
 	Mode    Mode
 	// Transform optionally maps the two solved colors in every cell. The
-	// spatial mask and temporal deadband are selected in source color space;
-	// transformed colors, reconstruction error, and visual hash are emitted.
+	// spatial mask and temporal deadband are selected in source color space.
 	Transform ColorTransform
 	// Buffers is the maximum number of simultaneously live CellFrames. Zero
 	// selects three. Solve returns ErrFramePoolExhausted instead of allocating.
@@ -128,12 +127,6 @@ func NewSolver(cfg Config) (*Solver, error) {
 	}, nil
 }
 
-// Columns returns the fixed terminal width.
-func (s *Solver) Columns() int { return s.columns }
-
-// Rows returns the fixed terminal height.
-func (s *Solver) Rows() int { return s.rows }
-
 // Mode returns the spatial partition mode.
 func (s *Solver) Mode() Mode { return s.mode }
 
@@ -165,15 +158,6 @@ func (s *Solver) SolvePlanar(input PlanarRGB, meta SourceMeta) (*CellFrame, erro
 	return s.solve(source, meta, nil)
 }
 
-// SolvePlanarWithPolicy is the explicit temporal-policy form of SolvePlanar.
-func (s *Solver) SolvePlanarWithPolicy(input PlanarRGB, meta SourceMeta, policy *DeadbandPolicy) (*CellFrame, error) {
-	source, err := s.planarSource(input)
-	if err != nil {
-		return nil, err
-	}
-	return s.solve(source, meta, policy)
-}
-
 // SolveStatistics solves area-aggregated cell-major sufficient statistics.
 func (s *Solver) SolveStatistics(input StatisticsFrame, meta SourceMeta) (*CellFrame, error) {
 	source, err := s.statisticsSource(input)
@@ -181,16 +165,6 @@ func (s *Solver) SolveStatistics(input StatisticsFrame, meta SourceMeta) (*CellF
 		return nil, err
 	}
 	return s.solve(source, meta, nil)
-}
-
-// SolveStatisticsWithPolicy is the explicit temporal-policy form of
-// SolveStatistics.
-func (s *Solver) SolveStatisticsWithPolicy(input StatisticsFrame, meta SourceMeta, policy *DeadbandPolicy) (*CellFrame, error) {
-	source, err := s.statisticsSource(input)
-	if err != nil {
-		return nil, err
-	}
-	return s.solve(source, meta, policy)
 }
 
 type sourceKind uint8
@@ -325,14 +299,13 @@ func (s *Solver) solve(source spatialSource, meta SourceMeta, policy *DeadbandPo
 		return nil, ErrFramePoolExhausted
 	}
 	frame.meta = meta
-	var totalError uint64
 	cellIndex := 0
 	for y := 0; y < s.rows; y++ {
 		for x := 0; x < s.columns; x++ {
 			quadrants := source.cell(s.columns, x, y, cellIndex)
 			cell, cellError := solveCell(quadrants, s.mode)
 			if policy != nil {
-				cell, cellError = policy.choose(cellIndex, quadrants, cell, cellError)
+				cell = policy.choose(cellIndex, quadrants, cell, cellError)
 			}
 			if s.transform != nil {
 				foreground, background := cell.Foreground(), cell.Background()
@@ -344,18 +317,14 @@ func (s *Solver) solve(source spatialSource, meta SourceMeta, policy *DeadbandPo
 					background = s.transform.TransformRGB(background)
 				}
 				cell = NewCell(cell.Mask(), foreground, background)
-				cellError = cellErrorUnchecked(cell, quadrants)
 			}
 			frame.cells[cellIndex] = cell
-			totalError += cellError
 			cellIndex++
 		}
 	}
 	if policy != nil {
 		policy.finish(meta)
 	}
-	frame.reconstructionError = totalError
-	frame.hash = visualHash(meta.GeometryEpoch, s.columns, s.rows, frame.cells)
 	return frame, nil
 }
 
@@ -391,12 +360,28 @@ func statsForRGB(r, g, b uint8) SampleStats {
 }
 
 func solveCell(quadrants [4]SampleStats, mode Mode) (Cell, uint64) {
+	total := quadrants[0]
+	total.add(quadrants[1])
+	total.add(quadrants[2])
+	total.add(quadrants[3])
 	if mode == ModeSoft {
-		return fitPartition(quadrants, 0x03)
+		foreground := quadrants[0]
+		foreground.add(quadrants[1])
+		return fitPartition(foreground, total.subtract(foreground), 0x03)
 	}
-	bestCell, bestError := fitPartition(quadrants, 0)
+	q01 := quadrants[0]
+	q01.add(quadrants[1])
+	q02 := quadrants[0]
+	q02.add(quadrants[2])
+	q12 := quadrants[1]
+	q12.add(quadrants[2])
+	q012 := q01
+	q012.add(quadrants[2])
+	foregrounds := [8]SampleStats{{}, quadrants[0], quadrants[1], q01, quadrants[2], q02, q12, q012}
+	bestCell, bestError := fitPartition(foregrounds[0], total, 0)
 	for mask := uint8(1); mask < 8; mask++ {
-		candidate, candidateError := fitPartition(quadrants, mask)
+		foreground := foregrounds[mask]
+		candidate, candidateError := fitPartition(foreground, total.subtract(foreground), mask)
 		// Masks are visited in canonical numeric order, so retaining the first
 		// exact tie is deterministic and selects the smallest mask.
 		if candidateError < bestError {
@@ -406,15 +391,7 @@ func solveCell(quadrants [4]SampleStats, mode Mode) (Cell, uint64) {
 	return bestCell, bestError
 }
 
-func fitPartition(quadrants [4]SampleStats, mask uint8) (Cell, uint64) {
-	var foreground, background SampleStats
-	for quadrant, stats := range quadrants {
-		if mask&(1<<quadrant) != 0 {
-			foreground.add(stats)
-		} else {
-			background.add(stats)
-		}
-	}
+func fitPartition(foreground, background SampleStats, mask uint8) (Cell, uint64) {
 	fg := foreground.meanLower()
 	bg := background.meanLower()
 	if foreground.Count == 0 {
@@ -424,7 +401,7 @@ func fitPartition(quadrants [4]SampleStats, mask uint8) (Cell, uint64) {
 		bg = fg
 	}
 	cell := NewCell(mask, fg, bg)
-	return cell, cellErrorUnchecked(cell, quadrants)
+	return cell, foreground.errorFor(fg) + background.errorFor(bg)
 }
 
 func (s *SampleStats) add(other SampleStats) {
@@ -433,6 +410,15 @@ func (s *SampleStats) add(other SampleStats) {
 	s.SumG += other.SumG
 	s.SumB += other.SumB
 	s.SumSquares += other.SumSquares
+}
+
+func (s SampleStats) subtract(other SampleStats) SampleStats {
+	s.Count -= other.Count
+	s.SumR -= other.SumR
+	s.SumG -= other.SumG
+	s.SumB -= other.SumB
+	s.SumSquares -= other.SumSquares
+	return s
 }
 
 func (s SampleStats) meanLower() RGB {
@@ -454,20 +440,6 @@ func nearestIntegerLowerTie(sum, count uint64) uint8 {
 		quotient++
 	}
 	return uint8(quotient)
-}
-
-// CellError returns exact total squared RGB-channel reconstruction error for a
-// cell over four non-empty quadrant statistics.
-func CellError(cell Cell, quadrants [4]SampleStats) (uint64, error) {
-	for _, stats := range quadrants {
-		if err := validateStats(stats); err != nil {
-			return 0, err
-		}
-	}
-	if !cell.IsCanonical() {
-		return 0, errors.New("cellframe: CellError requires a canonical cell")
-	}
-	return cellErrorUnchecked(cell, quadrants), nil
 }
 
 func cellErrorUnchecked(cell Cell, quadrants [4]SampleStats) uint64 {

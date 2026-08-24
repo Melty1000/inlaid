@@ -10,10 +10,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Melty1000/inlaid/internal/capture"
 	"github.com/Melty1000/inlaid/internal/cellframe"
 	"github.com/Melty1000/inlaid/internal/cellreduce"
 	"github.com/Melty1000/inlaid/internal/cellrender"
-	"github.com/Melty1000/inlaid/internal/mfcapture"
 )
 
 const (
@@ -51,16 +51,17 @@ type Result struct {
 	SourceFPS     float64
 	ShownFPS      float64
 	Dropped       uint64
-	SolveDuration time.Duration
+	Capture       capture.Stats
 }
 
 // SourceInfo is the real camera mode behind a session. It is presentation
 // truth for the dashboard, not the preferred mode originally requested.
 type SourceInfo struct {
-	Width, Height int
-	FPS           float64
-	Format        string
-	Backend       string
+	Width, Height  int
+	FPS            float64
+	FPSNumerator   uint32
+	FPSDenominator uint32
+	Format         string
 }
 
 // Session owns capture, reduction, solving, and every frame it has not handed
@@ -75,23 +76,27 @@ type Session struct {
 	cancel    context.CancelFunc
 	done      chan struct{}
 	closeOnce sync.Once
+	closeErr  error
 	source    SourceInfo
 }
 
-// StartMediaFoundation opens the measured Windows native-MJPEG/WIC path.
-func StartMediaFoundation(parent context.Context, camera mfcapture.Config, view ViewConfig) (*Session, error) {
+// StartCamera opens the native camera backend for the current operating system.
+func StartCamera(parent context.Context, camera capture.Config, view ViewConfig) (*Session, error) {
 	if parent == nil {
 		parent = context.Background()
 	}
-	source, err := mfcapture.Open(parent, camera)
+	source, err := capture.Open(parent, camera)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(parent)
 	session := newSession(cancel)
 	mode := source.Mode()
-	session.source = SourceInfo{Width: mode.Width, Height: mode.Height, FPS: mode.FPS(), Format: mode.Format, Backend: "Media Foundation"}
-	go session.runMediaFoundation(ctx, source, normalizeView(view))
+	session.source = SourceInfo{
+		Width: mode.Width, Height: mode.Height, FPS: mode.FPS(),
+		FPSNumerator: mode.FPSNumerator, FPSDenominator: mode.FPSDenominator, Format: mode.Format,
+	}
+	go session.runCamera(ctx, source, normalizeView(view))
 	return session, nil
 }
 
@@ -105,7 +110,10 @@ func StartSynthetic(parent context.Context, width, height, fps int, view ViewCon
 	}
 	ctx, cancel := context.WithCancel(parent)
 	session := newSession(cancel)
-	session.source = SourceInfo{Width: width, Height: height, FPS: float64(fps), Format: "synthetic", Backend: "Demo"}
+	session.source = SourceInfo{
+		Width: width, Height: height, FPS: float64(fps),
+		FPSNumerator: uint32(fps), FPSDenominator: 1, Format: "DEMO",
+	}
 	go session.runSynthetic(ctx, width, height, fps, normalizeView(view))
 	return session, nil
 }
@@ -156,11 +164,11 @@ func (s *Session) Update(view ViewConfig) {
 	}
 }
 
-// Close is idempotent, cancels native capture, and releases any unconsumed
-// canonical result.
-func (s *Session) Close() {
+// Close is idempotent, cancels native capture, releases any unconsumed
+// canonical result, and reports whether native ownership shut down cleanly.
+func (s *Session) Close() error {
 	if s == nil {
-		return
+		return nil
 	}
 	s.closeOnce.Do(func() {
 		s.cancel()
@@ -171,6 +179,7 @@ func (s *Session) Close() {
 			}
 		}
 	})
+	return s.closeErr
 }
 
 type pipelineState struct {
@@ -188,14 +197,19 @@ type pipelineState struct {
 func (p *pipelineState) update(view ViewConfig, sourceWidth, sourceHeight int) error {
 	geometry := cellreduce.FitGeometry(sourceWidth, sourceHeight, view.MaxColumns, view.MaxRows, view.Fill)
 	geometry.Mirror = view.Mirror
-	changed := p.reducer == nil || geometry != p.geometry || view.Mode != p.mode || view.TransformID != p.transformID
+	geometryChanged := p.reducer == nil || geometry != p.geometry
+	solverChanged := p.solver == nil || geometryChanged || view.Mode != p.mode || view.TransformID != p.transformID
 	p.view = view
-	if !changed {
+	if !solverChanged {
 		return nil
 	}
-	reducer, err := cellreduce.New(geometry)
-	if err != nil {
-		return err
+	reducer := p.reducer
+	if geometryChanged {
+		var err error
+		reducer, err = cellreduce.New(geometry)
+		if err != nil {
+			return err
+		}
 	}
 	solver, err := cellframe.NewSolver(cellframe.Config{
 		// Eight bounded leases cover the producer, latest-wins handoffs, the
@@ -207,14 +221,20 @@ func (p *pipelineState) update(view ViewConfig, sourceWidth, sourceHeight int) e
 		return err
 	}
 	p.geometry, p.mode, p.transformID, p.reducer, p.solver = geometry, view.Mode, view.TransformID, reducer, solver
-	p.synthetic = nil
-	p.geometryEpoch++
+	if geometryChanged {
+		p.synthetic = nil
+		p.geometryEpoch++
+	}
 	return nil
 }
 
-func (s *Session) runMediaFoundation(ctx context.Context, source *mfcapture.Session, view ViewConfig) {
+func (s *Session) runCamera(ctx context.Context, source *capture.Session, view ViewConfig) {
 	defer s.finish()
-	defer source.Close()
+	defer func() {
+		if err := source.Close(); err != nil {
+			s.closeErr = fmt.Errorf("close native capture: %w", err)
+		}
+	}()
 	state := pipelineState{view: view}
 	frames, sourceErrors := source.Frames, source.Errors
 	var cadence cadenceGate
@@ -252,13 +272,7 @@ func (s *Session) runMediaFoundation(ctx context.Context, source *mfcapture.Sess
 				s.publishError(err)
 				return
 			}
-			started := time.Now()
-			statistics, err := state.reducer.ReduceYCbCr(cellreduce.YCbCr{
-				Y: frame.Y.Pix, Cb: frame.Cb.Pix, Cr: frame.Cr.Pix,
-				Width: frame.Y.Width, Height: frame.Y.Height, YStride: frame.Y.Stride,
-				ChromaWidth: frame.Cb.Width, ChromaHeight: frame.Cb.Height,
-				CbStride: frame.Cb.Stride, CrStride: frame.Cr.Stride,
-			})
+			statistics, err := reduceCameraFrame(state.reducer, frame)
 			if err != nil {
 				frame.Release()
 				s.publishError(err)
@@ -266,7 +280,7 @@ func (s *Session) runMediaFoundation(ctx context.Context, source *mfcapture.Sess
 			}
 			canonical, err := state.solver.SolveStatistics(statistics, cellframe.SourceMeta{
 				GeometryEpoch: state.geometryEpoch, SourceSequence: frame.Sequence,
-				CapturedAt: time.Now(), PTS: pts,
+				PTS: pts,
 			})
 			frame.Release()
 			if err != nil {
@@ -279,18 +293,70 @@ func (s *Session) runMediaFoundation(ctx context.Context, source *mfcapture.Sess
 				s.publishError(err)
 				return
 			}
-			duration := time.Since(started)
 			state.stats.observeShown(time.Now())
 			captureStats := source.Stats()
 			s.publish(Result{
 				Version: state.view.Version, Frame: canonical, ANSI: ansi,
 				Columns: canonical.Columns(), Rows: canonical.Rows(), Sequence: canonical.SourceSequence(),
 				SourceFPS: state.stats.sourceFPS, ShownFPS: state.stats.shownFPS,
-				Dropped:       captureStats.DroppedPackets + captureStats.DroppedFrames + captureStats.DecodeErrors + state.stats.presentationDropped,
-				SolveDuration: duration,
+				Dropped: captureStats.DroppedPackets + captureStats.DroppedFrames + captureStats.DecodeErrors + state.stats.presentationDropped,
+				Capture: captureStats,
 			}, &state.stats)
 		}
 	}
+}
+
+func reduceCameraFrame(reducer *cellreduce.Reducer, frame *capture.Frame) (cellframe.StatisticsFrame, error) {
+	if reducer == nil || frame == nil {
+		return cellframe.StatisticsFrame{}, errors.New("celllive: camera frame is unavailable")
+	}
+	switch frame.Layout {
+	case capture.PixelLayoutPlanarYCbCr:
+		if frame.Range != capture.ColorRangeFull || frame.Matrix != capture.ColorMatrixBT601 {
+			return cellframe.StatisticsFrame{}, errors.New("celllive: planar camera frame is not full-range BT.601")
+		}
+		return reducer.ReduceYCbCr(cellreduce.YCbCr{
+			Y: frame.Y.Pix, Cb: frame.Cb.Pix, Cr: frame.Cr.Pix,
+			Width: frame.Y.Width, Height: frame.Y.Height, YStride: frame.Y.Stride,
+			ChromaWidth: frame.Cb.Width, ChromaHeight: frame.Cb.Height,
+			CbStride: frame.Cb.Stride, CrStride: frame.Cr.Stride,
+		})
+	case capture.PixelLayoutNV12:
+		rangeValue, matrixValue, err := cameraColorMetadata(frame.Range, frame.Matrix)
+		if err != nil {
+			return cellframe.StatisticsFrame{}, err
+		}
+		return reducer.ReduceNV12(cellreduce.NV12{
+			Y: frame.Y.Pix, UV: frame.UV.Pix,
+			Width: frame.Y.Width, Height: frame.Y.Height,
+			YStride: frame.Y.Stride, UVStride: frame.UV.Stride,
+			Range: rangeValue, Matrix: matrixValue,
+		})
+	default:
+		return cellframe.StatisticsFrame{}, fmt.Errorf("celllive: unsupported camera pixel layout %d", frame.Layout)
+	}
+}
+
+func cameraColorMetadata(colorRange capture.ColorRange, matrix capture.ColorMatrix) (cellreduce.ColorRange, cellreduce.ColorMatrix, error) {
+	var rangeValue cellreduce.ColorRange
+	switch colorRange {
+	case capture.ColorRangeFull:
+		rangeValue = cellreduce.ColorRangeFull
+	case capture.ColorRangeVideo:
+		rangeValue = cellreduce.ColorRangeVideo
+	default:
+		return 0, 0, errors.New("celllive: camera frame has no valid color range")
+	}
+	var matrixValue cellreduce.ColorMatrix
+	switch matrix {
+	case capture.ColorMatrixBT601:
+		matrixValue = cellreduce.ColorMatrixBT601
+	case capture.ColorMatrixBT709:
+		matrixValue = cellreduce.ColorMatrixBT709
+	default:
+		return 0, 0, errors.New("celllive: camera frame has no valid color matrix")
+	}
+	return rangeValue, matrixValue, nil
 }
 
 func (s *Session) runSynthetic(ctx context.Context, sourceWidth, sourceHeight, fps int, view ViewConfig) {
@@ -318,11 +384,10 @@ func (s *Session) runSynthetic(ctx context.Context, sourceWidth, sourceHeight, f
 				s.publishError(err)
 				return
 			}
-			started := time.Now()
 			statistics := state.syntheticStatistics(sequence)
 			canonical, err := state.solver.SolveStatistics(statistics, cellframe.SourceMeta{
 				GeometryEpoch: state.geometryEpoch, SourceSequence: sequence,
-				CapturedAt: now, PTS: pts,
+				PTS: pts,
 			})
 			if err != nil {
 				s.publishError(err)
@@ -339,7 +404,7 @@ func (s *Session) runSynthetic(ctx context.Context, sourceWidth, sourceHeight, f
 				Version: state.view.Version, Frame: canonical, ANSI: ansi,
 				Columns: canonical.Columns(), Rows: canonical.Rows(), Sequence: sequence,
 				SourceFPS: state.stats.sourceFPS, ShownFPS: state.stats.shownFPS,
-				Dropped: state.stats.presentationDropped, SolveDuration: time.Since(started),
+				Dropped: state.stats.presentationDropped,
 			}, &state.stats)
 		}
 	}
@@ -373,15 +438,11 @@ func (p *pipelineState) syntheticStatistics(sequence uint64) cellframe.Statistic
 	return cellframe.StatisticsFrame{Quadrants: p.synthetic, Columns: columns, Rows: rows}
 }
 
-func sourcePTS(frame *mfcapture.Frame) time.Duration {
-	timestamp := frame.ReaderTimestamp100ns
-	if frame.SampleTimestamp100ns >= 0 {
-		timestamp = frame.SampleTimestamp100ns
-	}
-	if timestamp < 0 || timestamp > math.MaxInt64/100 {
+func sourcePTS(frame *capture.Frame) time.Duration {
+	if frame == nil || frame.PTS < 0 {
 		return 0
 	}
-	return time.Duration(timestamp * 100)
+	return frame.PTS
 }
 
 type cadenceGate struct {
@@ -454,11 +515,6 @@ func cadenceDue(last, current time.Duration, fps int) bool {
 }
 
 func normalizeView(view ViewConfig) ViewConfig {
-	// Clamping each axis before FitGeometry prevents a forged MaxInt x 1 resize
-	// from entering its final integer-adjustment loop hundreds of billions of
-	// times. The product remains bounded independently by cellreduce.MaxCells.
-	view.MaxColumns = min(max(view.MaxColumns, 1), cellreduce.MaxCells)
-	view.MaxRows = min(max(view.MaxRows, 1), cellreduce.MaxCells)
 	if view.TargetFPS <= 0 || view.TargetFPS > 240 {
 		view.TargetFPS = defaultTargetFPS
 	}
@@ -505,7 +561,7 @@ func (s *Session) publishError(err error) {
 	// Recoverable sample-loss notices must never permanently hide the error
 	// that actually ended the stream. When the tiny diagnostic queue is full,
 	// retain its bounded behavior but make room for a terminal error.
-	if mfcapture.IsTemporary(err) {
+	if capture.IsTemporary(err) {
 		return
 	}
 	select {

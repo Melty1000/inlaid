@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"image"
-	"io"
 	"math"
 	"strings"
 
@@ -16,9 +15,13 @@ var (
 	// ErrCellTapeEmpty means that no committed terminal state can be exported.
 	ErrCellTapeEmpty = errors.New("celltape contains no committed frames")
 	// ErrCellTapeTail means that a CRC-checked prefix exists but the tape ends
-	// in an incomplete or corrupt record. Set RepairTail to export that durable
-	// prefix; the original path is otherwise left untouched for recovery.
+	// in an incomplete or corrupt record. Claim it through taperecovery before
+	// export; this package never mutates the canonical tape.
 	ErrCellTapeTail = errors.New("celltape has a recoverable damaged tail")
+	// ErrCellTapeAmplification means the requested fixed-rate derivative would
+	// exceed the caller's explicit automatic-work budget. The canonical tape is
+	// never removed by this package.
+	ErrCellTapeAmplification = errors.New("celltape output frame budget exceeded")
 )
 
 // CellTapeExportConfig describes an offline derivative of a canonical tape.
@@ -32,10 +35,11 @@ var (
 // must still be held for the time the user was recording. When it is zero, a
 // recovered tape is exported through one frame interval after its last commit.
 type CellTapeExportConfig struct {
-	TapePath     string
-	EndHostNanos uint64
-	RepairTail   bool
-	Writer       Config
+	TapePath        string
+	EndHostNanos    uint64
+	MaxOutputFrames uint64
+	TapeLimits      celltape.Limits
+	Writer          Config
 }
 
 // CellTapeExportReport makes the CFR timing conversion explicit. The tape is
@@ -77,13 +81,32 @@ func ExportCellTape(ctx context.Context, cfg CellTapeExportConfig) (CellTapeExpo
 		return report, errors.New("celltape path is required")
 	}
 
-	replay, err := celltape.Open(cfg.TapePath, celltape.OpenOptions{RepairTail: cfg.RepairTail})
+	replay, err := celltape.OpenContext(ctx, cfg.TapePath, celltape.OpenOptions{Limits: cfg.TapeLimits})
 	if err != nil {
 		return report, fmt.Errorf("open celltape: %w", err)
 	}
 	defer replay.Close()
+	return ExportCellTapeReplay(ctx, replay, cfg)
+}
+
+// ExportCellTapeReplay consumes an already validated replay without reopening
+// its pathname. The caller retains ownership and must close replay.
+func ExportCellTapeReplay(ctx context.Context, replay *celltape.Replay, cfg CellTapeExportConfig) (CellTapeExportReport, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var report CellTapeExportReport
+	if err := ctx.Err(); err != nil {
+		return report, err
+	}
+	if replay == nil {
+		return report, errors.New("celltape replay is required")
+	}
+	if strings.TrimSpace(cfg.TapePath) == "" {
+		return report, errors.New("celltape path is required")
+	}
 	report.Recovery = replay.Recovery()
-	if report.Recovery.TailError != nil && !cfg.RepairTail {
+	if report.Recovery.TailError != nil {
 		return report, fmt.Errorf(
 			"%w: %v (valid prefix: %d states; tape retained at %s)",
 			ErrCellTapeTail,
@@ -124,6 +147,15 @@ func ExportCellTape(ctx context.Context, cfg CellTapeExportConfig) (CellTapeExpo
 		return report, err
 	}
 	report.EncodedFrames = frames
+	if cfg.MaxOutputFrames > 0 && frames > cfg.MaxOutputFrames {
+		return report, fmt.Errorf(
+			"%w: requested %d frames, limit %d (CellTape retained at %s)",
+			ErrCellTapeAmplification,
+			frames,
+			cfg.MaxOutputFrames,
+			cfg.TapePath,
+		)
+	}
 	report.RequestedHostNanos = endHostNanos
 	report.EncodedDurationNanos = durationForFrames(frames, cfg.Writer.FPS)
 
@@ -178,35 +210,34 @@ func ExportCellTape(ctx context.Context, cfg CellTapeExportConfig) (CellTapeExpo
 }
 
 func inspectCellTape(ctx context.Context, replay *celltape.Replay, canvasWidth, canvasHeight int) (cellTapePlan, error) {
-	var plan cellTapePlan
-	var previousColumns, previousRows uint32
-	err := replay.Iterate(ctx, func(frame celltape.Frame) error {
-		if plan.records == 0 {
-			plan.columns, plan.rows = frame.Columns, frame.Rows
-		} else if frame.Columns != previousColumns || frame.Rows != previousRows {
-			plan.variable = true
-			plan.changes++
-		}
-		if frame.Rows == 0 || frame.Columns > uint32(maxTerminalCells)/frame.Rows {
-			return fmt.Errorf("celltape grid %dx%d exceeds the %d-cell export limit", frame.Columns, frame.Rows, maxTerminalCells)
-		}
-		if canvasWidth > 0 && canvasHeight > 0 {
-			if _, _, _, _, err := cellCanvasGeometry(int(frame.Columns), int(frame.Rows), canvasWidth, canvasHeight); err != nil {
-				return fmt.Errorf("celltape grid %dx%d cannot fit export canvas: %w", frame.Columns, frame.Rows, err)
-			}
-		}
-		plan.records++
-		plan.lastHostNanos = frame.HostNanos
-		previousColumns, previousRows = frame.Columns, frame.Rows
-		return nil
-	})
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return cellTapePlan{}, err
 	}
-	if plan.records == 0 {
+	summary := replay.Summary()
+	if summary.Records == 0 {
 		return cellTapePlan{}, ErrCellTapeEmpty
 	}
-	return plan, nil
+	if summary.MaxCells > maxTerminalCells {
+		return cellTapePlan{}, fmt.Errorf("celltape grid exceeds the %d-cell export limit", maxTerminalCells)
+	}
+	if canvasWidth > 0 && canvasHeight > 0 &&
+		(summary.MaxColumns > uint32(canvasWidth) || summary.MaxRows > uint32(canvasHeight/2)) {
+		return cellTapePlan{}, fmt.Errorf(
+			"celltape grid up to %dx%d cannot fit export canvas %dx%d",
+			summary.MaxColumns,
+			summary.MaxRows,
+			canvasWidth,
+			canvasHeight,
+		)
+	}
+	return cellTapePlan{
+		columns:       summary.FirstColumns,
+		rows:          summary.FirstRows,
+		records:       summary.Records,
+		lastHostNanos: summary.LastHostNanos,
+		variable:      summary.VariableGeometry,
+		changes:       summary.GeometryChanges,
+	}, nil
 }
 
 // emitCellTapeFrames is intentionally independent of FFmpeg so cadence and
@@ -220,14 +251,11 @@ func emitCellTapeFrames(
 	write func(*image.RGBA) error,
 ) error {
 	var raster *image.RGBA
-	return forEachCellTapeOutputFrame(ctx, replay, frameCount, fps, func(frame celltape.Frame) error {
+	return emitProjectedCellTapeFrames(ctx, replay, frameCount, fps, func(frame celltape.Frame) (*image.RGBA, error) {
 		var err error
 		raster, err = cellTapeTinyRGBA(frame, raster)
-		if err != nil {
-			return err
-		}
-		return write(raster)
-	})
+		return raster, err
+	}, write)
 }
 
 func emitCellTapeCanvasFrames(
@@ -240,54 +268,57 @@ func emitCellTapeCanvasFrames(
 	write func(*image.RGBA) error,
 ) error {
 	var canvas *image.RGBA
-	return forEachCellTapeOutputFrame(ctx, replay, frameCount, fps, func(frame celltape.Frame) error {
+	return emitProjectedCellTapeFrames(ctx, replay, frameCount, fps, func(frame celltape.Frame) (*image.RGBA, error) {
 		var err error
 		canvas, err = cellTapeCanvasRGBA(frame, canvas, width, height)
-		if err != nil {
-			return err
-		}
-		return write(canvas)
-	})
+		return canvas, err
+	}, write)
 }
 
-func forEachCellTapeOutputFrame(
+func emitProjectedCellTapeFrames(
 	ctx context.Context,
 	replay *celltape.Replay,
 	frameCount uint64,
 	fps int,
-	yield func(celltape.Frame) error,
+	project func(celltape.Frame) (*image.RGBA, error),
+	write func(*image.RGBA) error,
 ) error {
 	if frameCount == 0 {
 		return ErrCellTapeEmpty
 	}
-	current, err := replay.Next()
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return ErrCellTapeEmpty
+	if fps <= 0 {
+		return errors.New("recording FPS must be positive")
+	}
+	var index uint64
+	sawState := false
+	err := replay.IterateBorrowedIntervals(ctx, func(frame celltape.Frame, nextHostNanos uint64, hasNext bool) error {
+		sawState = true
+		if index >= frameCount || hasNext && frameTimestamp(index, fps) >= nextHostNanos {
+			return nil
 		}
+		current, err := project(frame)
+		if err != nil {
+			return err
+		}
+		for index < frameCount && (!hasNext || frameTimestamp(index, fps) < nextHostNanos) {
+			if err = ctx.Err(); err != nil {
+				return err
+			}
+			if err = write(current); err != nil {
+				return err
+			}
+			index++
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-	next, nextErr := replay.Next()
-	if nextErr != nil && !errors.Is(nextErr, io.EOF) {
-		return nextErr
+	if !sawState {
+		return ErrCellTapeEmpty
 	}
-	haveNext := nextErr == nil
-	for index := uint64(0); index < frameCount; index++ {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		target := frameTimestamp(index, fps)
-		for haveNext && next.HostNanos <= target {
-			current = next
-			next, nextErr = replay.Next()
-			if nextErr != nil && !errors.Is(nextErr, io.EOF) {
-				return nextErr
-			}
-			haveNext = nextErr == nil
-		}
-		if err = yield(current); err != nil {
-			return err
-		}
+	if index != frameCount {
+		return fmt.Errorf("celltape emitted %d of %d planned frames", index, frameCount)
 	}
 	return nil
 }

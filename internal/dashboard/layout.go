@@ -238,9 +238,9 @@ func (m Model) addPreview(root *lipgloss.Layer, x, y, width, height int) {
 	}
 }
 
-// previewInterior is the one projection used by both the full compositor and
-// the fast live-row splice. Keeping it pure prevents the two paths from ever
-// disagreeing about crop, centering, or terminal width.
+// previewInterior is the defensive projection used by the full compositor and
+// by demo, status, or malformed live content. The trusted live-frame splice
+// shares this geometry but can skip its ANSI parsing and row allocations.
 func (m Model) previewInterior(width, height int) (interior []string, columns, rows int) {
 	width, height = max(width, 12), max(height, 3)
 	maxColumns, maxRows := width-2, height-2
@@ -411,8 +411,20 @@ func (m Model) addTransport(root *lipgloss.Layer, y, width int) {
 			if m.snapshotSaving {
 				buttons[i].Label, buttons[i].Active = "SAVING…", true
 			}
+		case "transport.report":
+			switch m.reportState {
+			case "confirm":
+				buttons[i].Label, buttons[i].Glyph, buttons[i].Active = "CREATE REPORT", "◆", true
+			case "saving":
+				buttons[i].Label, buttons[i].Glyph, buttons[i].Active = "CREATING…", "◆", true
+			default:
+				buttons[i].Label, buttons[i].Glyph = "REPORT", "?"
+			}
 		}
 		if compact {
+			if buttons[i].ID == "transport.record" && strings.HasPrefix(buttons[i].Label, "RECORD ") {
+				buttons[i].Label = "REC " + strings.TrimPrefix(buttons[i].Label, "RECORD ")
+			}
 			switch buttons[i].Label {
 			case "PAUSE PREVIEW":
 				buttons[i].Label = "PAUSE"
@@ -422,6 +434,10 @@ func (m Model) addTransport(root *lipgloss.Layer, y, width int) {
 				buttons[i].Label = "RETRY"
 			case "OPEN FOLDER":
 				buttons[i].Label = "FOLDER"
+			case "SNAPSHOT":
+				buttons[i].Label = "SNAP"
+			case "CREATE REPORT":
+				buttons[i].Label = "CREATE"
 			}
 		}
 	}
@@ -446,7 +462,13 @@ func (m Model) addFooter(root *lipgloss.Layer, y, width int) {
 		message = "TAB move · ←/→ change · ENTER choose · Q quit"
 	}
 	style := lipgloss.NewStyle().Foreground(m.theme.Muted)
-	if m.persistentError != "" {
+	if m.reportState == "confirm" {
+		message = "LOCAL JSON ONLY · app, OS, terminal, camera mode, and performance · no images, paths, IDs, or upload · press CREATE"
+		if width < 100 {
+			message = "LOCAL JSON ONLY · no images, paths, IDs, or upload · press CREATE"
+		}
+		style = style.Foreground(m.theme.Cyan)
+	} else if m.persistentError != "" {
 		message = "! " + safeTerminalText(m.persistentError)
 		style = style.Foreground(m.theme.Red)
 	} else if m.toast != "" {

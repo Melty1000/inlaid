@@ -37,17 +37,6 @@ type Cell struct {
 	BG   RGB
 }
 
-func CellFromPacked(v uint64) (Cell, error) {
-	if v>>52 != 0 {
-		return Cell{}, fmt.Errorf("packed cell has reserved bits set")
-	}
-	c := Cell{Mask: uint8(v & 0x0f), FG: RGB((v >> 4) & 0xffffff), BG: RGB((v >> 28) & 0xffffff)}
-	if err := validateCell(c); err != nil {
-		return Cell{}, err
-	}
-	return c, nil
-}
-
 func (c Cell) Packed() uint64 {
 	return uint64(c.Mask&0x0f) | uint64(c.FG&0xffffff)<<4 | uint64(c.BG&0xffffff)<<28
 }
@@ -167,6 +156,14 @@ type SizeReport struct {
 	WorstBytesHour   uint64
 	DurabilityWindow time.Duration
 	QueueCapacity    int
+}
+
+// QueuePressure reports current and peak producer buffers held outside the
+// recorder's free list. HighWater is bounded by Capacity.
+type QueuePressure struct {
+	InFlight  int
+	HighWater int
+	Capacity  int
 }
 
 // Preflight returns a hard upper bound. The writer chooses a keyframe whenever

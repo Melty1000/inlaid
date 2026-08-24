@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
+    branches:
+      - "**"
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -15,14 +18,14 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26.6'
+          go-version: '1.26.7'
           cache: true
 
       - name: Test
@@ -39,3 +42,84 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path bin | Out-Null
           go build -trimpath -o bin\inlaid.exe .\cmd\inlaid
+
+      - name: Smoke-test Windows release package
+        shell: pwsh
+        run: .\scripts\test-release-package.ps1
+
+  linux:
+    name: Test, vet, and build (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.7'
+          cache: true
+
+      - name: Install native camera dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libturbojpeg0-dev pkg-config
+
+      - name: Test
+        run: go test ./...
+
+      - name: Check concurrent ownership paths
+        run: go test -race ./internal/capture ./internal/celllive ./internal/celltape ./internal/dashboard ./internal/supportreport ./internal/taperecovery
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Scan known Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
+      - name: Build dashboard
+        run: |
+          mkdir -p bin
+          go build -trimpath -o bin/inlaid ./cmd/inlaid
+
+  macos:
+    name: Test, vet, and build (macOS Arm)
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.7'
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Scan known Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
+      - name: Build dashboard
+        run: |
+          mkdir -p bin
+          go build -trimpath -o bin/inlaid ./cmd/inlaid
+
+      - name: Verify camera privacy declaration
+        run: |
+          xcrun otool-classic -X -s __TEXT __info_plist bin/inlaid | xxd -r -p > embedded-info.plist
+          plutil -lint embedded-info.plist
+          usage="$(plutil -extract NSCameraUsageDescription raw -o - embedded-info.plist)"
+          test "$usage" = "Inlaid uses the camera you choose to render live video in your terminal."
