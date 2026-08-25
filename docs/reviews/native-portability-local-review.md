@@ -54,6 +54,43 @@ test covers the path without weakening the report's privacy checks.
 
 No unresolved Spec finding remains within Windows-verifiable scope.
 
+## Windows regression evidence
+
+The merged Phase 1 implementation commit
+[`82404cd`](https://github.com/Melty1000/inlaid/commit/82404cd05ba98a1168900fd6d0cd0dde1831ed96)
+was exercised on Windows 10 Home 22H2 (build 19045, x64) with Go 1.26.7,
+PowerShell 7.6.4, and a Logitech C922 Pro Stream Webcam.
+
+The documented opt-in Media Foundation and color-path checks passed. The
+sustained native capture check delivered 30.03 wall-clock FPS and 29.93
+timestamp FPS with 171 decoded frames, no dropped packets or frames, and no
+decode or temporary errors. The real color-path check produced 2,268 unique
+truecolors, including 1,535 visibly chromatic colors. Camera control inventory
+and native asynchronous capture, close, reopen, and control restoration checks
+also passed.
+
+The documented dashboard hardware regression then passed live preview,
+recording, snapshot, and rendered Bubble Tea delivery. The 2.5-second MP4 run
+held 29.8 shown FPS, retained heap changed by +1,482,024 bytes, and the bounded
+recording queue reached a high-water mark of 1/120. The test decoded the saved
+MP4, GIF, and PNG outputs. This was an automated physical-camera regression,
+not a new subjective Windows Terminal visual
+acceptance; the existing released Windows picture and terminal evidence remains
+the visual baseline.
+
+Commands used:
+
+```powershell
+$env:INLAID_MF_CAPTURE_REAL = '1'
+go test -count=1 -v .\internal\capture .\internal\cellreduce
+
+$env:INLAID_LIVE_TEST = '1'
+$env:INLAID_TEST_DEVICE = 'c922 Pro Stream Webcam'
+go test -count=1 -v .\internal\dashboard -run 'TestRuntimeLiveCameraRecordAndSnapshot|TestBubbleTeaProgramReceivesLiveCameraPreview'
+```
+
+The opt-in environment variables were removed immediately after the checks.
+
 ## Evidence boundary and remaining acceptance
 
 Native CI compiles and tests the actual cgo-backed Linux and macOS bridges; a
