@@ -1,7 +1,7 @@
 # Phase 2: Native portability
 
-Status: implemented in the current source; native CI and current-source hardware
-acceptance remain open.
+Status: implemented and build-tested in native Windows, Linux, and macOS CI.
+Physical Linux and macOS camera acceptance remains open.
 
 ## Contract
 

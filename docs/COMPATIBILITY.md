@@ -11,17 +11,17 @@ This page uses precise status words:
 - **Known incompatible**: a documented requirement is absent or the current implementation cannot use the environment.
 - **Observed regression**: a previously working path has a reproduced failure that is not accepted as fixed yet.
 
-Implementation and configured CI are facts about the source tree, not support levels by themselves.
+Implementation and native CI results are facts about the source tree, not support levels by themselves.
 
 ## Platform status
 
 | Target | Distribution | Current source | Physical evidence | Classification |
 |---|---|---|---|---|
-| Windows 10/11 x64 | `v0.2.0-beta.1` | Media Foundation with native MJPEG; Windows CI configured | Logitech C922 release-candidate acceptance passed in Windows Terminal at approximately 30 FPS on 2026-08-24 | **Released** and **Hardware verified** |
-| Linux x86_64 | None | Experimental V4L2 MMAP capture, native MJPEG, and libturbojpeg decode; native CI configured | None | **Expected—unverified** |
-| macOS Apple silicon | None | Experimental AVFoundation capture with reduced NV12 frames; native CI configured | None | **Expected—unverified** |
+| Windows 10/11 x64 | `v0.2.0-beta.1` | Media Foundation with native MJPEG; native CI passed | Logitech C922 release-candidate acceptance passed in Windows Terminal at approximately 30 FPS on 2026-08-24 | **Released** and **Hardware verified** |
+| Linux x86_64 | None | Experimental V4L2 MMAP capture, native MJPEG, and libturbojpeg decode; native CI passed | None | **Expected—unverified** |
+| macOS Apple silicon | None | Experimental AVFoundation capture with reduced NV12 frames; native CI passed | None | **Expected—unverified** |
 
-The Linux and macOS rows should remain marked experimental until their native jobs pass and someone records the camera, terminal, cadence, memory, and shutdown results from physical machines. A cross-compile with cgo disabled does not compile either native camera bridge.
+The Linux and macOS rows remain experimental until someone records the camera, terminal, cadence, memory, and shutdown results from physical machines. Native CI proves that each bridge compiles and its automated checks pass on that operating system; it does not prove a camera or terminal. A cross-compile with cgo disabled does not compile either native camera bridge.
 
 ## Evidence ledger
 

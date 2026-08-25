@@ -43,7 +43,7 @@ Every control and button on the dashboard can be clicked.
 - **Color Look** selects None, Warm, Cool, Mono, or a custom `.cube` look. **Mix** controls its strength.
 - **Save As**, **Size**, **FPS**, and **Quality** set up the next recording. **Size** also sets the PNG canvas.
 - **Pause Preview** holds the current frame without closing the camera. **Record** starts or stops a recording, **Snapshot** writes a PNG, and **Open Folder** opens the output directory.
-- **Report** creates a local troubleshooting report after a second confirmation. It never includes camera media, paths, device IDs, or an upload.
+- **Report** creates a local troubleshooting report after a second confirmation. It never includes camera media, paths, device IDs, or an upload. After it is saved, **Open Folder** opens the report's location so you can review the JSON before deciding whether to attach it to a public issue.
 - **Details** shows the camera mode, terminal grid, frame rate, and skipped frames.
 
 Keyboard shortcuts:
