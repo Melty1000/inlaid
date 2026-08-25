@@ -477,7 +477,7 @@ func (m *Model) applyRuntimeEvent(event RuntimeEvent) tea.Cmd {
 		}
 	case RuntimeSupportReportSaved:
 		m.reportState = "idle"
-		m.notify("Local support report saved · " + shortPath(event.Path))
+		m.notify("Local support report saved · FOLDER opens its location · " + shortPath(event.Path))
 	case RuntimeSupportReportError:
 		m.reportState = "error"
 		m.technicalError = errorText(event.Err)

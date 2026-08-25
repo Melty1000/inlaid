@@ -34,6 +34,6 @@ Inlaid is a public beta. The roadmap records direction, not delivery dates. GitH
 - Opt-in support reports are local, bounded, allowlisted, and never uploaded by Inlaid.
 - Compatibility reports, issue forms, release notes, native CI, and an evidence-based support matrix are part of the repository.
 - A Logitech C922 in Windows Terminal is the first hardware-verified setup.
-- Linux V4L2 and macOS AVFoundation capture paths exist but remain experimental until native CI and physical-camera evidence say otherwise.
+- Linux V4L2 and macOS AVFoundation capture paths pass native CI but remain experimental until physical-camera evidence says otherwise.
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for current claims and [TESTING.md](TESTING.md) for the evidence needed to change them.

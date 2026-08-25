@@ -1343,6 +1343,9 @@ func (r *Runtime) CreateSupportReport() {
 			var saved supportreport.Saved
 			saved, err = r.support.Save(r.root, prepared)
 			if err == nil {
+				r.recordMu.Lock()
+				r.lastSaved = saved.Path
+				r.recordMu.Unlock()
 				r.publishEvent(RuntimeEvent{Kind: RuntimeSupportReportSaved, Path: saved.Path})
 				return
 			}

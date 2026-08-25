@@ -17,6 +17,7 @@ import (
 
 func TestRuntimeCreatesExplicitLocalSupportReportWithoutCameraIdentity(t *testing.T) {
 	root := t.TempDir()
+	opened := make(chan string, 1)
 	settings := DefaultSettings()
 	settings.Device = "Private Camera Name"
 	settings.DeviceID = `private-device-id-C:\Users\Alice`
@@ -26,6 +27,10 @@ func TestRuntimeCreatesExplicitLocalSupportReportWithoutCameraIdentity(t *testin
 		root,
 		supportreport.BuildFacts{Version: "v0.2.0-beta.1", Revision: "abcdef012345"},
 	)
+	runtime.openFolder = func(_ context.Context, directory string) error {
+		opened <- directory
+		return nil
+	}
 	defer runtime.Close()
 
 	runtime.CreateSupportReport()
@@ -50,6 +55,15 @@ func TestRuntimeCreatesExplicitLocalSupportReportWithoutCameraIdentity(t *testin
 				}
 				if !bytes.Contains(data, []byte(`"uploads_data": false`)) {
 					t.Fatal("support report did not state its local-only policy")
+				}
+				runtime.OpenFolder()
+				select {
+				case directory := <-opened:
+					if directory != filepath.Dir(event.Path) {
+						t.Fatalf("opened directory = %q, want support report directory %q", directory, filepath.Dir(event.Path))
+					}
+				case <-time.After(time.Second):
+					t.Fatal("support report directory was not opened")
 				}
 				return
 			}
