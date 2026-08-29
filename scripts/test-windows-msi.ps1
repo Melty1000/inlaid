@@ -618,7 +618,9 @@ function Retain-LifecycleEvidence([string]$Outcome, [string]$Phase) {
         foreach ($log in @(Get-ChildItem -LiteralPath $TemporaryRoot -Filter '*.log' -File | Sort-Object Name)) {
             $candidates += [pscustomobject]@{ source = $log.FullName; destination = Join-Path $artifactRoot ('logs\' + $log.Name) }
         }
-        $candidates += @(Get-EvidenceTreeCandidates (Join-Path $TemporaryRoot 'pre-execution-uninstall-refusal-fixture.json') (Join-Path $artifactRoot 'fixtures'))
+        foreach ($fixtureEvidence in @('pre-execution-uninstall-refusal-fixture.json', 'raw-path-fixture-outcomes.json')) {
+            $candidates += @(Get-EvidenceTreeCandidates (Join-Path $TemporaryRoot $fixtureEvidence) (Join-Path $artifactRoot 'fixtures'))
+        }
         $candidates += @(Get-EvidenceTreeCandidates (Join-Path $TemporaryRoot 'msi-clients') (Join-Path $artifactRoot 'msi-clients'))
     }
     $candidates += @(Get-EvidenceTreeCandidates $FirstEvidenceDirectory (Join-Path $artifactRoot 'first-evidence'))
@@ -1225,14 +1227,49 @@ function Assert-UserData {
         [pscustomobject]@{ Name = 'reg-sz-single-nul'; Type = [uint32]1; Decoded = 'C:\InlaidRawSingleNul'; Bytes = ConvertTo-RegistryStringBytes 'C:\InlaidRawSingleNul' },
         [pscustomobject]@{ Name = 'reg-expand-sz-multi-trailing-nul'; Type = [uint32]2; Decoded = 'C:\InlaidRawMultiNul'; Bytes = [byte[]](@([Text.Encoding]::Unicode.GetBytes('C:\InlaidRawMultiNul')) + @(0, 0, 0, 0, 0, 0)) }
     )
+    $RawPathFixtureOutcomes = @()
+    $RawPathFixtureEvidence = Join-Path $TemporaryRoot 'raw-path-fixture-outcomes.json'
     $RawCaseIndex = 0
     foreach ($rawCase in $LegalRawPathCases) {
         $RawCaseIndex++
         Set-RawUserPath $rawCase.Type $rawCase.Bytes
-        Assert-RawUserPathState $true $rawCase.Type $rawCase.Bytes "$($rawCase.Name) setup"
+        $observedRawCase = Get-ExactUserPathState
+        $requestedHex = ConvertTo-Hex $rawCase.Bytes
+        $canonicalHex = ConvertTo-Hex (ConvertTo-RegistryStringBytes $rawCase.Decoded)
+        $rawFixtureStatus = if ($observedRawCase.Present -and [uint32]$observedRawCase.Type -eq $rawCase.Type -and
+            $observedRawCase.RawHex -ceq $requestedHex) {
+            'exact'
+        }
+        elseif ($observedRawCase.Present -and [uint32]$observedRawCase.Type -eq $rawCase.Type -and
+            [string]$observedRawCase.Raw -ceq $rawCase.Decoded -and $observedRawCase.RawHex -ceq $canonicalHex) {
+            'host-normalized-before-msi'
+        }
+        else {
+            'unsupported-host-transformation'
+        }
+        $RawPathFixtureOutcomes += [ordered]@{
+            name = $rawCase.Name
+            requestedType = $rawCase.Type
+            observedType = $observedRawCase.Type
+            observedPresent = $observedRawCase.Present
+            decoded = $rawCase.Decoded
+            requestedHex = $requestedHex
+            observedHex = $observedRawCase.RawHex
+            status = $rawFixtureStatus
+            lifecycleExercised = ($rawFixtureStatus -ceq 'exact')
+        }
+        $RawPathFixtureOutcomes | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $RawPathFixtureEvidence -Encoding utf8NoBOM
+        if ($rawFixtureStatus -ceq 'unsupported-host-transformation') {
+            throw "$($rawCase.Name) setup produced an unsupported raw registry transformation. Requested type=$($rawCase.Type) hex=$requestedHex; observed present=$($observedRawCase.Present) type=$($observedRawCase.Type) raw='$($observedRawCase.Raw)' hex=$($observedRawCase.RawHex)."
+        }
         Assert-NoInlaidRegistration
         Assert-InstallerRegistryStructureEmpty "$($rawCase.Name) setup"
         Assert-TransactionSnapshotsAbsent -ProductCodes $LifecycleProductCodes -Context "$($rawCase.Name) setup"
+        if ($rawFixtureStatus -ceq 'host-normalized-before-msi') {
+            Save-LifecycleSnapshot ('02-raw-{0:D2}-{1}-host-normalized-before-msi' -f $RawCaseIndex, $rawCase.Name)
+            continue
+        }
+        Assert-RawUserPathState $true $rawCase.Type $rawCase.Bytes "$($rawCase.Name) setup"
 
         $failedInstallLog = "raw-$($rawCase.Name)-failed-install.log"
         Assert-FailedMsi @('/i', $First, '/qn', 'INLAID_TEST_INJECT_FAILURE=1') "Injected failed install for $($rawCase.Name)" $failedInstallLog

@@ -502,11 +502,15 @@ and normalized PATH state, exact `REG_SZ`/`REG_EXPAND_SZ` value kind, and rollba
 state, including the exact raw registry bytes at every supported failed-transaction rollback boundary. Exercise both an originally absent
 user PATH and an originally present empty PATH transactionally; prove failed
 install restores the first as absent and that successful uninstall preserves
-the original absence or present-empty state. Include legal zero-byte,
-unterminated, and multiply
-NUL-terminated strings plus rejection of odd byte counts, unpaired UTF-16
-surrogates, and embedded NUL followed by content. Failed install must restore the
-pre-install legal fixture's exact type and bytes. After a successful install and
+the original absence or present-empty state. Attempt legal zero-byte,
+unterminated, single-NUL, and multiply NUL-terminated fixtures before any MSI
+transaction, retaining requested and observed type/bytes. When Windows preserves
+the exact representation, run the full lifecycle and require failed install to
+restore its exact type and bytes. When `RegSetValueExW` canonicalizes an unusual
+representation during fixture setup, record that host behavior, do not claim
+live MSI coverage for that representation, and retain the exact-byte helper unit
+coverage instead. Reject odd byte counts, unpaired UTF-16 surrogates, and
+embedded NUL followed by content. After a successful install and
 uninstall, preserve presence, registry type,
 and decoded segment text or emptiness; the helper may conservatively serialize that
 value with exactly one trailing UTF-16 NUL because committed provenance does not
