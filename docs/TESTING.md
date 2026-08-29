@@ -622,7 +622,13 @@ launches a hidden
 credentialed child with a loaded HKCU profile,
 and places its process tree in a kill-on-close job with a 40-minute outer timeout.
 It records the actual child token, group SIDs, `whoami /all`, resolved profile,
-allowlisted runner facts, exact child exit, and exact ACL restoration. Parent
+allowlisted runner facts, exact child exit, and safe DACL restoration. Each of
+the three restored directory DACLs must retain byte-identical ordered ACEs and
+all original control flags; the only accepted normalization is Windows adding
+`DiscretionaryAclAutoInherited` when `Set-Acl` reapplies the captured descriptor.
+Cleanup evidence records exact restoration versus that one-way normalization,
+and any other permission, ordering, inheritance, protection, or control-flag
+change fails closed. Parent
 success additionally requires the retained token and completion JSON to prove the
 expected SID, a non-administrator token, a passing lifecycle, and no failure.
 The lifecycle establishes its evidence destination and top-level failure boundary

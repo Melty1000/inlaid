@@ -91,6 +91,9 @@ $OriginalLifecycleEvidenceAcl = $null
 $OriginalProjectAccessSddl = ''
 $OriginalEvidenceAccessSddl = ''
 $OriginalLifecycleEvidenceAccessSddl = ''
+$ProjectAclRestoration = $null
+$EvidenceAclRestoration = $null
+$LifecycleEvidenceAclRestoration = $null
 $Process = $null
 $JobHandle = [IntPtr]::Zero
 $ProcessAssignedToJob = $false
@@ -291,6 +294,83 @@ function ConvertTo-QuotedWindowsProcessArgument([string]$Value) {
     if ($Value.Contains('"')) { throw 'A child process path contains an unsupported quote character.' }
     return '"' + $Value + '"'
 }
+
+function Get-DiscretionaryAclBinary([Security.AccessControl.RawSecurityDescriptor]$Descriptor) {
+    if ($null -eq $Descriptor.DiscretionaryAcl) { return $null }
+    $binary = New-Object byte[] $Descriptor.DiscretionaryAcl.BinaryLength
+    $Descriptor.DiscretionaryAcl.GetBinaryForm($binary, 0)
+    return ,$binary
+}
+
+function Test-ByteArrayExact([byte[]]$Expected, [byte[]]$Actual) {
+    if ($null -eq $Expected -or $null -eq $Actual) { return $null -eq $Expected -and $null -eq $Actual }
+    if ($Expected.Length -ne $Actual.Length) { return $false }
+    for ($index = 0; $index -lt $Expected.Length; $index++) {
+        if ($Expected[$index] -ne $Actual[$index]) { return $false }
+    }
+    return $true
+}
+
+function Compare-AccessDaclRestoration([string]$BeforeSddl, [string]$AfterSddl) {
+    try {
+        $before = [Security.AccessControl.RawSecurityDescriptor]::new($BeforeSddl)
+        $after = [Security.AccessControl.RawSecurityDescriptor]::new($AfterSddl)
+        $beforeFlags = [int]$before.ControlFlags
+        $afterFlags = [int]$after.ControlFlags
+        $autoInherited = [int][Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited
+        $controlFlagXor = $beforeFlags -bxor $afterFlags
+        $daclBinaryExact = Test-ByteArrayExact (Get-DiscretionaryAclBinary $before) (Get-DiscretionaryAclBinary $after)
+        $exact = $BeforeSddl -ceq $AfterSddl
+        $acceptedCanonicalization = -not $exact -and
+            ($beforeFlags -band $autoInherited) -eq 0 -and
+            ($afterFlags -band $autoInherited) -ne 0 -and
+            $controlFlagXor -eq $autoInherited -and
+            $daclBinaryExact
+        $passed = $exact -or $acceptedCanonicalization
+        return [pscustomobject][ordered]@{
+            passed = $passed
+            mode = if ($exact) { 'exact' } elseif ($acceptedCanonicalization) { 'windows-added-discretionary-acl-auto-inherited' } else { 'mismatch' }
+            acceptedDaclAutoInheritedCanonicalization = $acceptedCanonicalization
+            daclBinaryExact = $daclBinaryExact
+            beforeControlFlags = $beforeFlags
+            afterControlFlags = $afterFlags
+            controlFlagXor = $controlFlagXor
+            failure = if ($passed) { $null } else { 'Ordered DACL bytes or control flags changed beyond a one-way Windows-added DiscretionaryAclAutoInherited flag.' }
+        }
+    }
+    catch {
+        return [pscustomobject][ordered]@{
+            passed = $false
+            mode = 'invalid-sddl'
+            acceptedDaclAutoInheritedCanonicalization = $false
+            daclBinaryExact = $false
+            beforeControlFlags = $null
+            afterControlFlags = $null
+            controlFlagXor = $null
+            failure = $_.Exception.Message
+        }
+    }
+}
+
+function Assert-AccessDaclRestorationComparator {
+    $base = 'D:(A;;FA;;;BA)(A;OICI;0x1200a9;;;BU)'
+    $autoInherited = 'D:AI(A;;FA;;;BA)(A;OICI;0x1200a9;;;BU)'
+    $changedAce = 'D:AI(A;;FR;;;BA)(A;OICI;0x1200a9;;;BU)'
+    $changedProtection = 'D:PAI(A;;FA;;;BA)(A;OICI;0x1200a9;;;BU)'
+    $changedInheritanceRequest = 'D:ARAI(A;;FA;;;BA)(A;OICI;0x1200a9;;;BU)'
+    $exact = Compare-AccessDaclRestoration $base $base
+    $canonical = Compare-AccessDaclRestoration $base $autoInherited
+    if (-not $exact.passed -or $exact.mode -cne 'exact') { throw 'ACL restoration comparator rejected exact SDDL.' }
+    if (-not $canonical.passed -or -not $canonical.acceptedDaclAutoInheritedCanonicalization) {
+        throw 'ACL restoration comparator rejected the sole permitted Windows-added control flag.'
+    }
+    if ((Compare-AccessDaclRestoration $autoInherited $base).passed) { throw 'ACL restoration comparator accepted removal of DiscretionaryAclAutoInherited.' }
+    if ((Compare-AccessDaclRestoration $base $changedAce).passed) { throw 'ACL restoration comparator accepted changed DACL bytes.' }
+    if ((Compare-AccessDaclRestoration $base $changedProtection).passed) { throw 'ACL restoration comparator accepted a changed protection flag.' }
+    if ((Compare-AccessDaclRestoration $base $changedInheritanceRequest).passed) { throw 'ACL restoration comparator accepted a changed inheritance-request flag.' }
+}
+
+Assert-AccessDaclRestorationComparator
 
 function Write-OrchestratorEvidence([string]$Phase) {
     $administratorsMember = if ($null -eq $UserSid) { $null } else { Test-LocalGroupMembership $UserSid 'S-1-5-32-544' }
@@ -886,14 +966,17 @@ finally {
             $restoredProjectSddl = (Get-Acl -LiteralPath $ProjectRoot).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
             $restoredEvidenceSddl = (Get-Acl -LiteralPath $EvidenceRoot).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
             $restoredLifecycleEvidenceSddl = (Get-Acl -LiteralPath $LifecycleEvidenceRoot).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
-            if ($restoredProjectSddl -cne $OriginalProjectAccessSddl) { throw 'Project-root access ACL did not restore exactly.' }
-            if ($restoredEvidenceSddl -cne $OriginalEvidenceAccessSddl) { throw 'Wrapper evidence-root access ACL did not restore exactly.' }
-            if ($restoredLifecycleEvidenceSddl -cne $OriginalLifecycleEvidenceAccessSddl) { throw 'Lifecycle evidence-root access ACL did not restore exactly.' }
+            $ProjectAclRestoration = Compare-AccessDaclRestoration $OriginalProjectAccessSddl $restoredProjectSddl
+            $EvidenceAclRestoration = Compare-AccessDaclRestoration $OriginalEvidenceAccessSddl $restoredEvidenceSddl
+            $LifecycleEvidenceAclRestoration = Compare-AccessDaclRestoration $OriginalLifecycleEvidenceAccessSddl $restoredLifecycleEvidenceSddl
+            if (-not $ProjectAclRestoration.passed) { throw "Project-root access DACL did not restore safely: $($ProjectAclRestoration.failure)" }
+            if (-not $EvidenceAclRestoration.passed) { throw "Wrapper evidence-root access DACL did not restore safely: $($EvidenceAclRestoration.failure)" }
+            if (-not $LifecycleEvidenceAclRestoration.passed) { throw "Lifecycle evidence-root access DACL did not restore safely: $($LifecycleEvidenceAclRestoration.failure)" }
         }
         catch {
-            $CleanupErrors += "restore repository ACLs exactly: $($_.Exception.Message)"
+            $CleanupErrors += "restore repository DACLs safely: $($_.Exception.Message)"
             $PreserveDisposableState = $true
-            $PreservationReasons += 'Exact repository ACL restoration could not be proven; the temporary identity is retained on the disposable VM.'
+            $PreservationReasons += 'Safe repository DACL restoration could not be proven; the temporary identity is retained on the disposable VM.'
         }
     }
 
@@ -915,7 +998,12 @@ finally {
         }
     }
     if (-not $PreserveDisposableState -and $null -ne $User) {
-        try { Remove-LocalUser -SID $UserSid }
+        try {
+            Remove-LocalUser -SID $UserSid
+            if ($null -ne (Get-LocalUser -SID $UserSid -ErrorAction SilentlyContinue)) {
+                throw 'Temporary local user remains present after removal returned.'
+            }
+        }
         catch { $CleanupErrors += "remove temporary local user: $($_.Exception.Message)" }
     }
     if ($null -ne $Password) { $Password.Dispose() }
@@ -934,6 +1022,11 @@ finally {
             evidenceAccessSddlAfter = if ($null -eq $OriginalEvidenceAcl) { $null } else { (Get-Acl -LiteralPath $EvidenceRoot).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access) }
             lifecycleEvidenceAccessSddlBefore = $OriginalLifecycleEvidenceAccessSddl
             lifecycleEvidenceAccessSddlAfter = if ($null -eq $OriginalLifecycleEvidenceAcl) { $null } else { (Get-Acl -LiteralPath $LifecycleEvidenceRoot).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access) }
+            repositoryDaclRestoration = [ordered]@{
+                project = $ProjectAclRestoration
+                wrapperEvidence = $EvidenceAclRestoration
+                lifecycleEvidence = $LifecycleEvidenceAclRestoration
+            }
             machineInstallerPolicy = [ordered]@{
                 registryView = 'Registry64'
                 subKey = "HKLM\$InstallerPolicySubKey"
