@@ -193,6 +193,36 @@ func TestReadUserPathSnapshotsExactRawBytesAndRejectsMalformedData(t *testing.T)
 	}
 }
 
+func TestMissingProvenanceKeyProducesCompleteAbsentSnapshotState(t *testing.T) {
+	const sid = "S-1-5-21-2167388485-3820163381-827165627-1001"
+	keyExists, values, err := snapshotMarkerValuesWithOpen(sid, func(path string) (registryRawValueKey, error) {
+		if path != userRegistryPath(sid, markerKey) {
+			t.Fatalf("opened marker path = %q", path)
+		}
+		return nil, registry.ErrNotExist
+	})
+	if err != nil || keyExists {
+		t.Fatalf("missing marker snapshot = exists %v, err %v", keyExists, err)
+	}
+	if len(values) != len(markerNames) {
+		t.Fatalf("missing marker snapshot has %d values, want %d", len(values), len(markerNames))
+	}
+	for _, name := range markerNames {
+		value, ok := values[name]
+		if !ok || value.Present || value.Type != 0 || len(value.Data) != 0 {
+			t.Fatalf("missing marker value %q = %+v, present %v", name, value, ok)
+		}
+	}
+	state := registryState{
+		PathPresent:  true,
+		PathType:     registry.SZ,
+		MarkerValues: values,
+	}
+	if !validSnapshotState(state) {
+		t.Fatal("zero-byte PATH with an absent provenance key did not form a valid rollback snapshot")
+	}
+}
+
 func TestPathEqualityUsesTargetTokenEnvironmentNotProcessEnvironment(t *testing.T) {
 	const sid = "S-1-5-21-2167388485-3820163381-827165627-1001"
 	t.Setenv("USERPROFILE", `C:\ProcessUser`)

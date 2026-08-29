@@ -490,11 +490,29 @@ function Assert-ActionFailureLog([string]$LogName, [string]$Action, [string]$Exp
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Expected-failure MSI log is missing: $path" }
     $text = Get-Content -LiteralPath $path -Raw
     $escaped = [regex]::Escape($Action)
-    $start = [regex]::Match($text, "(?m)^Action start .*: $escaped\.\s*$")
-    $failure = [regex]::Match($text, "(?m)^Action ended .*: $escaped\. Return value 3\.\s*$")
-    $messageIndex = if ([string]::IsNullOrWhiteSpace($ExpectedMessage)) { $start.Index } else { $text.IndexOf($ExpectedMessage, [System.StringComparison]::Ordinal) }
-    if (-not $start.Success -or -not $failure.Success -or $failure.Index -le $start.Index -or
-        $messageIndex -lt $start.Index -or $messageIndex -gt $failure.Index) {
+    $immediateStart = [regex]::Match($text, "(?m)^Action start .*: $escaped\.\s*$")
+    $immediateFailure = [regex]::Match($text, "(?m)^Action ended .*: $escaped\. Return value 3\.\s*$")
+    $startIndex = -1
+    $failureIndex = -1
+    if ($immediateStart.Success -and $immediateFailure.Success -and $immediateFailure.Index -gt $immediateStart.Index) {
+        $startIndex = $immediateStart.Index
+        $failureIndex = $immediateFailure.Index
+    }
+    else {
+        # Deferred executable custom actions are represented inside the execute
+        # script rather than by the immediate "Action start/ended" pair.
+        $deferredStart = [regex]::Match($text, "(?m)^MSI .*Executing op: ActionStart\(Name=$escaped(?:,|\))")
+        $deferredSchedule = [regex]::Match($text, "(?m)^MSI .*Executing op: CustomActionSchedule\(Action=$escaped,")
+        $deferredFailure = [regex]::Match($text, "(?m)^CustomAction $escaped returned actual error code (?!0(?:\s|$))\d+")
+        if ($deferredStart.Success -and $deferredSchedule.Success -and $deferredFailure.Success -and
+            $deferredSchedule.Index -gt $deferredStart.Index -and $deferredFailure.Index -gt $deferredSchedule.Index) {
+            $startIndex = $deferredStart.Index
+            $failureIndex = $deferredFailure.Index
+        }
+    }
+    $messageIndex = if ([string]::IsNullOrWhiteSpace($ExpectedMessage)) { $startIndex } else { $text.IndexOf($ExpectedMessage, [System.StringComparison]::Ordinal) }
+    if ($startIndex -lt 0 -or $failureIndex -le $startIndex -or
+        $messageIndex -lt $startIndex -or $messageIndex -gt $failureIndex) {
         throw "MSI log does not prove intended action $Action caused the failure: $LogName"
     }
 }

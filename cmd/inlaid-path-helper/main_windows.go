@@ -911,15 +911,21 @@ func deleteUserPathWithOpen(userSID string, open func(string) (registryValueKey,
 }
 
 func snapshotMarkerValues(userSID string) (keyExists bool, values map[string]registryValueSnapshot, err error) {
-	values = make(map[string]registryValueSnapshot, len(markerNames))
-	key, err := registry.OpenKey(registry.USERS, userRegistryPath(userSID, markerKey), registry.QUERY_VALUE)
+	return snapshotMarkerValuesWithOpen(userSID, func(path string) (registryRawValueKey, error) {
+		return registry.OpenKey(registry.USERS, path, registry.QUERY_VALUE)
+	})
+}
+
+func snapshotMarkerValuesWithOpen(userSID string, open func(string) (registryRawValueKey, error)) (keyExists bool, values map[string]registryValueSnapshot, err error) {
+	values = absentMarkerValues()
+	key, err := open(userRegistryPath(userSID, markerKey))
 	if errors.Is(err, registry.ErrNotExist) {
 		return false, values, nil
 	}
 	if err != nil {
 		return false, nil, fmt.Errorf("open PATH provenance marker for snapshot: %w", err)
 	}
-	defer closeRegistryKey(&err, key, "close PATH provenance marker after snapshot")
+	defer closeRawRegistryKey(&err, key, "close PATH provenance marker after snapshot")
 	for _, name := range markerNames {
 		size, valueType, valueErr := key.GetValue(name, nil)
 		if errors.Is(valueErr, registry.ErrNotExist) {
@@ -940,6 +946,14 @@ func snapshotMarkerValues(userSID string) (keyExists bool, values map[string]reg
 		values[name] = registryValueSnapshot{Present: true, Type: valueType, Data: data}
 	}
 	return true, values, err
+}
+
+func absentMarkerValues() map[string]registryValueSnapshot {
+	values := make(map[string]registryValueSnapshot, len(markerNames))
+	for _, name := range markerNames {
+		values[name] = registryValueSnapshot{}
+	}
+	return values
 }
 
 func markerFromRegistryState(state registryState) pathownership.Marker {
@@ -976,10 +990,7 @@ func markerFromRegistryState(state registryState) pathownership.Marker {
 }
 
 func markerValuesForPlan(marker pathownership.Marker) (map[string]registryValueSnapshot, error) {
-	values := make(map[string]registryValueSnapshot, len(markerNames))
-	for _, name := range markerNames {
-		values[name] = registryValueSnapshot{}
-	}
+	values := absentMarkerValues()
 	if !marker.Present {
 		return values, nil
 	}
