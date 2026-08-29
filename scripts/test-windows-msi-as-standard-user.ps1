@@ -205,7 +205,7 @@ function New-MachineInstallerPolicyKeyIfMissing {
     try {
         $parentKey = $baseKey.OpenSubKey($InstallerPolicyParentSubKey, $true)
         if ($null -eq $parentKey) { throw "Installer policy parent key is missing: HKLM\$InstallerPolicyParentSubKey" }
-        $parentHandle = $parentKey.SafeRegistryHandle.DangerousGetHandle()
+        $parentHandle = $parentKey.Handle.DangerousGetHandle()
         return [InlaidInstallerPolicyNative]::CreateNewKey($parentHandle, $InstallerPolicyLeafName)
     }
     finally {
