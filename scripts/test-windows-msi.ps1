@@ -556,10 +556,12 @@ function Assert-PostRemoveExistingProductsFailureLog([string]$LogName) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Post-RemoveExistingProducts MSI log is missing: $path" }
     $text = Get-Content -LiteralPath $path -Raw
     $removeCompleted = [regex]::Match($text, '(?m)^Action ended .*: RemoveExistingProducts\. Return value 1\.\s*$')
-    $failureStarted = [regex]::Match($text, '(?m)^Action start .*: FailAfterRemoveExistingProducts\.\s*$')
-    $failureEnded = [regex]::Match($text, '(?m)^Action ended .*: FailAfterRemoveExistingProducts\. Return value 3\.\s*$')
-    if (-not $removeCompleted.Success -or -not $failureStarted.Success -or -not $failureEnded.Success -or
-        $removeCompleted.Index -ge $failureStarted.Index -or $failureStarted.Index -ge $failureEnded.Index) {
+    $failureStarted = [regex]::Match($text, '(?m)^MSI .*Executing op: ActionStart\(Name=FailAfterRemoveExistingProducts(?:,|\))')
+    $failureScheduled = [regex]::Match($text, '(?m)^MSI .*Executing op: CustomActionSchedule\(Action=FailAfterRemoveExistingProducts,')
+    $failureReturned = [regex]::Match($text, '(?m)^CustomAction FailAfterRemoveExistingProducts returned actual error code (?!0(?:\s|$))\d+')
+    if (-not $removeCompleted.Success -or -not $failureStarted.Success -or -not $failureScheduled.Success -or -not $failureReturned.Success -or
+        $removeCompleted.Index -ge $failureStarted.Index -or $failureStarted.Index -ge $failureScheduled.Index -or
+        $failureScheduled.Index -ge $failureReturned.Index) {
         throw 'Failed-upgrade log does not prove RemoveExistingProducts completed before FailAfterRemoveExistingProducts executed and failed.'
     }
 }
@@ -568,11 +570,15 @@ function Assert-PostFinalizeUserPathMarkerFailureLog([string]$LogName) {
     $path = Join-Path $TemporaryRoot $LogName
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Post-finalize MSI log is missing: $path" }
     $text = Get-Content -LiteralPath $path -Raw
-    $finalizeCompleted = [regex]::Match($text, '(?m)^Action ended .*: FinalizeUserPathMarker\. Return value 1\.\s*$')
-    $failureStarted = [regex]::Match($text, '(?m)^Action start .*: FailAfterFinalizeUserPathMarker\.\s*$')
-    $failureEnded = [regex]::Match($text, '(?m)^Action ended .*: FailAfterFinalizeUserPathMarker\. Return value 3\.\s*$')
-    if (-not $finalizeCompleted.Success -or -not $failureStarted.Success -or -not $failureEnded.Success -or
-        $finalizeCompleted.Index -ge $failureStarted.Index -or $failureStarted.Index -ge $failureEnded.Index) {
+    $finalizeStarted = [regex]::Match($text, '(?m)^MSI .*Executing op: ActionStart\(Name=FinalizeUserPathMarker(?:,|\))')
+    $finalizeScheduled = [regex]::Match($text, '(?m)^MSI .*Executing op: CustomActionSchedule\(Action=FinalizeUserPathMarker,')
+    $failureStarted = [regex]::Match($text, '(?m)^MSI .*Executing op: ActionStart\(Name=FailAfterFinalizeUserPathMarker(?:,|\))')
+    $failureScheduled = [regex]::Match($text, '(?m)^MSI .*Executing op: CustomActionSchedule\(Action=FailAfterFinalizeUserPathMarker,')
+    $failureReturned = [regex]::Match($text, '(?m)^CustomAction FailAfterFinalizeUserPathMarker returned actual error code (?!0(?:\s|$))\d+')
+    if (-not $finalizeStarted.Success -or -not $finalizeScheduled.Success -or -not $failureStarted.Success -or
+        -not $failureScheduled.Success -or -not $failureReturned.Success -or
+        $finalizeStarted.Index -ge $finalizeScheduled.Index -or $finalizeScheduled.Index -ge $failureStarted.Index -or
+        $failureStarted.Index -ge $failureScheduled.Index -or $failureScheduled.Index -ge $failureReturned.Index) {
         throw 'Failed-uninstall log does not prove marker finalization completed before the test-only action executed and failed.'
     }
 }
