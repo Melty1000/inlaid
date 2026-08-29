@@ -524,7 +524,16 @@ function Assert-ActionSuccessLog([string]$LogName, [string]$Action) {
     $escaped = [regex]::Escape($Action)
     $start = [regex]::Match($text, "(?m)^Action start .*: $escaped\.\s*$")
     $success = [regex]::Match($text, "(?m)^Action ended .*: $escaped\. Return value 1\.\s*$")
-    if (-not $start.Success -or -not $success.Success -or $success.Index -le $start.Index) {
+    $deferredStart = [regex]::Match($text, "(?m)^MSI .*Executing op: ActionStart\(Name=$escaped(?:,|\))")
+    $deferredSchedule = [regex]::Match($text, "(?m)^MSI .*Executing op: CustomActionSchedule\(Action=$escaped,")
+    $installFinalizeSuccess = @([regex]::Matches($text, '(?m)^Action ended .*: InstallFinalize\. Return value 1\.\s*$') |
+        Where-Object { $_.Index -gt $deferredSchedule.Index } | Select-Object -First 1)
+    $deferredFailure = [regex]::Match($text, "(?m)^CustomAction $escaped returned actual error code (?!0(?:\s|$))\d+")
+    $immediateProven = $start.Success -and $success.Success -and $success.Index -gt $start.Index
+    $deferredProven = $deferredStart.Success -and $deferredSchedule.Success -and $installFinalizeSuccess.Count -eq 1 -and
+        $deferredSchedule.Index -gt $deferredStart.Index -and $installFinalizeSuccess[0].Index -gt $deferredSchedule.Index -and
+        (-not $deferredFailure.Success -or $deferredFailure.Index -gt $installFinalizeSuccess[0].Index)
+    if (-not $immediateProven -or -not $deferredProven) {
         throw "MSI log does not prove intended action $Action completed successfully: $LogName"
     }
 }
