@@ -538,6 +538,26 @@ function Assert-ActionSuccessLog([string]$LogName, [string]$Action) {
     }
 }
 
+function Assert-ServerPropertyLog([string]$LogName, [string]$Name, [string]$Value) {
+    $path = Join-Path $TemporaryRoot $LogName
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "MSI log is missing: $path" }
+    $text = Get-Content -LiteralPath $path -Raw
+    $expected = "Property(S): $Name = $Value"
+    if (-not $text.Contains($expected)) {
+        throw "$LogName does not prove that Windows Installer received the exact server property '$expected'."
+    }
+}
+
+function Assert-ActionCommandContainsLog([string]$LogName, [string]$Action, [string]$ExpectedArgument) {
+    $path = Join-Path $TemporaryRoot $LogName
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "MSI log is missing: $path" }
+    $prefix = "CustomActionSchedule(Action=$Action,"
+    $schedule = Get-Content -LiteralPath $path | Where-Object { $_.Contains($prefix) } | Select-Object -First 1
+    if ($null -eq $schedule -or -not $schedule.Contains($ExpectedArgument)) {
+        throw "$LogName does not prove that $Action received the exact argument '$ExpectedArgument'."
+    }
+}
+
 function Assert-BasicUiLog([string]$LogName) {
     $path = Join-Path $TemporaryRoot $LogName
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Basic-UI MSI log is missing: $path" }
@@ -1463,6 +1483,7 @@ function Assert-UserData {
 
     $InvalidProgramDir = 'C:\Inlaid;Rejected'
     Assert-FailedMsi @('/i', $First, '/qn', "INLAID_PATH_PROGRAM_DIR=$InvalidProgramDir") 'Semicolon clean install' 'semicolon-install.log'
+    Assert-ServerPropertyLog 'semicolon-install.log' 'INLAID_PATH_PROGRAM_DIR' $InvalidProgramDir
     Assert-ActionFailureLog 'semicolon-install.log' 'ApplyUserPath'
     if ((Test-Path -LiteralPath $InstallRoot) -or (Get-ExactUserPath) -cne $OriginalPath) {
         throw 'Semicolon clean install committed files, PATH, or provenance state.'
@@ -1536,7 +1557,12 @@ function Assert-UserData {
 
     $BeforeSemicolonRepairPath = Get-ExactUserPathSnapshot
     $BeforeSemicolonRepairMarker = Get-MarkerSnapshot
-    Assert-FailedMsi @('/fa', $First, '/qn', "INLAID_PATH_PROGRAM_DIR=$InvalidProgramDir") 'Semicolon repair' 'semicolon-repair.log'
+    # Microsoft's /f shorthand ignores public properties. Use the documented
+    # REINSTALL properties so this test actually injects the invalid path into
+    # a repair transaction rather than silently exercising a normal repair.
+    Assert-FailedMsi @('/i', $First, '/qn', 'REINSTALL=ALL', 'REINSTALLMODE=a', "INLAID_PATH_PROGRAM_DIR=$InvalidProgramDir") 'Semicolon repair' 'semicolon-repair.log'
+    Assert-ServerPropertyLog 'semicolon-repair.log' 'INLAID_PATH_PROGRAM_DIR' $InvalidProgramDir
+    Assert-ActionCommandContainsLog 'semicolon-repair.log' 'ApplyUserPath' '--program-dir "C:\Inlaid;Rejected."'
     Assert-ActionFailureLog 'semicolon-repair.log' 'ApplyUserPath'
     if ((Get-ExactUserPathSnapshot) -cne $BeforeSemicolonRepairPath -or
         (Get-MarkerSnapshot) -cne $BeforeSemicolonRepairMarker) {
@@ -1552,6 +1578,7 @@ function Assert-UserData {
     $BeforeUpgradePayload = Get-InstallTreeSnapshot
     $BeforeUpgradeRegistration = Get-InlaidRegistrationSnapshot
     Assert-FailedMsi @('/i', $Second, '/qn', "INLAID_PATH_PROGRAM_DIR=$InvalidProgramDir") 'Semicolon major upgrade' 'semicolon-upgrade.log'
+    Assert-ServerPropertyLog 'semicolon-upgrade.log' 'INLAID_PATH_PROGRAM_DIR' $InvalidProgramDir
     Assert-ActionFailureLog 'semicolon-upgrade.log' 'ApplyUserPath'
     Assert-InstalledPayload $FirstVersion $FirstMsiVersion $FirstProductCode $FirstEvidence
     if ((Get-ExactUserPathSnapshot) -cne $BeforeUpgradePath -or

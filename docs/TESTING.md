@@ -496,7 +496,11 @@ install (`/qb!`, UI level 3 with cancellation disabled for deterministic CI) and
 an unattended `/qn` install, repair, upgrade from an older test MSI, blocked downgrade, injected
 failed-upgrade rollback both before and after `RemoveExistingProducts`, safe
 pre-execution uninstall refusal, and successful uninstall after marker
-finalization. Reconcile program files,
+finalization. Fault-injected repair uses `/i` with `REINSTALL=ALL` and
+`REINSTALLMODE=a`, not `/f`, because [Windows Installer's `/f` option ignores
+command-line property values](https://learn.microsoft.com/en-us/windows/win32/msi/command-line-options);
+the retained log must prove the exact injected property reached the server
+session. Reconcile program files,
 Windows Installer registration, the persisted PATH provenance marker, literal
 and normalized PATH state, exact `REG_SZ`/`REG_EXPAND_SZ` value kind, and rollback
 state, including the exact raw registry bytes at every supported failed-transaction rollback boundary. Exercise both an originally absent
