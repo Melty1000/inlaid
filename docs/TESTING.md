@@ -607,8 +607,10 @@ a claim that a human completed a full installer wizard walkthrough. Its MSI log
 must contain the exact UI level, while separate `/qn` evidence remains mandatory.
 On both success and failure, CI copies bounded logs, snapshots, inspected package
 evidence, fixture packages, process records, and inventories under `.tools/evidence`,
-then uploads the package, lifecycle, standard-user-wrapper, and focused-helper
-roots with an always-run pinned artifact action. The standard-user wrapper grants
+then uploads every inventoried leaf—including generated hidden leaves—the package,
+lifecycle, standard-user-wrapper, and focused-helper roots with an always-run pinned
+artifact action. The downloaded artifact must reproduce the retained inventories
+without missing or mismatched files. The standard-user wrapper grants
 the temporary SID read/execute access to the source tree, explicitly denies that
 SID source writes/deletes/ACL ownership changes despite broader inherited runner
 ACLs, and grants Modify only on protected `windows-msi-standard-user` and

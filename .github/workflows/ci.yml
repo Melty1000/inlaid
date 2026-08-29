@@ -101,6 +101,7 @@ jobs:
             .tools/evidence/windows-msi-lifecycle
             .tools/evidence/windows-msi-standard-user
             .tools/evidence/windows-msi-helper
+          include-hidden-files: true
           if-no-files-found: warn
           retention-days: 14
 
