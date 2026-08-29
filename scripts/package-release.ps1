@@ -6,7 +6,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+. (Join-Path $PSScriptRoot 'resolve-payload.ps1')
+. (Join-Path $PSScriptRoot 'assert-amd64-pe.ps1')
 
 if ([string]::IsNullOrWhiteSpace($Executable)) {
     $Executable = Join-Path $ProjectRoot 'bin\inlaid.exe'
@@ -23,39 +26,19 @@ elseif (-not [System.IO.Path]::IsPathRooted($OutputDirectory)) {
 }
 
 $Version = $Version.Trim()
-if ($Version -notmatch '^[0-9A-Za-z][0-9A-Za-z._-]*$') {
-    throw "Version contains unsupported filename characters: '$Version'"
+if ($Version -notmatch '^v[0-9][0-9A-Za-z._-]*$') {
+    throw "Version must be a leading-v executable identity with safe filename characters: '$Version'"
 }
 if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
     throw "Release executable was not found: $Executable"
 }
 
-$packageFiles = @(
-    'START-INLAID.cmd',
-    'START-INLAID.ps1',
-    'README.md',
-    'CHANGELOG.md',
-    'CONTRIBUTING.md',
-    'LICENSE',
-    'SECURITY.md',
-    'THIRD_PARTY_NOTICES.md',
-    'docs\CELL_PIPELINE.md',
-    'docs\COMPATIBILITY.md',
-    'docs\DESIGN.md',
-    'docs\FILTERS.md',
-    'docs\PHASE_1.md',
-    'docs\PHASE_2.md',
-    'docs\ROADMAP.md',
-    'docs\TESTING.md',
-    'filters\README.md',
-    'scripts\install-ffmpeg.ps1'
-)
-foreach ($relative in $packageFiles) {
-    $source = Join-Path $ProjectRoot $relative
-    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
-        throw "Release file was not found: $source"
-    }
+$null = Assert-InlaidAmd64Pe32Plus -Path $Executable -Description 'Portable application payload'
+$identity = @(& $Executable --version)
+if ($LASTEXITCODE -ne 0 -or $identity.Count -ne 1 -or $identity[0] -cne "Inlaid $Version") {
+    throw "Release executable identity must be exactly 'Inlaid $Version'; got '$($identity -join ' ')'."
 }
+$packageFiles = Resolve-InlaidPayload -ProjectRoot $ProjectRoot -Platform windows -Profile portable -Executable $Executable
 
 $artifactName = "inlaid-$Version-windows-amd64"
 $archivePath = Join-Path $OutputDirectory "$artifactName.zip"
@@ -66,16 +49,35 @@ $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
 $packageRoot = Join-Path $temporaryRoot $artifactName
 
 try {
-    New-Item -ItemType Directory -Force -Path (Join-Path $packageRoot 'bin') | Out-Null
-    Copy-Item -LiteralPath $Executable -Destination (Join-Path $packageRoot 'bin\inlaid.exe')
-    # Keep this a file-by-file allowlist. In particular, never copy the filters
-    # directory recursively: it may contain a user's private .cube files even
-    # though those files are ignored by Git.
-    foreach ($relative in $packageFiles) {
-        $destination = Join-Path $packageRoot $relative
+    # The manifest is a file-by-file allowlist. In particular, never copy the
+    # filters directory recursively: it may contain private .cube files.
+    foreach ($entry in $packageFiles | Where-Object { $_.SourceToken -ne '@generated-portable-manifest' }) {
+        $destination = Join-Path $packageRoot $entry.Destination
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
-        Copy-Item -LiteralPath (Join-Path $ProjectRoot $relative) -Destination $destination
+        Copy-Item -LiteralPath $entry.Source -Destination $destination
     }
+
+    $portableManifestEntries = @($packageFiles | Where-Object { $_.SourceToken -eq '@generated-portable-manifest' })
+    if ($portableManifestEntries.Count -ne 1) { throw 'Portable profile must have exactly one generated portable manifest role.' }
+    $portableManifestEntry = $portableManifestEntries[0]
+    $ownedFiles = @($packageFiles |
+        Where-Object { $_.SourceToken -ne '@generated-portable-manifest' } |
+        ForEach-Object {
+            $path = Join-Path $packageRoot $_.Destination
+            [ordered]@{
+                role = $_.Role
+                path = $_.Destination.Replace('\', '/')
+                sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+        })
+    $portableManifest = [ordered]@{
+        schema = 2
+        layout = 'portable'
+        version = $Version
+        files = $ownedFiles
+    }
+    $portableManifestPath = Join-Path $packageRoot $portableManifestEntry.Destination
+    $portableManifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $portableManifestPath -Encoding utf8
 
     # FFmpeg is GPL software distributed by its own publishers. Inlaid
     # discovers a user-installed copy or the local copy fetched by setup.ps1;

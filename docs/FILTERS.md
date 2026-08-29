@@ -5,9 +5,16 @@ Inlaid includes None, Warm, Cool, and Mono. Custom Color Looks use the data-only
 ## Add a look
 
 1. Close Inlaid.
-2. Copy a trusted `.cube` file directly into `filters\` beside the launcher.
+2. Copy a trusted `.cube` file directly into the active filters directory:
+   - installed Windows: `Documents\Inlaid\Filters` in the Documents known
+     folder selected by Windows;
+   - portable or source: `filters\` below that run's portable or source root;
+   - explicit tests: `filters\` below the explicit test data root.
 3. Start the app again.
 4. Choose the file under **Color Look** and adjust **Mix** from 0–100%.
+
+The installed program directory is input-only. Do not create a `filters`
+directory beside the installed executable; installed Inlaid does not read it.
 
 Subfolders and symbolic links are ignored. The displayed name comes from a safe `TITLE` value when present, otherwise from the filename. Duplicate names receive a numeric suffix. Invalid files are skipped; **Details** shows the parser error.
 

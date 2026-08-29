@@ -14,7 +14,11 @@ jobs:
   windows:
     name: Test, vet, and build (Windows)
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 55
+    env:
+      DOTNET_ADD_GLOBAL_TOOLS_TO_PATH: '0'
+      DOTNET_CLI_HOME: ${{ github.workspace }}\.tools\dotnet-cli-home
+      NUGET_PACKAGES: ${{ github.workspace }}\.tools\nuget-packages
 
     steps:
       - name: Check out source
@@ -27,6 +31,38 @@ jobs:
         with:
           go-version: '1.26.7'
           cache: true
+
+      - name: Install pinned WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --tool-path .tools\wix wix --version 5.0.2
+          & .\.tools\wix\wix.exe --version
+
+      - name: Record focused PATH transaction restart evidence
+        shell: pwsh
+        run: |
+          $evidence = '.tools\evidence\windows-msi-helper'
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $pattern = 'Test(WriteSnapshotNeverOverwritesExistingState|PreflightClaimAllowsCurrentTransactionSnapshotPublication|PublishSnapshotNeverReplacesRacingFinalState|RollbackAndCommitNeverConsumePartialState|TransactionTeardownFailuresRemainSafelyRestartable)$'
+          $jsonLines = @(& go test -count=1 -v -json .\cmd\inlaid-path-helper -run $pattern 2>&1)
+          $testExitCode = $LASTEXITCODE
+          $jsonPath = Join-Path $evidence 'focused-transaction-tests.jsonl'
+          $logPath = Join-Path $evidence 'focused-transaction-tests.log'
+          $jsonLines | Set-Content -LiteralPath $jsonPath -Encoding utf8NoBOM
+          @($jsonLines | ForEach-Object {
+            try { $event = $_ | ConvertFrom-Json; if ($null -ne $event.Output) { $event.Output.TrimEnd([char[]]"`r`n") } }
+            catch { [string]$_ }
+          }) | Set-Content -LiteralPath $logPath -Encoding utf8NoBOM
+          [ordered]@{
+            schema = 1
+            command = 'go test -count=1 -v -json .\cmd\inlaid-path-helper -run <focused-pattern>'
+            pattern = $pattern
+            exitCode = $testExitCode
+            jsonlSHA256 = (Get-FileHash -LiteralPath $jsonPath -Algorithm SHA256).Hash
+            logSHA256 = (Get-FileHash -LiteralPath $logPath -Algorithm SHA256).Hash
+            composition = 'Unit fault injection for transaction publication/activation/cleanup/restart behavior; static MSI sequencing and live lifecycle evidence remain separate inputs.'
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $evidence 'focused-transaction-tests-summary.json') -Encoding utf8NoBOM
+          if ($testExitCode -ne 0) { throw "Focused PATH transaction tests failed with exit code $testExitCode." }
 
       - name: Test
         run: go test ./...
@@ -41,11 +77,32 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path bin | Out-Null
-          go build -trimpath -o bin\inlaid.exe .\cmd\inlaid
+          go build -trimpath -ldflags "-X main.version=v0.0.0-ci" -o bin\inlaid.exe .\cmd\inlaid
 
       - name: Smoke-test Windows release package
         shell: pwsh
-        run: .\scripts\test-release-package.ps1
+        run: .\scripts\test-release-package.ps1 -Version v0.0.0-ci
+
+      - name: Build and inspect strict per-user MSI fixtures
+        shell: pwsh
+        run: .\scripts\test-windows-msi-package.ps1 -Wix .\.tools\wix\wix.exe -OutputDirectory .\.tools\evidence\windows-msi-package
+
+      - name: Exercise per-user MSI lifecycle
+        shell: pwsh
+        run: .\scripts\test-windows-msi-as-standard-user.ps1 -Wix .\.tools\wix\wix.exe -ChildTimeoutSeconds 2400 -AcceptLocalUserSetup
+
+      - name: Upload Windows MSI package and lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-msi-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .tools/evidence/windows-msi-package
+            .tools/evidence/windows-msi-lifecycle
+            .tools/evidence/windows-msi-standard-user
+            .tools/evidence/windows-msi-helper
+          if-no-files-found: warn
+          retention-days: 14
 
   linux:
     name: Test, vet, and build (Linux)

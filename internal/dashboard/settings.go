@@ -12,12 +12,12 @@ import (
 const maxSettingsBytes = 64 << 10
 
 // Settings is the subset of inlaid-settings.json used to seed the dashboard.
-// Unknown fields remain forward-compatible with the launcher settings file.
+// Unknown fields remain forward-compatible with the persisted settings file.
 type Settings struct {
 	Device string `json:"Device"`
 	// DeviceID is the platform camera's stable identity. Device remains the
 	// human-readable label and keeps older settings files compatible.
-	DeviceID        string `json:"DeviceID,omitempty"`
+	DeviceID        string `json:"DeviceID"`
 	RenderFPS       int    `json:"RenderFPS"`
 	CaptureWidth    int    `json:"CaptureWidth"`
 	CaptureHeight   int    `json:"CaptureHeight"`
@@ -106,6 +106,9 @@ func SaveSettings(path string, cfg Settings) error {
 	}
 
 	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return fmt.Errorf("save settings: create parent directory: %w", err)
+	}
 	base := filepath.Base(path)
 	temp, err := os.CreateTemp(directory, "."+base+".*.tmp")
 	if err != nil {
@@ -145,7 +148,7 @@ func SaveSettings(path string, cfg Settings) error {
 	return nil
 }
 
-// LoadSettings reads the launcher settings while falling back field-by-field
+// LoadSettings reads the persisted settings while falling back field-by-field
 // to safe values when the file is missing, malformed, or outside valid ranges.
 func LoadSettings(path string) (Settings, error) {
 	cfg := DefaultSettings()

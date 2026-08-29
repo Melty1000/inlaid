@@ -18,11 +18,11 @@ Support reports are designed to exclude camera images, recordings, absolute path
 
 ## Data and network behavior
 
-The packaged Windows app keeps settings, recovery tapes, saved media, and support reports in its extracted directory. Source builds keep them beside the selected settings file. Inlaid has no account system, telemetry, update service, or media upload path.
+The terminal-first Windows installer keeps settings and recovery data under the current user's local application-data directory and saves recordings, snapshots, filters, and support reports under the corresponding user media or documents folders. A portable or source run keeps its data beneath its explicitly resolved portable or source root. Inlaid has no account system, telemetry, update service, or media upload path.
 
-On a launch with no working FFmpeg, the launcher may make one attempt to download a pinned archive. Source setup also downloads Go modules. No camera frame is sent with those requests.
+The installed application and terminal-first portable ZIP do not download FFmpeg or any other tool. They accept a user-provided executable through `INLAID_FFMPEG` or `PATH`; the portable layout may also use `.tools\ffmpeg\bin\ffmpeg.exe` beneath its own root. Source setup may download Go modules and may run the repository's pinned, checksum-verifying FFmpeg setup helper. No camera frame is sent with those requests.
 
-FFmpeg is external software and is not included in Inlaid release archives. The published Windows launcher may call `scripts\install-ffmpeg.ps1`, which downloads the named archive over HTTPS, verifies its fixed SHA-256 digest before extraction, and installs only `ffmpeg.exe` under `.tools\ffmpeg`. The app also accepts a user-provided executable through `INLAID_FFMPEG` or `PATH`. Current Linux and macOS source builds do not have an automatic FFmpeg installer.
+FFmpeg is external software and is not included in Inlaid release archives. The already-published legacy `v0.2.0-beta.1` Windows launcher may call its packaged `scripts\install-ffmpeg.ps1`; that historical helper downloads the named archive over HTTPS, verifies its fixed SHA-256 digest before extraction, and installs only `ffmpeg.exe` under the extracted release's `.tools\ffmpeg` directory. Current Linux and macOS source builds do not have an automatic FFmpeg installer.
 
 ## Input boundaries
 
@@ -36,8 +36,8 @@ These controls reduce risk but do not make arbitrary third-party cameras, driver
 
 ## Local file considerations
 
-The app does not encrypt `inlaid-settings.json`, the compatible legacy `webcam-settings.json`, `snapshots\`, `recordings\`, `recordings\.recovery\`, or `support-reports\`. Anyone with access to the operating-system account or installation directory may be able to read them. On Windows, these files inherit that directory's access controls; Unix support reports are created with owner-only permissions. Delete local data yourself when it is no longer needed.
+The app does not encrypt settings, compatible legacy settings, snapshots, recordings, recovery data, custom filters, or support reports in any layout. Anyone with access to the operating-system account or the resolved data directories may be able to read them. On Windows, these files inherit their user-directory access controls; Unix support reports are created with owner-only permissions. Delete local data yourself when it is no longer needed.
 
 Recording intentionally has no time limit. CellTape recovery data and completed media continue growing until recording is stopped or storage reports an error; check available space before a long session.
 
-Release binaries are currently unsigned. Download them only from the project's GitHub Releases page. `SHA256SUMS.txt` can detect a damaged or mismatched ZIP, but a checksum hosted with the same unsigned release does not independently authenticate the publisher.
+The currently published legacy release binaries are unsigned. Download them only from the project's GitHub Releases page. `SHA256SUMS.txt` can detect a damaged or mismatched ZIP, but a checksum hosted with the same unsigned release does not independently authenticate the publisher. The terminal-first distribution is not ready for publication until its separate signing and provenance gates are satisfied.

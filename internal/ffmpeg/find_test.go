@@ -28,7 +28,7 @@ func TestFindDoesNotExecuteWorkingDirectoryTools(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chdir(previous) })
 
-	_, _ = find(context.Background(), "", func(_ context.Context, candidate string) error {
+	_, _ = find(context.Background(), "", "", func(_ context.Context, candidate string) error {
 		equal, compareErr := filepath.Abs(candidate)
 		if compareErr != nil {
 			return compareErr
@@ -45,7 +45,7 @@ func TestFindPrefersExplicitFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("test"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got, err := find(context.Background(), path, func(context.Context, string) error { return nil })
+	got, err := find(context.Background(), path, "", func(context.Context, string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestFindUsesEnvironmentFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("INLAID_FFMPEG", path)
-	got, err := find(context.Background(), "", func(context.Context, string) error { return nil })
+	got, err := find(context.Background(), "", "", func(context.Context, string) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestFindSkipsInvalidCandidate(t *testing.T) {
 	}
 	t.Setenv("INLAID_FFMPEG", valid)
 
-	got, err := find(context.Background(), invalid, func(_ context.Context, path string) error {
+	got, err := find(context.Background(), invalid, "", func(_ context.Context, path string) error {
 		if filepath.Clean(path) == filepath.Clean(invalid) {
 			return errors.New("not FFmpeg")
 		}
@@ -102,7 +102,7 @@ func TestFindRejectsInvalidCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("INLAID_FFMPEG", "")
-	_, err := find(context.Background(), path, func(context.Context, string) error { return errors.New("not FFmpeg") })
+	_, err := find(context.Background(), path, "", func(context.Context, string) error { return errors.New("not FFmpeg") })
 	if err == nil || !strings.Contains(err.Error(), "could not run") {
 		t.Fatalf("Find() error = %v, want invalid executable error", err)
 	}
@@ -115,13 +115,53 @@ func TestFindStopsWhenContextIsCanceled(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := find(ctx, path, func(context.Context, string) error {
+	_, err := find(ctx, path, "", func(context.Context, string) error {
 		t.Fatal("probe ran after cancellation")
 		return nil
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Find() error = %v, want context cancellation", err)
 	}
+}
+
+func TestFindUsesConfiguredLocalToolsRoot(t *testing.T) {
+	root := t.TempDir()
+	local := BundledPath(root)
+	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(local, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("INLAID_FFMPEG", "")
+
+	got, err := find(context.Background(), "", root, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := filepath.Abs(local)
+	if got != want {
+		t.Fatalf("Find() = %q, want local tools candidate %q", got, want)
+	}
+}
+
+func TestFindNeverProbesLocalToolsWhenRootIsEmpty(t *testing.T) {
+	root := t.TempDir()
+	planted := BundledPath(root)
+	if err := os.MkdirAll(filepath.Dir(planted), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(planted, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("INLAID_FFMPEG", "")
+
+	_, _ = find(context.Background(), "", "", func(_ context.Context, candidate string) error {
+		if pathKey(filepath.Clean(candidate)) == pathKey(filepath.Clean(planted)) {
+			t.Fatalf("disabled local tools candidate was probed: %s", candidate)
+		}
+		return errors.New("not selected")
+	})
 }
 
 func TestBundledPathUsesPlatformExecutable(t *testing.T) {

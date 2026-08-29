@@ -54,9 +54,9 @@ does not publish a Linux binary.
 
 ## External FFmpeg
 
-FFmpeg is **not bundled** in the source repository, Inlaid executable, or release ZIP.
+FFmpeg is **not bundled** in the source repository, Inlaid executable, MSI, or release ZIP.
 
-The packaged `scripts\install-ffmpeg.ps1` first accepts a working user-installed FFmpeg. If none is found, the launcher automatically attempts one download of `ffmpeg-9.0.1-essentials_build.zip` from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) and verifies SHA-256 `fec81ae03971d9dd4be3ebe02e263bd2ec1d789483f931bdba5f5715e65da2e9` before copying `ffmpeg.exe` into the local `.tools` directory.
+The already-published legacy `v0.2.0-beta.1` Windows ZIP includes `scripts\install-ffmpeg.ps1`. That helper first accepts a working user-installed FFmpeg. If none is found, the legacy launcher automatically attempts one download of `ffmpeg-9.0.1-essentials_build.zip` from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) and verifies SHA-256 `fec81ae03971d9dd4be3ebe02e263bd2ec1d789483f931bdba5f5715e65da2e9` before copying `ffmpeg.exe` into that extracted release's `.tools` directory. The terminal-first MSI and portable ZIP do not contain or invoke that downloader; source users may still run the repository helper deliberately.
 
 That Gyan Essentials build reports `--enable-gpl --enable-version3` and includes libraries such as x264. It is separately distributed GPL-enabled software, not a derivative component linked into Inlaid. Its license files, build configuration, and corresponding-source information are provided by the FFmpeg and Gyan projects:
 

@@ -19,13 +19,22 @@ func (c *Collector) Save(root string, prepared Prepared) (Saved, error) {
 	if c == nil {
 		return Saved{}, errors.New("support report collector is nil")
 	}
-	return savePrepared(root, prepared, writePrepared)
+	return savePrepared(filepath.Join(root, reportDirectory), prepared, writePrepared)
 }
 
-func savePrepared(root string, prepared Prepared, write preparedWriter) (Saved, error) {
-	root = strings.TrimSpace(root)
-	if root == "" {
-		return Saved{}, errors.New("support report root is empty")
+// SaveDirectory writes to the resolved report directory. It lets the runtime
+// keep report placement independent from recordings and settings.
+func (c *Collector) SaveDirectory(directory string, prepared Prepared) (Saved, error) {
+	if c == nil {
+		return Saved{}, errors.New("support report collector is nil")
+	}
+	return savePrepared(directory, prepared, writePrepared)
+}
+
+func savePrepared(directory string, prepared Prepared, write preparedWriter) (Saved, error) {
+	directory = strings.TrimSpace(directory)
+	if directory == "" {
+		return Saved{}, errors.New("support report directory is empty")
 	}
 	if len(prepared.data) == 0 || len(prepared.data) > MaxReportBytes {
 		return Saved{}, errors.New("support report is empty or exceeds its size limit")
@@ -40,7 +49,6 @@ func savePrepared(root string, prepared Prepared, write preparedWriter) (Saved, 
 		return Saved{}, errors.New("support report writer is unavailable")
 	}
 
-	directory := filepath.Join(root, reportDirectory)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return Saved{}, fmt.Errorf("create support report directory: %w", err)
 	}

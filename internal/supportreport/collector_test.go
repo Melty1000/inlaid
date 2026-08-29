@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-func TestPrepareDeterministicSchemaV1(t *testing.T) {
+func TestPrepareDeterministicSchemaV2(t *testing.T) {
 	now := time.Date(2026, time.August, 24, 15, 30, 0, 0, time.UTC)
 	collector := fixtureCollector(now)
 	collector.Record(Event{
@@ -46,24 +46,27 @@ func TestPrepareDeterministicSchemaV1(t *testing.T) {
 		review.CameraModelIncluded != secondReview.CameraModelIncluded {
 		t.Fatal("identical prepared snapshots were not deterministic")
 	}
-	wantDigest := "bcf033d5cc254b27c47d5c9e2a6c32e2ceb1574cbe910a963089e4a07cfd7e06"
+	wantDigest := "bbaf762c8610930be8c6d21d76f24605d6f020f8a308bb31b9375b6b0eb6aa4c"
 	if review.SHA256 != wantDigest {
-		t.Fatalf("schema v1 golden digest = %s, want %s", review.SHA256, wantDigest)
+		t.Fatalf("schema v2 golden digest = %s, want %s", review.SHA256, wantDigest)
 	}
 	digest := sha256.Sum256(first.Content())
 	if review.SHA256 != hex.EncodeToString(digest[:]) || review.Bytes != len(first.Content()) {
 		t.Fatal("review does not describe the exact prepared bytes")
 	}
 
-	var report reportV1
+	var report reportV2
 	if err := json.Unmarshal(first.Content(), &report); err != nil {
 		t.Fatal(err)
 	}
-	if report.Schema != SchemaV1 || report.CreatedUTC != "2026-08-24T15:30:00Z" || report.App.Version != "v0.2.0-beta.1" {
+	if report.Schema != SchemaV2 || report.CreatedUTC != "2026-08-24T15:30:00Z" || report.App.Version != "v0.2.0-beta.1" {
 		t.Fatalf("report identity = %+v", report)
 	}
 	if report.Platform.OS != "windows" || report.Launch.Terminal != "windows-terminal" || report.Camera.Model != "C922 Pro Stream Webcam" {
 		t.Fatalf("safe facts were not preserved: %+v %+v %+v", report.Platform, report.Launch, report.Camera)
+	}
+	if strings.Contains(string(first.Content()), `"launch_route"`) || strings.Contains(string(first.Content()), `"launcher"`) {
+		t.Fatal("support report retained superseded launch-route reporting")
 	}
 	if len(report.RecentEvents) != 1 || report.RecentEvents[0].SecondsBeforeReport != 2 || len(report.RecentSamples) != 1 {
 		t.Fatalf("bounded history shape = %+v %+v", report.RecentEvents, report.RecentSamples)
@@ -79,7 +82,7 @@ func TestPrepareRejectsToxicStringsAndUnknownFields(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "EXAMPLE_GITHUB_VALUE")
 	host := hostFacts{
 		Platform: platformFacts{OS: `https://host.invalid`, Architecture: `C:\Users\Alice`, Version: `/home/alice`, GoVersion: "go1.26.0", LogicalCPUs: 8},
-		Launch:   launchFacts{Launcher: "$(private)", Terminal: "evil-terminal", TerminalVersion: "../../secret", ShellHint: `C:\private\shell.exe`, TrueColorHint: true},
+		Launch:   launchFacts{Terminal: "evil-terminal", TerminalVersion: "../../secret", ShellHint: `C:\private\shell.exe`, TrueColorHint: true},
 	}
 	collector := newCollector(BuildFacts{Version: `C:\Users\Alice\private`, Revision: "not-a-revision"}, host, func() time.Time { return now })
 	current := fixtureCurrent(`Camera C:\Users\Alice\secret token=EXAMPLE_TOKEN_VALUE`)
@@ -103,7 +106,7 @@ func TestPrepareRejectsToxicStringsAndUnknownFields(t *testing.T) {
 	if review.CameraModelIncluded {
 		t.Fatal("toxic camera model was marked as included")
 	}
-	var report reportV1
+	var report reportV2
 	if err := json.Unmarshal(prepared.Content(), &report); err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +169,7 @@ func TestRecentHistoryUsesFixedNewestRings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var report reportV1
+	var report reportV2
 	if err := json.Unmarshal(prepared.Content(), &report); err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +283,7 @@ func TestSaveCleansPartialAfterWriteFailure(t *testing.T) {
 func fixtureCollector(now time.Time) *Collector {
 	host := hostFacts{
 		Platform: platformFacts{OS: "windows", Architecture: "amd64", Version: "10.0.26100", GoVersion: "go1.26.0", LogicalCPUs: 16},
-		Launch:   launchFacts{Launcher: "windows-terminal-direct", Terminal: "windows-terminal", ShellHint: "unknown", TrueColorHint: true},
+		Launch:   launchFacts{Terminal: "windows-terminal", ShellHint: "unknown", TrueColorHint: true},
 	}
 	return newCollector(BuildFacts{Version: "v0.2.0-beta.1", Revision: "abcdef012345", Modified: true}, host, func() time.Time { return now })
 }
