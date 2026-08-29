@@ -618,6 +618,7 @@ function Retain-LifecycleEvidence([string]$Outcome, [string]$Phase) {
         foreach ($log in @(Get-ChildItem -LiteralPath $TemporaryRoot -Filter '*.log' -File | Sort-Object Name)) {
             $candidates += [pscustomobject]@{ source = $log.FullName; destination = Join-Path $artifactRoot ('logs\' + $log.Name) }
         }
+        $candidates += @(Get-EvidenceTreeCandidates (Join-Path $TemporaryRoot 'pre-execution-uninstall-refusal-fixture.json') (Join-Path $artifactRoot 'fixtures'))
         $candidates += @(Get-EvidenceTreeCandidates (Join-Path $TemporaryRoot 'msi-clients') (Join-Path $artifactRoot 'msi-clients'))
     }
     $candidates += @(Get-EvidenceTreeCandidates $FirstEvidenceDirectory (Join-Path $artifactRoot 'first-evidence'))
@@ -1280,10 +1281,21 @@ function Assert-UserData {
                     throw "Pre-execution uninstall refusal produced $($newDiagnostics.Count) new helper diagnostics instead of exactly one."
                 }
                 $diagnostic = Get-Content -LiteralPath $newDiagnostics[0].FullName -Raw | ConvertFrom-Json
-                $expectedDiagnostic = "refusing to start with stale transaction state: $refusalStatePath"
+                $diagnosticPrefix = 'refusing to start with stale transaction state: '
+                $diagnosticError = [string]$diagnostic.error
                 if ([int]$diagnostic.schema -ne 1 -or [string]$diagnostic.action -cne 'preflight' -or
-                    [string]$diagnostic.error -cne $expectedDiagnostic) {
+                    -not $diagnosticError.StartsWith($diagnosticPrefix, [System.StringComparison]::Ordinal)) {
                     throw "Pre-execution uninstall refusal diagnostic did not prove the exact stale-state boundary: $($newDiagnostics[0].FullName)"
+                }
+                $diagnosticStatePath = $diagnosticError.Substring($diagnosticPrefix.Length)
+                if ([System.IO.Path]::GetFileName($diagnosticStatePath) -cne [System.IO.Path]::GetFileName($refusalStatePath) -or
+                    -not (Test-Path -LiteralPath $diagnosticStatePath -PathType Leaf)) {
+                    throw "Pre-execution uninstall refusal diagnostic did not name the exact fixture leaf: $diagnosticStatePath"
+                }
+                $diagnosticState = Get-Item -LiteralPath $diagnosticStatePath -ErrorAction Stop
+                if ($diagnosticState.Length -ne $refusalStateBytes.Length -or
+                    (Get-FileHash -LiteralPath $diagnosticStatePath -Algorithm SHA256).Hash -cne $refusalStateHash) {
+                    throw "Pre-execution uninstall refusal diagnostic did not resolve to the exact fixture bytes: $diagnosticStatePath"
                 }
                 Assert-InstalledPayload $FirstVersion $FirstMsiVersion $FirstProductCode $FirstEvidence
                 Assert-Marker $true $InstallRoot $true
