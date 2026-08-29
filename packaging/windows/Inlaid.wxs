@@ -84,9 +84,6 @@
     <CustomAction Id="FinalizeUserPathMarker" BinaryRef="InlaidPathHelper"
                   ExeCommand='--action finalize --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
                   Execute="deferred" Impersonate="yes" Return="check" />
-    <CustomAction Id="FailAfterFinalizeUserPathMarker" BinaryRef="InlaidPathHelper"
-                  ExeCommand='--action fail --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
-                  Execute="deferred" Impersonate="yes" Return="check" />
     <CustomAction Id="FailAfterUserPath" BinaryRef="InlaidPathHelper"
                   ExeCommand='--action fail --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
                   Execute="deferred" Impersonate="yes" Return="check" />
@@ -112,17 +109,8 @@
               Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot; AND (REMOVE~=&quot;ALL&quot;)" />
       <Custom Action="FinalizeUserPathMarker" After="RemoveRegistryValues"
               Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot; AND (REMOVE~=&quot;ALL&quot;)" />
-      <Custom Action="FailAfterFinalizeUserPathMarker" After="FinalizeUserPathMarker"
-              Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot; AND INLAID_TEST_FAIL_AFTER_FINALIZE_USER_PATH_MARKER=&quot;1&quot; AND (REMOVE~=&quot;ALL&quot;)" />
-      <ProcessComponents Sequence="6497" />
-      <UnpublishFeatures Sequence="6498" />
-      <InstallExecute Sequence="6500" Condition="NOT Installed OR (REMOVE~=&quot;ALL&quot;)" />
       <Custom Action="FailAfterRemoveExistingProducts" After="RemoveExistingProducts"
               Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot; AND INLAID_TEST_FAIL_AFTER_REMOVE_EXISTING_PRODUCTS=&quot;1&quot; AND WIX_UPGRADE_DETECTED" />
-      <RegisterUser Sequence="6503" />
-      <RegisterProduct Sequence="6504" />
-      <PublishFeatures Sequence="6505" />
-      <PublishProduct Sequence="6506" />
       <Custom Action="CommitUserPath" Before="InstallFinalize"
               Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot;" />
     </InstallExecuteSequence>

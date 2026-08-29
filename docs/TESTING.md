@@ -494,19 +494,20 @@ run.
 For MSI lifecycle evidence, separately record a bounded Windows Installer basic-UI
 install (`/qb!`, UI level 3 with cancellation disabled for deterministic CI) and
 an unattended `/qn` install, repair, upgrade from an older test MSI, blocked downgrade, injected
-failed-upgrade rollback both before and after `RemoveExistingProducts`, failed
-uninstall after marker finalization, and uninstall. Reconcile program files,
+failed-upgrade rollback both before and after `RemoveExistingProducts`, safe
+pre-execution uninstall refusal, and successful uninstall after marker
+finalization. Reconcile program files,
 Windows Installer registration, the persisted PATH provenance marker, literal
 and normalized PATH state, exact `REG_SZ`/`REG_EXPAND_SZ` value kind, and rollback
-state, including the exact raw registry bytes at every failed-transaction rollback boundary. Exercise both an originally absent
+state, including the exact raw registry bytes at every supported failed-transaction rollback boundary. Exercise both an originally absent
 user PATH and an originally present empty PATH transactionally; prove failed
-install and uninstall restore the first as absent and preserve the second as a
-present empty value. Include legal zero-byte, unterminated, and multiply
+install restores the first as absent and that successful uninstall preserves
+the original absence or present-empty state. Include legal zero-byte,
+unterminated, and multiply
 NUL-terminated strings plus rejection of odd byte counts, unpaired UTF-16
 surrogates, and embedded NUL followed by content. Failed install must restore the
-pre-install legal fixture's exact type and bytes. Failed uninstall must restore
-the exact pre-uninstall installed state, including its type and canonical raw
-bytes. After a successful install and uninstall, preserve presence, registry type,
+pre-install legal fixture's exact type and bytes. After a successful install and
+uninstall, preserve presence, registry type,
 and decoded segment text or emptiness; the helper may conservatively serialize that
 value with exactly one trailing UTF-16 NUL because committed provenance does not
 retain a whole-PATH byte backup. The already canonical single-NUL fixture remains
@@ -528,6 +529,14 @@ snapshot, `.partial`, `.claim`, and `.claim.partial` paths are absent. Static/pa
 prove the same-product stale-state check executes immediately before rollback is
 scheduled, `NOT UPGRADINGPRODUCTCODE` appears directly on every PATH transaction
 action, and `NOT RollbackDisabled` is present in the LaunchCondition table.
+Live evidence must create one exact, harness-owned stale transaction fixture and
+prove `PreflightUserPathState` refuses uninstall before the first
+`InstallExecute` or `InstallFinalize` script. Product registration, payload,
+marker, PATH bytes/type, and the fixture itself must remain exact until the
+harness removes only that fixture. Do not deliberately inject a deferred failure
+after complete-removal execution begins: Windows Installer automatically adds
+product-registration removal to that script, and a standard-user package cannot
+promise exact registration rollback across that platform boundary.
 Static inspection must also compare the complete seven-row Registry table—root,
 key, name, encoded value, owning component, and component key-path reference—to
 the expected mapping; checking only the provenance row is insufficient.
@@ -569,16 +578,11 @@ The rollback-disabled case passes public `DISABLEROLLBACK=1` and retains the MSI
 log proving the package's LaunchConditions action emitted the rollback-required
 message and failed before mutation. The post-`RemoveExistingProducts` failure log
 must prove that standard action returned success before the injected action ran
-and failed. Each failed-uninstall log must likewise prove
-`FinalizeUserPathMarker` returned success before its test-only action ran and
-failed. It must also prove that this first `InstallExecute` script reached no
-`ProcessComponents`, `UnpublishFeatures`, product-unregister, product-unpublish,
-or source-list-unpublish operation before the failure. Then prove exact rollback
-of product registration, all package-evidenced payload hashes/lengths, marker,
-PATH presence/type/raw value, and all ProductCode-qualified transaction paths.
-A successful uninstall must prove that first script completed before
-`InstallFinalize` performed product-registration teardown. Successful lifecycle
-evidence retains those logs, complete recursive
+and failed. The pre-execution uninstall-refusal log must prove the stale-state
+preflight failed before `InstallExecute`, `InstallFinalize`, product-unregister,
+product-unpublish, or source-list-unpublish activity. A successful uninstall log
+must prove `FinalizeUserPathMarker` ran successfully and `InstallFinalize`
+completed. Successful lifecycle evidence retains those logs, complete recursive
 registration key/value-kind/raw-value inventories with no volatile exclusions,
 cached-MSI hashes, and exact path/length/SHA-256 inventories for every user-data
 fixture.

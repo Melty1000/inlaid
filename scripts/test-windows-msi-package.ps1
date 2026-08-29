@@ -93,7 +93,7 @@ foreach ($fixture in $fixtures) {
         builderRestoredHostileGoFlags = $true
         payload = @($evidence.payload)
         registry = @($evidence.registry)
-        postFinalizeFailureActionCount = @($evidence.customActions | Where-Object { $_.Action -ceq 'FailAfterFinalizeUserPathMarker' }).Count
+        unsafePostFinalizeFailureActionCount = @($evidence.customActions | Where-Object { $_.Action -ceq 'FailAfterFinalizeUserPathMarker' }).Count
     }
 }
 
@@ -104,9 +104,9 @@ if ($results.Count -ne 2 -or $results[0].productCode -ceq $results[1].productCod
 }
 foreach ($result in $results) {
     if ($result.architecture -cne 'amd64' -or @($result.payload).Count -ne 6 -or
-        @($result.registry).Count -ne 7 -or $result.postFinalizeFailureActionCount -ne 1 -or
+        @($result.registry).Count -ne 7 -or $result.unsafePostFinalizeFailureActionCount -ne 0 -or
         $result.pathHelperTestHooks -ne ($result.name -ceq 'second')) {
-        throw "MSI fixture did not prove an amd64 application, deterministic PATH-helper hook mode, exact exported payload/registry mapping, and failed-uninstall test seam: $($result.name)"
+        throw "MSI fixture did not prove an amd64 application, deterministic PATH-helper hook mode, exact exported payload/registry mapping, and absence of the unsafe late-uninstall failure hook: $($result.name)"
     }
 }
 

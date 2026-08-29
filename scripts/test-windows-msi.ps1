@@ -575,44 +575,14 @@ function Assert-PostRemoveExistingProductsFailureLog([string]$LogName) {
     }
 }
 
-function Assert-PostFinalizeUserPathMarkerFailureLog([string]$LogName) {
+function Assert-PreExecutionUninstallRefusalLog([string]$LogName) {
     $path = Join-Path $TemporaryRoot $LogName
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Post-finalize MSI log is missing: $path" }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Pre-execution uninstall-refusal log is missing: $path" }
+    Assert-ActionFailureLog $LogName 'PreflightUserPathState'
     $text = Get-Content -LiteralPath $path -Raw
-    $finalizeStarted = [regex]::Match($text, '(?m)^MSI .*Executing op: ActionStart\(Name=FinalizeUserPathMarker(?:,|\))')
-    $finalizeScheduled = [regex]::Match($text, '(?m)^MSI .*Executing op: CustomActionSchedule\(Action=FinalizeUserPathMarker,')
-    $failureStarted = [regex]::Match($text, '(?m)^MSI .*Executing op: ActionStart\(Name=FailAfterFinalizeUserPathMarker(?:,|\))')
-    $failureScheduled = [regex]::Match($text, '(?m)^MSI .*Executing op: CustomActionSchedule\(Action=FailAfterFinalizeUserPathMarker,')
-    $failureReturned = [regex]::Match($text, '(?m)^CustomAction FailAfterFinalizeUserPathMarker returned actual error code (?!0(?:\s|$))\d+')
-    $installExecuteStarted = [regex]::Match($text, '(?m)^Action start .*: InstallExecute\.\s*$')
-    if (-not $finalizeStarted.Success -or -not $finalizeScheduled.Success -or -not $failureStarted.Success -or
-        -not $failureScheduled.Success -or -not $failureReturned.Success -or -not $installExecuteStarted.Success -or
-        $installExecuteStarted.Index -ge $finalizeStarted.Index -or
-        $finalizeStarted.Index -ge $finalizeScheduled.Index -or $finalizeScheduled.Index -ge $failureStarted.Index -or
-        $failureStarted.Index -ge $failureScheduled.Index -or $failureScheduled.Index -ge $failureReturned.Index) {
-        throw 'Failed-uninstall log does not prove marker finalization completed before the test-only action executed and failed.'
-    }
-    $beforeFailure = $text.Substring(0, $failureReturned.Index)
-    if ($beforeFailure -match '(?m)^MSI .*Executing op: (?:ProductUnregister|ProductUnpublish|SourceListUnpublish|ActionStart\(Name=(?:ProcessComponents|UnpublishFeatures)(?:,|\)))') {
-        throw 'Failed-uninstall log shows Windows Installer registration teardown before the injected rollback checkpoint.'
-    }
-    if ($beforeFailure -match '(?m)^Action start .*: InstallFinalize\.\s*$') {
-        throw 'Failed-uninstall log reached InstallFinalize before the injected rollback checkpoint.'
-    }
-}
-
-function Assert-SplitUninstallRegistrationLog([string]$LogName) {
-    $path = Join-Path $TemporaryRoot $LogName
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Successful uninstall MSI log is missing: $path" }
-    $text = Get-Content -LiteralPath $path -Raw
-    $finalizeScheduled = [regex]::Match($text, '(?m)^MSI .*Executing op: CustomActionSchedule\(Action=FinalizeUserPathMarker,')
-    $installExecuteCompleted = [regex]::Match($text, '(?m)^Action ended .*: InstallExecute\. Return value 1\.\s*$')
-    $installFinalizeStarted = [regex]::Match($text, '(?m)^Action start .*: InstallFinalize\.\s*$')
-    $productUnregistered = [regex]::Match($text, '(?m)^MSI .*Executing op: ProductUnregister\(')
-    if (-not $finalizeScheduled.Success -or -not $installExecuteCompleted.Success -or -not $installFinalizeStarted.Success -or
-        -not $productUnregistered.Success -or $finalizeScheduled.Index -ge $installExecuteCompleted.Index -or
-        $installExecuteCompleted.Index -ge $installFinalizeStarted.Index -or $installFinalizeStarted.Index -ge $productUnregistered.Index) {
-        throw 'Successful uninstall log does not prove PATH finalization in the first script and product-registration teardown in the final script.'
+    if ($text -match '(?m)^Action start .*: Install(?:Execute|Finalize)\.\s*$' -or
+        $text -match '(?m)^MSI .*Executing op: (?:ProductUnregister|ProductUnpublish|SourceListUnpublish)\(') {
+        throw 'Uninstall preflight refusal reached Windows Installer execution or product-registration teardown.'
     }
 }
 
@@ -1274,7 +1244,7 @@ function Assert-UserData {
         Save-LifecycleSnapshot ('02-raw-{0:D2}-{1}-failed-install' -f $RawCaseIndex, $rawCase.Name)
 
         $installLog = "raw-$($rawCase.Name)-install.log"
-        Invoke-Msi @('/i', $First, '/qn') "Install for $($rawCase.Name) failed-uninstall evidence" $installLog
+        Invoke-Msi @('/i', $First, '/qn') "Install for $($rawCase.Name) uninstall evidence" $installLog
         $InstalledMsi = $First
         Assert-InstalledPayload $FirstVersion $FirstMsiVersion $FirstProductCode $FirstEvidence
         Assert-Marker $true $InstallRoot $true
@@ -1282,27 +1252,77 @@ function Assert-UserData {
         $expectedInstalledBytes = ConvertTo-RegistryStringBytes $expectedInstalledRaw
         Assert-RawUserPathState $true $rawCase.Type $expectedInstalledBytes "$($rawCase.Name) successful install canonicalization"
         Assert-ExactUserPathState $true $expectedInstalledRaw ([Microsoft.Win32.RegistryValueKind]$rawCase.Type) "$($rawCase.Name) successful install semantics"
-        $installedRawState = Get-ExactUserPathSnapshot
-        $installedStructure = Get-InstallerRegistryStructureSnapshot
-        $installedRegistration = Get-InlaidRegistrationSnapshot
-
-        $failedUninstallLog = "raw-$($rawCase.Name)-failed-uninstall.log"
-        Assert-FailedMsi @('/x', $First, '/qn', 'INLAID_TEST_FAIL_AFTER_FINALIZE_USER_PATH_MARKER=1') "Injected failed uninstall for $($rawCase.Name)" $failedUninstallLog
-        Assert-PostFinalizeUserPathMarkerFailureLog $failedUninstallLog
-        Assert-InstalledPayload $FirstVersion $FirstMsiVersion $FirstProductCode $FirstEvidence
-        Assert-Marker $true $InstallRoot $true
-        if ((Get-ExactUserPathSnapshot) -cne $installedRawState -or
-            (Get-InstallerRegistryStructureSnapshot) -cne $installedStructure -or
-            (Get-InlaidRegistrationSnapshot) -cne $installedRegistration) {
-            throw "$($rawCase.Name) failed uninstall did not restore installed PATH bytes, registry structure, and registration exactly."
+        if ($RawCaseIndex -eq 1) {
+            $refusalStatePath = Join-Path $TemporaryBase "inlaid-path-$FirstProductCode.json"
+            $refusalStateBytes = [Text.Encoding]::UTF8.GetBytes('{"fixture":"pre-execution-uninstall-refusal"}')
+            if (Test-Path -LiteralPath $refusalStatePath) { throw "Uninstall-refusal fixture path already exists: $refusalStatePath" }
+            [IO.File]::WriteAllBytes($refusalStatePath, $refusalStateBytes)
+            $refusalStateHash = (Get-FileHash -LiteralPath $refusalStatePath -Algorithm SHA256).Hash
+            $diagnosticsBeforeRefusal = @{}
+            foreach ($diagnostic in @(Get-TestFailureDiagnosticFiles @($FirstProductCode))) {
+                $diagnosticsBeforeRefusal[[System.IO.Path]::GetFullPath($diagnostic.FullName)] = $true
+            }
+            $beforeRefusal = [ordered]@{
+                path = Get-ExactUserPathSnapshot
+                marker = Get-MarkerSnapshot
+                installerStructure = Get-InstallerRegistryStructureSnapshot
+                installTree = Get-InstallTreeSnapshot
+                registration = Get-InlaidRegistrationSnapshot
+                transactionFiles = Get-TransactionFilesSnapshot $LifecycleProductCodes
+            }
+            try {
+                Assert-FailedMsi @('/x', $First, '/qn') 'Pre-execution uninstall refusal' 'pre-execution-uninstall-refusal.log'
+                Assert-PreExecutionUninstallRefusalLog 'pre-execution-uninstall-refusal.log'
+                $newDiagnostics = @(Get-TestFailureDiagnosticFiles @($FirstProductCode) | Where-Object {
+                    -not $diagnosticsBeforeRefusal.ContainsKey([System.IO.Path]::GetFullPath($_.FullName))
+                })
+                if ($newDiagnostics.Count -ne 1) {
+                    throw "Pre-execution uninstall refusal produced $($newDiagnostics.Count) new helper diagnostics instead of exactly one."
+                }
+                $diagnostic = Get-Content -LiteralPath $newDiagnostics[0].FullName -Raw | ConvertFrom-Json
+                $expectedDiagnostic = "refusing to start with stale transaction state: $refusalStatePath"
+                if ([int]$diagnostic.schema -ne 1 -or [string]$diagnostic.action -cne 'preflight' -or
+                    [string]$diagnostic.error -cne $expectedDiagnostic) {
+                    throw "Pre-execution uninstall refusal diagnostic did not prove the exact stale-state boundary: $($newDiagnostics[0].FullName)"
+                }
+                Assert-InstalledPayload $FirstVersion $FirstMsiVersion $FirstProductCode $FirstEvidence
+                Assert-Marker $true $InstallRoot $true
+                if ((Get-ExactUserPathSnapshot) -cne $beforeRefusal.path -or
+                    (Get-MarkerSnapshot) -cne $beforeRefusal.marker -or
+                    (Get-InstallerRegistryStructureSnapshot) -cne $beforeRefusal.installerStructure -or
+                    (Get-InstallTreeSnapshot) -cne $beforeRefusal.installTree -or
+                    (Get-InlaidRegistrationSnapshot) -cne $beforeRefusal.registration -or
+                    (Get-TransactionFilesSnapshot $LifecycleProductCodes) -cne $beforeRefusal.transactionFiles) {
+                    throw 'Pre-execution uninstall refusal changed product registration, payload, marker, PATH, or transaction state.'
+                }
+                $fixture = Get-Item -LiteralPath $refusalStatePath -ErrorAction Stop
+                if ($fixture.Length -ne $refusalStateBytes.Length -or
+                    (Get-FileHash -LiteralPath $refusalStatePath -Algorithm SHA256).Hash -cne $refusalStateHash) {
+                    throw 'Pre-execution uninstall refusal changed its exact stale-state fixture.'
+                }
+                Save-LifecycleSnapshot '02-pre-execution-uninstall-refusal'
+            }
+            finally {
+                if (Test-Path -LiteralPath $refusalStatePath -PathType Leaf) {
+                    $fixture = Get-Item -LiteralPath $refusalStatePath -ErrorAction Stop
+                    if ($fixture.Length -eq $refusalStateBytes.Length -and
+                        (Get-FileHash -LiteralPath $refusalStatePath -Algorithm SHA256).Hash -ceq $refusalStateHash) {
+                        $fixtureEvidence = Join-Path $TemporaryRoot 'pre-execution-uninstall-refusal-fixture.json'
+                        if (Test-Path -LiteralPath $fixtureEvidence) { throw "Refusal-fixture evidence path already exists: $fixtureEvidence" }
+                        Copy-Item -LiteralPath $refusalStatePath -Destination $fixtureEvidence -ErrorAction Stop
+                        if ((Get-FileHash -LiteralPath $fixtureEvidence -Algorithm SHA256).Hash -cne $refusalStateHash) {
+                            throw 'Retained uninstall-refusal fixture does not match the exact test-owned state.'
+                        }
+                        Remove-Item -LiteralPath $refusalStatePath -Force -ErrorAction Stop
+                    }
+                }
+            }
+            Assert-TransactionSnapshotsAbsent -ProductCodes $LifecycleProductCodes -Context 'Pre-execution uninstall-refusal fixture cleanup'
         }
-        Assert-TransactionSnapshotsAbsent -ProductCodes $LifecycleProductCodes -Context "$($rawCase.Name) failed-uninstall rollback"
-        Save-LifecycleSnapshot ('02-raw-{0:D2}-{1}-failed-uninstall' -f $RawCaseIndex, $rawCase.Name)
 
         $uninstallLog = "raw-$($rawCase.Name)-uninstall.log"
         Invoke-Msi @('/x', $First, '/qn') "Uninstall for $($rawCase.Name)" $uninstallLog
         Assert-ActionSuccessLog $uninstallLog 'FinalizeUserPathMarker'
-        Assert-SplitUninstallRegistrationLog $uninstallLog
         $InstalledMsi = ''
         Assert-NoInlaidRegistration
         if (Test-Path -LiteralPath $InstallRoot) { throw "$($rawCase.Name) uninstall retained package payload." }
@@ -1363,33 +1383,8 @@ function Assert-UserData {
     Assert-Marker $true $InstallRoot $false
     Assert-InstalledPayload $FirstVersion $FirstMsiVersion $FirstProductCode $FirstEvidence
     Save-LifecycleSnapshot '04-absent-path-install'
-    $BeforeAbsentPathFailedUninstall = [ordered]@{
-        path = Get-ExactUserPathSnapshot
-        marker = Get-MarkerSnapshot
-        installerStructure = Get-InstallerRegistryStructureSnapshot
-        installTree = Get-InstallTreeSnapshot
-        registration = Get-InlaidRegistrationSnapshot
-        transactionFiles = Get-TransactionFilesSnapshot $LifecycleProductCodes
-    }
-    Assert-FailedMsi @('/x', $First, '/qn', 'INLAID_TEST_FAIL_AFTER_FINALIZE_USER_PATH_MARKER=1') 'Injected failed uninstall from originally absent PATH' 'absent-path-failed-uninstall.log'
-    Assert-PostFinalizeUserPathMarkerFailureLog 'absent-path-failed-uninstall.log'
-    Assert-InstalledPayload $FirstVersion $FirstMsiVersion $FirstProductCode $FirstEvidence
-    Assert-ProductAbsent $SecondProductCode
-    Assert-ExactUserPathState $true $InstallRoot ([Microsoft.Win32.RegistryValueKind]::ExpandString) 'Absent-PATH failed-uninstall rollback'
-    Assert-Marker $true $InstallRoot $false
-    if ((Get-ExactUserPathSnapshot) -cne $BeforeAbsentPathFailedUninstall.path -or
-        (Get-MarkerSnapshot) -cne $BeforeAbsentPathFailedUninstall.marker -or
-        (Get-InstallerRegistryStructureSnapshot) -cne $BeforeAbsentPathFailedUninstall.installerStructure -or
-        (Get-InstallTreeSnapshot) -cne $BeforeAbsentPathFailedUninstall.installTree -or
-        (Get-InlaidRegistrationSnapshot) -cne $BeforeAbsentPathFailedUninstall.registration -or
-        (Get-TransactionFilesSnapshot $LifecycleProductCodes) -cne $BeforeAbsentPathFailedUninstall.transactionFiles) {
-        throw 'Failed uninstall from originally absent PATH did not restore product registration, payload, marker, PATH, and transaction files exactly.'
-    }
-    Assert-TransactionSnapshotsAbsent -ProductCodes $LifecycleProductCodes -Context 'Absent-PATH failed-uninstall rollback'
-    Save-LifecycleSnapshot '05-absent-path-failed-uninstall'
     Invoke-Msi @('/x', $First, '/qn') 'Absent-PATH uninstall' 'absent-path-uninstall.log'
     Assert-ActionSuccessLog 'absent-path-uninstall.log' 'FinalizeUserPathMarker'
-    Assert-SplitUninstallRegistrationLog 'absent-path-uninstall.log'
     $InstalledMsi = ''
     Assert-NoInlaidRegistration
     Assert-ExactUserPathState $false '' $null 'Absent-PATH uninstall restore'
@@ -1406,33 +1401,8 @@ function Assert-UserData {
     Assert-Marker $true $InstallRoot $true
     Assert-InstalledPayload $FirstVersion $FirstMsiVersion $FirstProductCode $FirstEvidence
     Save-LifecycleSnapshot '08-present-empty-path-install'
-    $BeforePresentEmptyPathFailedUninstall = [ordered]@{
-        path = Get-ExactUserPathSnapshot
-        marker = Get-MarkerSnapshot
-        installerStructure = Get-InstallerRegistryStructureSnapshot
-        installTree = Get-InstallTreeSnapshot
-        registration = Get-InlaidRegistrationSnapshot
-        transactionFiles = Get-TransactionFilesSnapshot $LifecycleProductCodes
-    }
-    Assert-FailedMsi @('/x', $First, '/qn', 'INLAID_TEST_FAIL_AFTER_FINALIZE_USER_PATH_MARKER=1') 'Injected failed uninstall from originally present-empty PATH' 'present-empty-path-failed-uninstall.log'
-    Assert-PostFinalizeUserPathMarkerFailureLog 'present-empty-path-failed-uninstall.log'
-    Assert-InstalledPayload $FirstVersion $FirstMsiVersion $FirstProductCode $FirstEvidence
-    Assert-ProductAbsent $SecondProductCode
-    Assert-ExactUserPathState $true $InstallRoot ([Microsoft.Win32.RegistryValueKind]::ExpandString) 'Present-empty-PATH failed-uninstall rollback'
-    Assert-Marker $true $InstallRoot $true
-    if ((Get-ExactUserPathSnapshot) -cne $BeforePresentEmptyPathFailedUninstall.path -or
-        (Get-MarkerSnapshot) -cne $BeforePresentEmptyPathFailedUninstall.marker -or
-        (Get-InstallerRegistryStructureSnapshot) -cne $BeforePresentEmptyPathFailedUninstall.installerStructure -or
-        (Get-InstallTreeSnapshot) -cne $BeforePresentEmptyPathFailedUninstall.installTree -or
-        (Get-InlaidRegistrationSnapshot) -cne $BeforePresentEmptyPathFailedUninstall.registration -or
-        (Get-TransactionFilesSnapshot $LifecycleProductCodes) -cne $BeforePresentEmptyPathFailedUninstall.transactionFiles) {
-        throw 'Failed uninstall from originally present-empty PATH did not restore product registration, payload, marker, PATH, and transaction files exactly.'
-    }
-    Assert-TransactionSnapshotsAbsent -ProductCodes $LifecycleProductCodes -Context 'Present-empty-PATH failed-uninstall rollback'
-    Save-LifecycleSnapshot '09-present-empty-path-failed-uninstall'
     Invoke-Msi @('/x', $First, '/qn') 'Present-empty-PATH uninstall' 'present-empty-path-uninstall.log'
     Assert-ActionSuccessLog 'present-empty-path-uninstall.log' 'FinalizeUserPathMarker'
-    Assert-SplitUninstallRegistrationLog 'present-empty-path-uninstall.log'
     $InstalledMsi = ''
     Assert-NoInlaidRegistration
     Assert-ExactUserPathState $true '' ([Microsoft.Win32.RegistryValueKind]::ExpandString) 'Present-empty-PATH uninstall restore'
@@ -1610,7 +1580,6 @@ function Assert-UserData {
 
     Invoke-Msi @('/x', $Second, '/qn') 'Final uninstall' 'uninstall.log'
     Assert-ActionSuccessLog 'uninstall.log' 'FinalizeUserPathMarker'
-    Assert-SplitUninstallRegistrationLog 'uninstall.log'
     $InstalledMsi = ''
     Assert-NoInlaidRegistration
     if (Test-Path -LiteralPath $InstallRoot) { throw 'Uninstall retained the MSI-owned program directory.' }
@@ -1637,21 +1606,28 @@ finally {
         catch { $CleanupErrors += "pre-cleanup artifact retention: $($_.Exception.Message)"; Write-Warning $CleanupErrors[-1] }
     }
     $env:PATH = $OriginalProcessPath
+    $cleanupCanRestoreOriginalPath = [string]::IsNullOrWhiteSpace($InstalledMsi)
     if (-not $MsiClientTimedOut) {
         if (-not [string]::IsNullOrWhiteSpace($InstalledMsi) -and
             $null -ne (Get-Command Invoke-MsiExitCode -CommandType Function -ErrorAction SilentlyContinue)) {
             try {
                 $cleanupExitCode = Invoke-MsiExitCode @('/x', $InstalledMsi, '/qn') 'cleanup-uninstall.log'
                 if ($cleanupExitCode -ne 0) { throw "cleanup uninstall returned Windows Installer exit code $cleanupExitCode" }
+                Assert-NoInlaidRegistration
+                $InstalledMsi = ''
+                $cleanupCanRestoreOriginalPath = $true
             }
             catch { $CleanupErrors += "cleanup uninstall: $($_.Exception.Message)"; Write-Warning $CleanupErrors[-1] }
         }
-        if (-not $MsiClientTimedOut -and $OriginalPathCaptured -and
+        if (-not $MsiClientTimedOut -and $cleanupCanRestoreOriginalPath -and $OriginalPathCaptured -and
             $null -ne (Get-Command Restore-OriginalUserPath -CommandType Function -ErrorAction SilentlyContinue)) {
             try { Restore-OriginalUserPath }
             catch { $CleanupErrors += "restore original PATH: $($_.Exception.Message)"; Write-Warning $CleanupErrors[-1] }
         }
-        if (-not $MsiClientTimedOut -and
+        elseif (-not $MsiClientTimedOut -and $OriginalPathCaptured -and -not $cleanupCanRestoreOriginalPath) {
+            Write-Warning 'Original PATH restoration was suppressed because cleanup could not prove the test MSI was removed.'
+        }
+        if (-not $MsiClientTimedOut -and $cleanupCanRestoreOriginalPath -and
             $null -ne (Get-Command Assert-InstallerRegistryStructureEmpty -CommandType Function -ErrorAction SilentlyContinue)) {
             try { Assert-InstallerRegistryStructureEmpty 'Lifecycle cleanup' }
             catch {
@@ -1659,7 +1635,7 @@ finally {
                 Write-Warning "Lifecycle cleanup preserved non-empty installer registry structure for investigation: $($_.Exception.Message)"
             }
         }
-        if (-not $MsiClientTimedOut -and -not [string]::IsNullOrWhiteSpace($ExpectedUserDataSnapshot) -and
+        if (-not $MsiClientTimedOut -and $cleanupCanRestoreOriginalPath -and -not [string]::IsNullOrWhiteSpace($ExpectedUserDataSnapshot) -and
             $null -ne (Get-Command Get-UserDataSnapshot -CommandType Function -ErrorAction SilentlyContinue)) {
             try {
                 if ((Get-UserDataSnapshot) -cne $ExpectedUserDataSnapshot) {

@@ -312,8 +312,8 @@ Require ($preflightAction.Count -eq 1 -and [int]$preflightAction[0].Type -eq 2 -
 $transactionSetter = @($customActions | Where-Object { $_.Action -ceq 'SetInlaidPathTransactionActive' })
 Require ($transactionSetter.Count -eq 1 -and [int]$transactionSetter[0].Type -eq 51 -and
     $transactionSetter[0].Source -ceq 'InlaidPathTransactionActive' -and $transactionSetter[0].Target -ceq '1') 'MSI private transaction-active property setter is missing or malformed.'
-$expectedActionTypes = [ordered]@{ RollbackUserPath = 1282; ApplyUserPath = 1026; UninstallUserPath = 1026; FinalizeUserPathMarker = 1026; FailAfterFinalizeUserPathMarker = 1026; FailAfterUserPath = 1026; FailAfterRemoveExistingProducts = 1026; CommitUserPath = 1538 }
-$expectedActionCommands = [ordered]@{ RollbackUserPath = '--action rollback'; ApplyUserPath = '--action apply'; UninstallUserPath = '--action uninstall'; FinalizeUserPathMarker = '--action finalize'; FailAfterFinalizeUserPathMarker = '--action fail'; FailAfterUserPath = '--action fail'; FailAfterRemoveExistingProducts = '--action fail'; CommitUserPath = '--action commit' }
+$expectedActionTypes = [ordered]@{ RollbackUserPath = 1282; ApplyUserPath = 1026; UninstallUserPath = 1026; FinalizeUserPathMarker = 1026; FailAfterUserPath = 1026; FailAfterRemoveExistingProducts = 1026; CommitUserPath = 1538 }
+$expectedActionCommands = [ordered]@{ RollbackUserPath = '--action rollback'; ApplyUserPath = '--action apply'; UninstallUserPath = '--action uninstall'; FinalizeUserPathMarker = '--action finalize'; FailAfterUserPath = '--action fail'; FailAfterRemoveExistingProducts = '--action fail'; CommitUserPath = '--action commit' }
 foreach ($name in $expectedActionTypes.Keys) {
     $action = @($customActions | Where-Object { $_.Action -ceq $name })
     Require ($action.Count -eq 1 -and [int]$action[0].Type -eq $expectedActionTypes[$name] -and
@@ -324,8 +324,10 @@ foreach ($name in $expectedActionTypes.Keys) {
         -not $action[0].Target.Contains('[CustomActionData]')) "MSI custom action mismatch: $name"
     Require (([int]$action[0].Type -band 2048) -eq 0) "MSI custom action unexpectedly requests no-impersonate/elevated execution: $name"
 }
+Require (@($customActions | Where-Object { $_.Action -ceq 'FailAfterFinalizeUserPathMarker' }).Count -eq 0) 'MSI retains the unsafe deferred complete-uninstall failure hook.'
 
 $executeSequence = Read-MsiRows $database 'SELECT `Action`, `Condition`, `Sequence` FROM `InstallExecuteSequence`' @('Action', 'Condition', 'Sequence')
+Require (@($executeSequence | Where-Object { $_.Action -ceq 'FailAfterFinalizeUserPathMarker' }).Count -eq 0) 'MSI retains an orphaned sequence row for the unsafe deferred complete-uninstall failure hook.'
 $executeCostFinalize = @($executeSequence | Where-Object { $_.Action -ceq 'CostFinalize' })
 $executePathDirectory = @($executeSequence | Where-Object { $_.Action -ceq 'SetINLAID_PATH_PROGRAM_DIR' })
 $executePreflight = @($executeSequence | Where-Object { $_.Action -ceq 'PreflightUserPathState' })
@@ -334,18 +336,10 @@ $executeRollbackPath = @($executeSequence | Where-Object { $_.Action -ceq 'Rollb
 $executeApplyPath = @($executeSequence | Where-Object { $_.Action -ceq 'ApplyUserPath' })
 $executeUninstallPath = @($executeSequence | Where-Object { $_.Action -ceq 'UninstallUserPath' })
 $executeFinalizeMarker = @($executeSequence | Where-Object { $_.Action -ceq 'FinalizeUserPathMarker' })
-$executePostFinalizeFailure = @($executeSequence | Where-Object { $_.Action -ceq 'FailAfterFinalizeUserPathMarker' })
 $executeFailAfterPath = @($executeSequence | Where-Object { $_.Action -ceq 'FailAfterUserPath' })
 $executeRemoveRegistry = @($executeSequence | Where-Object { $_.Action -ceq 'RemoveRegistryValues' })
 $executeRemoveExisting = @($executeSequence | Where-Object { $_.Action -ceq 'RemoveExistingProducts' })
 $executePostRemovalFailure = @($executeSequence | Where-Object { $_.Action -ceq 'FailAfterRemoveExistingProducts' })
-$executeProcessComponents = @($executeSequence | Where-Object { $_.Action -ceq 'ProcessComponents' })
-$executeUnpublishFeatures = @($executeSequence | Where-Object { $_.Action -ceq 'UnpublishFeatures' })
-$executeInstallExecute = @($executeSequence | Where-Object { $_.Action -ceq 'InstallExecute' })
-$executeRegisterUser = @($executeSequence | Where-Object { $_.Action -ceq 'RegisterUser' })
-$executeRegisterProduct = @($executeSequence | Where-Object { $_.Action -ceq 'RegisterProduct' })
-$executePublishFeatures = @($executeSequence | Where-Object { $_.Action -ceq 'PublishFeatures' })
-$executePublishProduct = @($executeSequence | Where-Object { $_.Action -ceq 'PublishProduct' })
 $executeCommitPath = @($executeSequence | Where-Object { $_.Action -ceq 'CommitUserPath' })
 Require ($executeCostFinalize.Count -eq 1 -and $executePathDirectory.Count -eq 1 -and
     [int]$executePathDirectory[0].Sequence -gt [int]$executeCostFinalize[0].Sequence) 'MSI execute sequence does not capture INSTALLFOLDER after costing.'
@@ -355,17 +349,12 @@ Require ($executeFinalizeMarker.Count -eq 1 -and $executeRemoveRegistry.Count -e
     [int]$executeFinalizeMarker[0].Sequence -gt [int]$executeRemoveRegistry[0].Sequence -and
     [int]$executeFinalizeMarker[0].Sequence -lt [int]$executeCommitPath[0].Sequence -and
     $executeFinalizeMarker[0].Condition.Contains('REMOVE~="ALL"')) 'MSI does not verify finalized installer-private marker values after Registry-table removal and before commit.'
-Require ($executePostFinalizeFailure.Count -eq 1 -and
-    [int]$executePostFinalizeFailure[0].Sequence -gt [int]$executeFinalizeMarker[0].Sequence -and
-    [int]$executePostFinalizeFailure[0].Sequence -lt [int]$executeCommitPath[0].Sequence -and
-    $executePostFinalizeFailure[0].Condition.Contains('INLAID_TEST_FAIL_AFTER_FINALIZE_USER_PATH_MARKER="1"') -and
-    $executePostFinalizeFailure[0].Condition.Contains('REMOVE~="ALL"')) 'MSI lacks the test-only failed-uninstall seam after marker finalization and before commit.'
 Require ($executePreflight.Count -eq 1 -and $executeTransactionSetter.Count -eq 1 -and $executeRollbackPath.Count -eq 1 -and
     $executePreflight[0].Condition -ceq 'NOT UPGRADINGPRODUCTCODE' -and
     $executeTransactionSetter[0].Condition -ceq 'NOT UPGRADINGPRODUCTCODE' -and
     [int]$executePreflight[0].Sequence -lt [int]$executeTransactionSetter[0].Sequence -and
     [int]$executeTransactionSetter[0].Sequence -lt [int]$executeRollbackPath[0].Sequence) 'Stale-state preflight and private transaction activation do not run explicitly before rollback scheduling or the upgrading-away package is not excluded.'
-foreach ($action in @($executeRollbackPath, $executeApplyPath, $executeUninstallPath, $executeFinalizeMarker, $executePostFinalizeFailure, $executeFailAfterPath, $executePostRemovalFailure, $executeCommitPath)) {
+foreach ($action in @($executeRollbackPath, $executeApplyPath, $executeUninstallPath, $executeFinalizeMarker, $executeFailAfterPath, $executePostRemovalFailure, $executeCommitPath)) {
     Require ($action.Count -eq 1 -and $action[0].Condition.Contains('NOT UPGRADINGPRODUCTCODE') -and
         $action[0].Condition.Contains('InlaidPathTransactionActive="1"')) "MSI PATH cleanup action is not directly upgrade-excluded and transaction-conditioned: $($action[0].Action)"
 }
@@ -374,19 +363,6 @@ Require ($executeRemoveExisting.Count -eq 1 -and $executePostRemovalFailure.Coun
     [int]$executePostRemovalFailure[0].Sequence -lt [int]$executeCommitPath[0].Sequence -and
     $executePostRemovalFailure[0].Condition.Contains('INLAID_TEST_FAIL_AFTER_REMOVE_EXISTING_PRODUCTS="1"') -and
     $executePostRemovalFailure[0].Condition.Contains('WIX_UPGRADE_DETECTED')) 'MSI lacks the test-only failure seam after RemoveExistingProducts and before PATH commit.'
-Require ($executeProcessComponents.Count -eq 1 -and [int]$executeProcessComponents[0].Sequence -eq 6497 -and
-    $executeUnpublishFeatures.Count -eq 1 -and [int]$executeUnpublishFeatures[0].Sequence -eq 6498 -and
-    $executeInstallExecute.Count -eq 1 -and [int]$executeInstallExecute[0].Sequence -eq 6500 -and
-    $executeInstallExecute[0].Condition -ceq 'NOT Installed OR (REMOVE~="ALL")' -and
-    [int]$executePostFinalizeFailure[0].Sequence -lt [int]$executeProcessComponents[0].Sequence -and
-    [int]$executeUnpublishFeatures[0].Sequence -lt [int]$executeInstallExecute[0].Sequence) 'MSI does not execute the complete-uninstall failure seam before component and feature registration teardown.'
-Require ($executeRegisterUser.Count -eq 1 -and [int]$executeRegisterUser[0].Sequence -eq 6503 -and
-    $executeRegisterProduct.Count -eq 1 -and [int]$executeRegisterProduct[0].Sequence -eq 6504 -and
-    $executePublishFeatures.Count -eq 1 -and [int]$executePublishFeatures[0].Sequence -eq 6505 -and
-    $executePublishProduct.Count -eq 1 -and [int]$executePublishProduct[0].Sequence -eq 6506 -and
-    [int]$executeInstallExecute[0].Sequence -lt [int]$executeRemoveExisting[0].Sequence -and
-    [int]$executePostRemovalFailure[0].Sequence -lt [int]$executeRegisterUser[0].Sequence -and
-    [int]$executePublishProduct[0].Sequence -lt [int]$executeCommitPath[0].Sequence) 'MSI product publication actions are not isolated in the final transaction script after the rollback checkpoints.'
 
 $upgradeRows = Read-MsiRows $database 'SELECT `UpgradeCode`, `VersionMin`, `VersionMax`, `Attributes`, `ActionProperty` FROM `Upgrade`' @('UpgradeCode', 'VersionMin', 'VersionMax', 'Attributes', 'ActionProperty')
 Require (@($upgradeRows | Where-Object { $_.UpgradeCode -ceq $ExpectedUpgradeCode }).Count -ge 1) 'MSI Upgrade table does not use the stable UpgradeCode.'

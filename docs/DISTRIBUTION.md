@@ -163,7 +163,8 @@ creation][chocolatey] and [Scoop manifests][scoop].
   claim; it never consumes active state.
 - The package has a `NOT RollbackDisabled` launch condition. It refuses install,
   repair, upgrade, or uninstall when Windows Installer rollback is disabled,
-  because the PATH contract cannot otherwise guarantee exact restoration.
+  because install, repair, upgrade, and pre-execution uninstall protection depend
+  on an available rollback transaction.
 
 ### Entry points
 
@@ -221,11 +222,13 @@ creation][chocolatey] and [Scoop manifests][scoop].
   missing segment refreshes it from the then-current PATH state. An unowned
   marker has no inserted segment and no prior-presence claim. This marker is an
   installer component with stable identity across repair and major upgrade.
-  PATH and marker changes are one rollback-aware transaction: failed install,
-  repair, upgrade, or uninstall restores both to their
-  prior values, including restoring PATH as absent when it was originally absent
-  and preserving `REG_SZ` versus `REG_EXPAND_SZ`. Unexpected registry open,
-  delete, or close failures fail the rollback and retain its snapshot for retry.
+  PATH and marker changes are one rollback-aware transaction for install, repair,
+  and upgrade. A detectable uninstall preflight conflict refuses the operation
+  before the first execution script, leaving product registration, payload,
+  marker, and PATH unchanged. These boundaries preserve PATH as absent when it
+  was originally absent and preserve `REG_SZ` versus `REG_EXPAND_SZ`.
+  Unexpected registry open, delete, or close failures fail the rollback and
+  retain its snapshot for retry.
   On uninstall, the deferred PATH action clears only the known marker values,
   Windows Installer removes its `Components` values, and a normal deferred
   finalizer verifies the expected PATH state and absence of all known owned
@@ -236,6 +239,13 @@ creation][chocolatey] and [Scoop manifests][scoop].
   fails lifecycle evidence.
   The commit action only consumes the authenticated snapshot and claim; it
   performs no PATH or registry mutation.
+- Complete removal has a Windows Installer boundary: after the first execution
+  script begins, Windows Installer may automatically remove product and
+  Add/Remove Programs registration before authored deferred actions run. The MSI
+  therefore does not claim exact full-product rollback after an unexpected late
+  uninstall failure. User data remains outside MSI ownership, but reinstalling
+  the same verified package may be required before uninstall can be retried. See
+  Microsoft's [Add/Remove Programs registration behavior][msi-arp].
 - Repair and upgrade preserve the marker. When `owned=true`, a missing exact
   inserted segment is re-appended unless an equivalent user-edited segment now
   exists; an equivalent but non-identical or duplicate segment is treated as
@@ -608,7 +618,8 @@ four layout modes and payload seam while removing the shortcut, Explorer
 handoff, host lookup, relaunch marker, route reporting, and route-only tests. It
 must prove bounded basic-UI and unattended install, repair, persisted user-PATH ownership,
 collision behavior, upgrade, blocked downgrade, failed-upgrade rollback,
-failed-uninstall rollback after marker finalization, uninstall preservation,
+pre-execution uninstall refusal, successful uninstall after marker finalization,
+late-uninstall recovery guidance, uninstall preservation,
 non-destructive import, and exact package-derived payload identity. Host refresh
 and bare-command discovery are accepted only through the separate physical
 terminal-and-shell matrix.
@@ -672,6 +683,7 @@ nor a blocker for this distribution work.
 [chocolatey]: https://docs.chocolatey.org/en-us/create/create-packages/
 [distribution-path]: https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/choose-distribution-path
 [known]: https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid
+[msi-arp]: https://learn.microsoft.com/en-us/windows/win32/msi/configuring-add-remove-programs-with-windows-installer
 [msi-environment]: https://learn.microsoft.com/en-us/windows/win32/msi/environment-table
 [msi-per-user]: https://learn.microsoft.com/en-us/windows/win32/msi/msiinstallperuser
 [msi-version]: https://learn.microsoft.com/en-us/windows/win32/msi/productversion
