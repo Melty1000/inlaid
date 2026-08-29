@@ -68,10 +68,20 @@ Windows runner. The hosted image can set Windows Installer
 or
 [`DisableUserInstalls`](https://learn.microsoft.com/en-us/windows/win32/msi/disableuserinstalls)
 machine policy that rejects unmanaged non-elevated per-user packages before
-package sequencing. The wrapper captures both policy
-DWORDs, requires the separate override switch when either is blocking, sets
-only those present blocking values to `0` for the bounded disposable test
-window, and restores and verifies their exact original values on every exit.
+package sequencing. On the hosted Windows Server image, Windows Installer can
+report effective `DisableMSI=1` even when that policy value and key are absent.
+The wrapper therefore captures both policy DWORDs, requires the separate
+override switch, establishes explicit `DisableMSI=0`, and changes
+`DisableUserInstalls` only when a present value is blocking. For the bounded
+disposable test window it may atomically create only the exact missing
+`Installer` policy key and distinguish that creation from opening a concurrently
+created key; opening an existing key fails closed. On every exit it restores
+each original value or absence independently and verifies the resulting policy
+values. If the wrapper created the key, cleanup also proves the key contains no
+values or subkeys. It deliberately does not delete that empty key because an
+empty-check followed by registry-key deletion could erase a concurrently added
+value; the empty key remains contained to the disposable VM until GitHub destroys
+the runner.
 That runner normalization is evidence setup, not product behavior or permission
 to change a persistent machine. The wrapper then creates a random temporary
 local Users-group account, loads that account's profile, proves the child token

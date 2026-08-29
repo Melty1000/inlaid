@@ -63,6 +63,8 @@ $ValidatedLifecycleRunJsonSHA256 = ''
 $ValidatedLifecycleBootstrapSHA256 = ''
 $ValidatedAccessBoundarySHA256 = ''
 $InstallerPolicySubKey = 'SOFTWARE\Policies\Microsoft\Windows\Installer'
+$InstallerPolicyParentSubKey = 'SOFTWARE\Policies\Microsoft\Windows'
+$InstallerPolicyLeafName = 'Installer'
 $InstallerPolicyNames = @('DisableMSI', 'DisableUserInstalls')
 $InstallerPolicyBefore = @()
 $InstallerPolicyEffective = @()
@@ -72,6 +74,8 @@ $InstallerPolicyMutationRequired = $false
 $InstallerPolicyOverrideApplied = $false
 $InstallerPolicyChangedNames = @()
 $InstallerPolicyAppliedNames = @()
+$InstallerPolicyKeyCreated = $false
+$InstallerPolicyKeyAfter = $null
 $InstallerPolicyRestorationAttempted = $false
 $InstallerPolicyRestored = $null
 $Password = $null
@@ -192,9 +196,94 @@ function Set-MachineInstallerPolicyDword([string]$Name, [uint32]$Value) {
     }
 }
 
-function Test-InstallerPolicySnapshotsEqual([object[]]$Expected, [object[]]$Actual) {
-    $expectedJson = ConvertTo-Json -InputObject @($Expected) -Depth 4 -Compress
-    $actualJson = ConvertTo-Json -InputObject @($Actual) -Depth 4 -Compress
+function New-MachineInstallerPolicyKeyIfMissing {
+    $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::LocalMachine,
+        [Microsoft.Win32.RegistryView]::Registry64
+    )
+    $parentKey = $null
+    try {
+        $parentKey = $baseKey.OpenSubKey($InstallerPolicyParentSubKey, $true)
+        if ($null -eq $parentKey) { throw "Installer policy parent key is missing: HKLM\$InstallerPolicyParentSubKey" }
+        $parentHandle = $parentKey.SafeRegistryHandle.DangerousGetHandle()
+        return [InlaidInstallerPolicyNative]::CreateNewKey($parentHandle, $InstallerPolicyLeafName)
+    }
+    finally {
+        if ($null -ne $parentKey) { $parentKey.Dispose() }
+        $baseKey.Dispose()
+    }
+}
+
+function Remove-MachineInstallerPolicyValue([string]$Name) {
+    $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::LocalMachine,
+        [Microsoft.Win32.RegistryView]::Registry64
+    )
+    $key = $null
+    try {
+        $key = $baseKey.OpenSubKey($InstallerPolicySubKey, $true)
+        if ($null -eq $key) { throw "Installer policy key disappeared before restoring absent value $Name." }
+        $matchingNames = @($key.GetValueNames() | Where-Object { $_ -ieq $Name })
+        if ($matchingNames.Count -ne 1) { throw "Temporary installer policy value $Name is not uniquely present for removal." }
+        $actualName = [string]$matchingNames[0]
+        if ($key.GetValueKind($actualName) -ne [Microsoft.Win32.RegistryValueKind]::DWord -or
+            [long]$key.GetValue($actualName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) -ne 0) {
+            throw "Temporary installer policy value $Name changed before restoration."
+        }
+        $key.DeleteValue($actualName, $true)
+    }
+    finally {
+        if ($null -ne $key) { $key.Dispose() }
+        $baseKey.Dispose()
+    }
+}
+
+function Get-MachineInstallerPolicyKeyInventory {
+    $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::LocalMachine,
+        [Microsoft.Win32.RegistryView]::Registry64
+    )
+    $key = $null
+    try {
+        $key = $baseKey.OpenSubKey($InstallerPolicySubKey, $false)
+        if ($null -eq $key) {
+            return [pscustomobject][ordered]@{
+                present = $false
+                valueNames = @()
+                subKeyNames = @()
+            }
+        }
+        return [pscustomobject][ordered]@{
+            present = $true
+            valueNames = @($key.GetValueNames() | Sort-Object)
+            subKeyNames = @($key.GetSubKeyNames() | Sort-Object)
+        }
+    }
+    finally {
+        if ($null -ne $key) { $key.Dispose() }
+        $baseKey.Dispose()
+    }
+}
+
+function Test-InstallerPolicyValueSnapshotsEqual([object[]]$Expected, [object[]]$Actual) {
+    $expectedValues = @($Expected | ForEach-Object {
+        [pscustomobject][ordered]@{
+            name = $_.name
+            present = $_.present
+            kind = $_.kind
+            value = $_.value
+        }
+    })
+    $actualValues = @($Actual | ForEach-Object {
+        [pscustomobject][ordered]@{
+            name = $_.name
+            present = $_.present
+            kind = $_.kind
+            value = $_.value
+        }
+    })
+    $expectedJson = ConvertTo-Json -InputObject $expectedValues -Depth 4 -Compress
+    $actualJson = ConvertTo-Json -InputObject $actualValues -Depth 4 -Compress
     return $expectedJson -ceq $actualJson
 }
 
@@ -234,6 +323,7 @@ function Write-OrchestratorEvidence([string]$Phase) {
             overrideApplied = $InstallerPolicyOverrideApplied
             changedNames = @($InstallerPolicyChangedNames)
             appliedNames = @($InstallerPolicyAppliedNames)
+            keyCreated = $InstallerPolicyKeyCreated
             before = @($InstallerPolicyBefore)
             effective = @($InstallerPolicyEffective)
         }
@@ -360,6 +450,54 @@ public static class InlaidStandardUserJob {
             throw new Win32Exception(Marshal.GetLastWin32Error(), "TerminateJobObject");
     }
 }
+
+public static class InlaidInstallerPolicyNative {
+    private const UInt32 REG_OPTION_NON_VOLATILE = 0;
+    private const Int32 KEY_READ = 0x00020019;
+    private const Int32 KEY_WRITE = 0x00020006;
+    private const UInt32 REG_CREATED_NEW_KEY = 1;
+    private const UInt32 REG_OPENED_EXISTING_KEY = 2;
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    private static extern Int32 RegCreateKeyExW(
+        IntPtr key,
+        string subKey,
+        Int32 reserved,
+        string keyClass,
+        UInt32 options,
+        Int32 desiredAccess,
+        IntPtr securityAttributes,
+        out IntPtr result,
+        out UInt32 disposition
+    );
+
+    [DllImport("advapi32.dll")]
+    private static extern Int32 RegCloseKey(IntPtr key);
+
+    public static bool CreateNewKey(IntPtr parentKey, string leafName) {
+        IntPtr result;
+        UInt32 disposition;
+        Int32 error = RegCreateKeyExW(
+            parentKey,
+            leafName,
+            0,
+            null,
+            REG_OPTION_NON_VOLATILE,
+            KEY_READ | KEY_WRITE,
+            IntPtr.Zero,
+            out result,
+            out disposition
+        );
+        if (error != 0)
+            throw new Win32Exception(error, "RegCreateKeyExW");
+        Int32 closeError = RegCloseKey(result);
+        if (closeError != 0)
+            throw new Win32Exception(closeError, "RegCloseKey");
+        if (disposition == REG_CREATED_NEW_KEY) return true;
+        if (disposition == REG_OPENED_EXISTING_KEY) return false;
+        throw new InvalidOperationException("RegCreateKeyExW returned an unknown disposition.");
+    }
+}
 '@
 
 try {
@@ -369,7 +507,10 @@ try {
     $InstallerPolicyBefore = @($InstallerPolicyNames | ForEach-Object { Get-MachineInstallerPolicyValue $_ })
     $InstallerPolicyCaptured = $true
     foreach ($policy in $InstallerPolicyBefore) {
-        if (-not [bool]$policy.present) { continue }
+        if (-not [bool]$policy.present) {
+            if ($policy.name -ceq 'DisableMSI') { $InstallerPolicyChangedNames += [string]$policy.name }
+            continue
+        }
         if ($policy.kind -cne 'DWord') { throw "Installer policy $($policy.name) has unsupported registry kind $($policy.kind)." }
         $allowedValues = if ($policy.name -ceq 'DisableMSI') { @(0L, 1L, 2L) } else { @(0L, 1L) }
         if ([long]$policy.value -notin $allowedValues) {
@@ -381,14 +522,22 @@ try {
     if ($InstallerPolicyMutationRequired -and -not $AcceptMachinePolicyOverride) {
         throw "The GitHub-hosted runner blocks unmanaged standard-user MSI execution through: $($InstallerPolicyChangedNames -join ', '). Re-run with -AcceptMachinePolicyOverride only on this disposable runner."
     }
+    $disableMsiBefore = @($InstallerPolicyBefore | Where-Object { $_.name -ceq 'DisableMSI' })
+    if ($disableMsiBefore.Count -ne 1) { throw 'DisableMSI policy preflight did not produce exactly one result.' }
+    if ($InstallerPolicyMutationRequired -and -not [bool]$disableMsiBefore[0].keyPresent) {
+        $InstallerPolicyKeyCreated = New-MachineInstallerPolicyKeyIfMissing
+        if (-not $InstallerPolicyKeyCreated) { throw 'Installer policy key appeared concurrently before the bounded override.' }
+    }
     foreach ($name in $InstallerPolicyChangedNames) {
         Set-MachineInstallerPolicyDword $name 0
         $InstallerPolicyAppliedNames += $name
     }
     $InstallerPolicyEffective = @($InstallerPolicyNames | ForEach-Object { Get-MachineInstallerPolicyValue $_ })
-    foreach ($policy in $InstallerPolicyEffective) {
-        if ([bool]$policy.present -and ($policy.kind -cne 'DWord' -or [long]$policy.value -ne 0)) {
-            throw "Installer policy $($policy.name) did not reach the required nonblocking DWORD value 0."
+    foreach ($name in $InstallerPolicyChangedNames) {
+        $effective = @($InstallerPolicyEffective | Where-Object { $_.name -ceq $name })
+        if ($effective.Count -ne 1 -or -not [bool]$effective[0].present -or
+            $effective[0].kind -cne 'DWord' -or [long]$effective[0].value -ne 0) {
+            throw "Installer policy $name did not reach the required nonblocking DWORD value 0."
         }
     }
     $InstallerPolicyOverrideApplied = $InstallerPolicyAppliedNames.Count -ne 0
@@ -691,6 +840,10 @@ finally {
                 try {
                     $original = @($InstallerPolicyBefore | Where-Object { $_.name -ceq $name })
                     if ($original.Count -ne 1 -or -not [bool]$original[0].present -or $original[0].kind -cne 'DWord') {
+                        if ($original.Count -eq 1 -and -not [bool]$original[0].present) {
+                            Remove-MachineInstallerPolicyValue $name
+                            continue
+                        }
                         throw "Original installer policy evidence is not restorable for $name."
                     }
                     Set-MachineInstallerPolicyDword $name ([uint32]$original[0].value)
@@ -703,12 +856,22 @@ finally {
         }
         catch { $policyRestoreErrors += "capture final state: $($_.Exception.Message)" }
         if ($InstallerPolicyAfter.Count -ne $InstallerPolicyNames.Count -or
-            -not (Test-InstallerPolicySnapshotsEqual $InstallerPolicyBefore $InstallerPolicyAfter)) {
-            $policyRestoreErrors += 'final state does not exactly match the captured original state'
+            -not (Test-InstallerPolicyValueSnapshotsEqual $InstallerPolicyBefore $InstallerPolicyAfter)) {
+            $policyRestoreErrors += 'final policy values do not exactly match the captured original values or absence'
         }
+        try {
+            $InstallerPolicyKeyAfter = Get-MachineInstallerPolicyKeyInventory
+            if ($InstallerPolicyKeyCreated -and
+                (-not [bool]$InstallerPolicyKeyAfter.present -or
+                 @($InstallerPolicyKeyAfter.valueNames).Count -ne 0 -or
+                 @($InstallerPolicyKeyAfter.subKeyNames).Count -ne 0)) {
+                $policyRestoreErrors += 'wrapper-created Installer policy key is not present and empty after value restoration'
+            }
+        }
+        catch { $policyRestoreErrors += "capture final policy-key inventory: $($_.Exception.Message)" }
         $InstallerPolicyRestored = $policyRestoreErrors.Count -eq 0
         if (-not $InstallerPolicyRestored) {
-            $CleanupErrors += "restore machine Windows Installer policy exactly: $($policyRestoreErrors -join '; ')"
+            $CleanupErrors += "restore machine Windows Installer policy values safely: $($policyRestoreErrors -join '; ')"
         }
     }
     if (-not $PreserveDisposableState) {
@@ -780,8 +943,11 @@ finally {
                 overrideApplied = $InstallerPolicyOverrideApplied
                 changedNames = @($InstallerPolicyChangedNames)
                 appliedNames = @($InstallerPolicyAppliedNames)
+                keyCreated = $InstallerPolicyKeyCreated
+                keyAfter = $InstallerPolicyKeyAfter
+                verifiedEmptyCreatedKeyRetainedUntilVmDestruction = [bool]($InstallerPolicyKeyCreated -and $InstallerPolicyRestored)
                 restorationAttempted = $InstallerPolicyRestorationAttempted
-                restored = $InstallerPolicyRestored
+                valuesRestored = $InstallerPolicyRestored
                 before = @($InstallerPolicyBefore)
                 effective = @($InstallerPolicyEffective)
                 after = @($InstallerPolicyAfter)
