@@ -89,7 +89,7 @@ jobs:
 
       - name: Exercise per-user MSI lifecycle
         shell: pwsh
-        run: .\scripts\test-windows-msi-as-standard-user.ps1 -Wix .\.tools\wix\wix.exe -ChildTimeoutSeconds 2400 -AcceptLocalUserSetup
+        run: .\scripts\test-windows-msi-as-standard-user.ps1 -Wix .\.tools\wix\wix.exe -ChildTimeoutSeconds 2400 -AcceptLocalUserSetup -AcceptMachinePolicyOverride
 
       - name: Upload Windows MSI package and lifecycle evidence
         if: always()

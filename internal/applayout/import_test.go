@@ -219,7 +219,7 @@ func TestImportPortablePreflightsAllDestinationsBeforeWriting(t *testing.T) {
 	}
 
 	report, err := ImportPortable(source, destination)
-	if err == nil || !strings.Contains(err.Error(), "destination parent") {
+	if err == nil || !strings.Contains(err.Error(), `import filter "warm.cube"`) {
 		t.Fatalf("import error = %v", err)
 	}
 	if len(report.Items) != 0 {

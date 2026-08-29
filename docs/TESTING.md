@@ -61,10 +61,21 @@ Only after that evidence passes does the lifecycle route install, repair,
 upgrade, and uninstall test packages, and it therefore runs only with its
 explicit switch in an authorized disposable Windows environment. Windows CI
 does not invoke that mutating script as the elevated runner identity. It invokes
-`test-windows-msi-as-standard-user.ps1 -AcceptLocalUserSetup`, which refuses to
-run outside a GitHub-hosted Windows runner, creates a random temporary local
-Users-group account, loads that account's profile, proves the child token lacks
-the Administrators SID and role, and then invokes the lifecycle route. Neither
+`test-windows-msi-as-standard-user.ps1` with `-AcceptLocalUserSetup` and
+`-AcceptMachinePolicyOverride`, which refuses to run outside a GitHub-hosted
+Windows runner. The hosted image can set Windows Installer
+[`DisableMSI`](https://learn.microsoft.com/en-us/windows/win32/msi/disablemsi)
+or
+[`DisableUserInstalls`](https://learn.microsoft.com/en-us/windows/win32/msi/disableuserinstalls)
+machine policy that rejects unmanaged non-elevated per-user packages before
+package sequencing. The wrapper captures both policy
+DWORDs, requires the separate override switch when either is blocking, sets
+only those present blocking values to `0` for the bounded disposable test
+window, and restores and verifies their exact original values on every exit.
+That runner normalization is evidence setup, not product behavior or permission
+to change a persistent machine. The wrapper then creates a random temporary
+local Users-group account, loads that account's profile, proves the child token
+lacks the Administrators SID and role, and invokes the lifecycle route. Neither
 route is a documentation-only check. The presence or success of an MSI route is
 not by itself contract-compliance evidence. Implementation acceptance requires
 the MSI authoring and lifecycle assertions invoked by those routes to prove
@@ -573,8 +584,11 @@ ACLs, and grants Modify only on protected `windows-msi-standard-user` and
 `windows-msi-lifecycle` evidence roots. Before the lifecycle starts, child and
 parent evidence must agree on effective write-denial probes for source, package,
 and focused-helper state and successful create/write/delete probes only in those
-two owned evidence roots. The wrapper then launches a hidden credentialed child
-with a loaded HKCU profile,
+two owned evidence roots. Orchestrator evidence must record the original and
+effective `DisableMSI` and `DisableUserInstalls` state; cleanup evidence must
+record the final state, and success requires exact restoration. The wrapper then
+launches a hidden
+credentialed child with a loaded HKCU profile,
 and places its process tree in a kill-on-close job with a 40-minute outer timeout.
 It records the actual child token, group SIDs, `whoami /all`, resolved profile,
 allowlisted runner facts, exact child exit, and exact ACL restoration. Parent

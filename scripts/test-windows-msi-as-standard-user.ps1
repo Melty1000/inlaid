@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory)][string]$Wix,
     [ValidateRange(60, 2700)][int]$ChildTimeoutSeconds = 2400,
-    [switch]$AcceptLocalUserSetup
+    [switch]$AcceptLocalUserSetup,
+    [switch]$AcceptMachinePolicyOverride
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,6 +62,18 @@ $ValidatedLifecycleEvidenceRun = ''
 $ValidatedLifecycleRunJsonSHA256 = ''
 $ValidatedLifecycleBootstrapSHA256 = ''
 $ValidatedAccessBoundarySHA256 = ''
+$InstallerPolicySubKey = 'SOFTWARE\Policies\Microsoft\Windows\Installer'
+$InstallerPolicyNames = @('DisableMSI', 'DisableUserInstalls')
+$InstallerPolicyBefore = @()
+$InstallerPolicyEffective = @()
+$InstallerPolicyAfter = @()
+$InstallerPolicyCaptured = $false
+$InstallerPolicyMutationRequired = $false
+$InstallerPolicyOverrideApplied = $false
+$InstallerPolicyChangedNames = @()
+$InstallerPolicyAppliedNames = @()
+$InstallerPolicyRestorationAttempted = $false
+$InstallerPolicyRestored = $null
 $Password = $null
 $Credential = $null
 $User = $null
@@ -117,6 +130,74 @@ function Test-LocalGroupMembership([Security.Principal.SecurityIdentifier]$Sid, 
     return $null -ne (Get-LocalGroupMember -Group $group | Where-Object { $_.SID -eq $Sid } | Select-Object -First 1)
 }
 
+function Get-MachineInstallerPolicyValue([string]$Name) {
+    $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::LocalMachine,
+        [Microsoft.Win32.RegistryView]::Registry64
+    )
+    $key = $null
+    try {
+        $key = $baseKey.OpenSubKey($InstallerPolicySubKey, $false)
+        if ($null -eq $key) {
+            return [pscustomobject][ordered]@{
+                name = $Name
+                keyPresent = $false
+                present = $false
+                kind = $null
+                value = $null
+            }
+        }
+        $matchingNames = @($key.GetValueNames() | Where-Object { $_ -ieq $Name })
+        if ($matchingNames.Count -gt 1) { throw "Installer policy $Name has multiple case-insensitive registry matches." }
+        if ($matchingNames.Count -eq 0) {
+            return [pscustomobject][ordered]@{
+                name = $Name
+                keyPresent = $true
+                present = $false
+                kind = $null
+                value = $null
+            }
+        }
+        $actualName = [string]$matchingNames[0]
+        $kind = $key.GetValueKind($actualName)
+        $value = $key.GetValue($actualName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        return [pscustomobject][ordered]@{
+            name = $Name
+            keyPresent = $true
+            present = $true
+            kind = $kind.ToString()
+            value = [long]$value
+        }
+    }
+    finally {
+        if ($null -ne $key) { $key.Dispose() }
+        $baseKey.Dispose()
+    }
+}
+
+function Set-MachineInstallerPolicyDword([string]$Name, [uint32]$Value) {
+    $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::LocalMachine,
+        [Microsoft.Win32.RegistryView]::Registry64
+    )
+    $key = $null
+    try {
+        $key = $baseKey.OpenSubKey($InstallerPolicySubKey, $true)
+        if ($null -eq $key) { throw "Installer policy key is missing: HKLM\$InstallerPolicySubKey" }
+        $key.SetValue($Name, [int]$Value, [Microsoft.Win32.RegistryValueKind]::DWord)
+    }
+    finally {
+        if ($null -ne $key) { $key.Dispose() }
+        $baseKey.Dispose()
+    }
+}
+
+function Test-InstallerPolicySnapshotsEqual([object[]]$Expected, [object[]]$Actual) {
+    $expectedJson = ConvertTo-Json -InputObject @($Expected) -Depth 4 -Compress
+    $actualJson = ConvertTo-Json -InputObject @($Actual) -Depth 4 -Compress
+    return $expectedJson -ceq $actualJson
+}
+
 function ConvertTo-QuotedWindowsProcessArgument([string]$Value) {
     if ($Value.Contains('"')) { throw 'A child process path contains an unsupported quote character.' }
     return '"' + $Value + '"'
@@ -143,6 +224,18 @@ function Write-OrchestratorEvidence([string]$Phase) {
             validatedLifecycleRunJsonSHA256 = $ValidatedLifecycleRunJsonSHA256
             validatedLifecycleBootstrapSHA256 = $ValidatedLifecycleBootstrapSHA256
             validatedAccessBoundarySHA256 = $ValidatedAccessBoundarySHA256
+        }
+        machineInstallerPolicy = [ordered]@{
+            registryView = 'Registry64'
+            subKey = "HKLM\$InstallerPolicySubKey"
+            explicitOverrideAuthorization = $AcceptMachinePolicyOverride.IsPresent
+            captured = $InstallerPolicyCaptured
+            mutationRequired = $InstallerPolicyMutationRequired
+            overrideApplied = $InstallerPolicyOverrideApplied
+            changedNames = @($InstallerPolicyChangedNames)
+            appliedNames = @($InstallerPolicyAppliedNames)
+            before = @($InstallerPolicyBefore)
+            effective = @($InstallerPolicyEffective)
         }
         account = [ordered]@{
             name = $UserName
@@ -272,6 +365,34 @@ public static class InlaidStandardUserJob {
 try {
     Import-Module Microsoft.PowerShell.LocalAccounts -ErrorAction Stop
     Add-Type -TypeDefinition $JobSource -Language CSharp
+
+    $InstallerPolicyBefore = @($InstallerPolicyNames | ForEach-Object { Get-MachineInstallerPolicyValue $_ })
+    $InstallerPolicyCaptured = $true
+    foreach ($policy in $InstallerPolicyBefore) {
+        if (-not [bool]$policy.present) { continue }
+        if ($policy.kind -cne 'DWord') { throw "Installer policy $($policy.name) has unsupported registry kind $($policy.kind)." }
+        $allowedValues = if ($policy.name -ceq 'DisableMSI') { @(0L, 1L, 2L) } else { @(0L, 1L) }
+        if ([long]$policy.value -notin $allowedValues) {
+            throw "Installer policy $($policy.name) has unsupported DWORD value $($policy.value)."
+        }
+        if ([long]$policy.value -ne 0) { $InstallerPolicyChangedNames += [string]$policy.name }
+    }
+    $InstallerPolicyMutationRequired = $InstallerPolicyChangedNames.Count -ne 0
+    if ($InstallerPolicyMutationRequired -and -not $AcceptMachinePolicyOverride) {
+        throw "The GitHub-hosted runner blocks unmanaged standard-user MSI execution through: $($InstallerPolicyChangedNames -join ', '). Re-run with -AcceptMachinePolicyOverride only on this disposable runner."
+    }
+    foreach ($name in $InstallerPolicyChangedNames) {
+        Set-MachineInstallerPolicyDword $name 0
+        $InstallerPolicyAppliedNames += $name
+    }
+    $InstallerPolicyEffective = @($InstallerPolicyNames | ForEach-Object { Get-MachineInstallerPolicyValue $_ })
+    foreach ($policy in $InstallerPolicyEffective) {
+        if ([bool]$policy.present -and ($policy.kind -cne 'DWord' -or [long]$policy.value -ne 0)) {
+            throw "Installer policy $($policy.name) did not reach the required nonblocking DWORD value 0."
+        }
+    }
+    $InstallerPolicyOverrideApplied = $InstallerPolicyAppliedNames.Count -ne 0
+    Write-OrchestratorEvidence 'installer-policy-ready'
 
     $Password = New-RandomSecurePassword
     $Credential = [Management.Automation.PSCredential]::new("$env:COMPUTERNAME\$UserName", $Password)
@@ -562,6 +683,34 @@ finally {
         $JobHandle = [IntPtr]::Zero
     }
     if ($null -ne $Process) { $Process.Dispose() }
+    if ($InstallerPolicyCaptured) {
+        $policyRestoreErrors = @()
+        if ($InstallerPolicyAppliedNames.Count -ne 0) {
+            $InstallerPolicyRestorationAttempted = $true
+            foreach ($name in $InstallerPolicyAppliedNames) {
+                try {
+                    $original = @($InstallerPolicyBefore | Where-Object { $_.name -ceq $name })
+                    if ($original.Count -ne 1 -or -not [bool]$original[0].present -or $original[0].kind -cne 'DWord') {
+                        throw "Original installer policy evidence is not restorable for $name."
+                    }
+                    Set-MachineInstallerPolicyDword $name ([uint32]$original[0].value)
+                }
+                catch { $policyRestoreErrors += "$name`: $($_.Exception.Message)" }
+            }
+        }
+        try {
+            $InstallerPolicyAfter = @($InstallerPolicyNames | ForEach-Object { Get-MachineInstallerPolicyValue $_ })
+        }
+        catch { $policyRestoreErrors += "capture final state: $($_.Exception.Message)" }
+        if ($InstallerPolicyAfter.Count -ne $InstallerPolicyNames.Count -or
+            -not (Test-InstallerPolicySnapshotsEqual $InstallerPolicyBefore $InstallerPolicyAfter)) {
+            $policyRestoreErrors += 'final state does not exactly match the captured original state'
+        }
+        $InstallerPolicyRestored = $policyRestoreErrors.Count -eq 0
+        if (-not $InstallerPolicyRestored) {
+            $CleanupErrors += "restore machine Windows Installer policy exactly: $($policyRestoreErrors -join '; ')"
+        }
+    }
     if (-not $PreserveDisposableState) {
         Remove-Item -LiteralPath $GatePath -Force -ErrorAction SilentlyContinue
     }
@@ -622,6 +771,21 @@ finally {
             evidenceAccessSddlAfter = if ($null -eq $OriginalEvidenceAcl) { $null } else { (Get-Acl -LiteralPath $EvidenceRoot).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access) }
             lifecycleEvidenceAccessSddlBefore = $OriginalLifecycleEvidenceAccessSddl
             lifecycleEvidenceAccessSddlAfter = if ($null -eq $OriginalLifecycleEvidenceAcl) { $null } else { (Get-Acl -LiteralPath $LifecycleEvidenceRoot).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access) }
+            machineInstallerPolicy = [ordered]@{
+                registryView = 'Registry64'
+                subKey = "HKLM\$InstallerPolicySubKey"
+                explicitOverrideAuthorization = $AcceptMachinePolicyOverride.IsPresent
+                captured = $InstallerPolicyCaptured
+                mutationRequired = $InstallerPolicyMutationRequired
+                overrideApplied = $InstallerPolicyOverrideApplied
+                changedNames = @($InstallerPolicyChangedNames)
+                appliedNames = @($InstallerPolicyAppliedNames)
+                restorationAttempted = $InstallerPolicyRestorationAttempted
+                restored = $InstallerPolicyRestored
+                before = @($InstallerPolicyBefore)
+                effective = @($InstallerPolicyEffective)
+                after = @($InstallerPolicyAfter)
+            }
             accountPresentAfterCleanup = if ($null -eq $UserSid) { $null } else { $null -ne (Get-LocalUser -SID $UserSid -ErrorAction SilentlyContinue) }
             profilePresentAfterCleanup = if ($null -eq $UserSid) { $null } else { $null -ne (Get-CimInstance -ClassName Win32_UserProfile -Filter "SID = '$($UserSid.Value)'" -ErrorAction SilentlyContinue) }
             cleanupErrors = @($CleanupErrors)
