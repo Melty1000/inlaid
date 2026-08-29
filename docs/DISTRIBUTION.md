@@ -290,10 +290,17 @@ creation][chocolatey] and [Scoop manifests][scoop].
 
 - The MSI has one permanent UpgradeCode. Every release receives a new
   ProductCode and PackageCode.
-- WiX major-upgrade behavior removes the older product, preserves user data,
-  rolls back a failed installation, and blocks installing an older MSI over a
-  newer one. WiX documents that major upgrades require a stable UpgradeCode and
-  a changing ProductVersion. See [WiX MajorUpgrade][wix-major-upgrade].
+- WiX major-upgrade behavior commits the incoming product before it removes the
+  older product, preserves user data, and blocks installing an older MSI over a
+  newer one. A failure before `InstallFinalize` rolls back the incoming
+  transaction while the older product remains installed. Old-product removal
+  runs afterward as a separate Windows Installer operation. If that removal
+  fails, the failure remains visible and the committed newer product remains;
+  the older product or its registration may also remain and require separate,
+  version-specific cleanup. Inlaid does not claim atomic two-product rollback across that
+  boundary. See [WiX MajorUpgrade][wix-major-upgrade], Microsoft's
+  [RemoveExistingProducts sequencing][msi-remove-existing], and
+  [InstallFinalize transaction boundary][msi-install-finalize].
 - Inlaid's public version remains the leading-`v` Git tag, such as
   `v0.3.0-beta.1`. Windows
   Installer compares only a three-part numeric ProductVersion, so packaging
@@ -311,11 +318,15 @@ creation][chocolatey] and [Scoop manifests][scoop].
   WinGet's [MSI correlation guidance][winget-manifest].
 - A direct MSI update and a WinGet update execute the same major-upgrade path.
   Portable ZIPs never participate in MSI upgrade detection.
-- Failed MSI upgrades rely on Windows Installer rollback. An intentional
-  downgrade requires uninstalling the newer MSI first and installing the older
-  retained release. Release notes must say when stored settings cease to be
-  backward compatible; absent such a warning, one previous release must read
-  the current settings file safely.
+- Failed incoming MSI transactions before `InstallFinalize` rely on Windows
+  Installer rollback. A failure while removing the older product after that
+  boundary does not roll back the already committed newer product; evidence must
+  prove the newer product remains repairable and any older registration is
+  handled through a separate version-specific cleanup without touching user
+  data. An intentional downgrade requires uninstalling the newer MSI first
+  and installing the older retained release. Release notes must say when stored
+  settings cease to be backward compatible; absent such a warning, one previous
+  release must read the current settings file safely.
 
 ### Signing
 
@@ -602,7 +613,7 @@ and tests before the terminal-first contract can be accepted as implemented.
 | Distribution mode and launch route are separate facts | **Reassigned**; distribution mode remains, while product launch-route detection and reporting are deleted |
 | Shared allowlisted payload metadata feeds MSI and ZIP | **Retained**; MSI profile now owns PATH and registration, not a shortcut |
 | Stable UpgradeCode, changing product/package identity, and semantic-to-MSI version ledger | **Retained** |
-| Upgrade preserves data, blocks downgrade, and rolls back failure | **Retained** |
+| Upgrade preserves data, blocks downgrade, and rolls back failure | **Retained with a precise boundary**; an incoming failure before `InstallFinalize` rolls back exactly, while later old-product removal occurs after commit and uses visible repair/cleanup recovery rather than an impossible atomic two-product rollback claim |
 | Uninstall removes only installer-owned resources and preserves all user data | **Retained and tightened** with persisted provenance and conservative retention of ambiguous or pre-existing PATH text |
 | Public EXE and MSI use trusted timestamped signing; ZIP uses the same EXE plus checksum and attestation | **Retained** |
 | GitHub Releases and the protected tag build are immutable artifact authority | **Retained** |
@@ -684,6 +695,8 @@ nor a blocker for this distribution work.
 [distribution-path]: https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/choose-distribution-path
 [known]: https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid
 [msi-arp]: https://learn.microsoft.com/en-us/windows/win32/msi/configuring-add-remove-programs-with-windows-installer
+[msi-install-finalize]: https://learn.microsoft.com/en-us/windows/win32/msi/installfinalize-action
+[msi-remove-existing]: https://learn.microsoft.com/en-us/windows/win32/msi/removeexistingproducts-action
 [msi-environment]: https://learn.microsoft.com/en-us/windows/win32/msi/environment-table
 [msi-per-user]: https://learn.microsoft.com/en-us/windows/win32/msi/msiinstallperuser
 [msi-version]: https://learn.microsoft.com/en-us/windows/win32/msi/productversion

@@ -494,7 +494,7 @@ run.
 For MSI lifecycle evidence, separately record a bounded Windows Installer basic-UI
 install (`/qb!`, UI level 3 with cancellation disabled for deterministic CI) and
 an unattended `/qn` install, repair, upgrade from an older test MSI, blocked downgrade, injected
-failed-upgrade rollback both before and after `RemoveExistingProducts`, safe
+pre-finalize failed-upgrade rollback, successful post-finalize old-product removal, safe
 pre-execution uninstall refusal, and successful uninstall after marker
 finalization. Fault-injected repair uses `/i` with `REINSTALL=ALL` and
 `REINSTALLMODE=a`, not `/f`, because [Windows Installer's `/f` option ignores
@@ -528,10 +528,11 @@ zero package, registration, known-marker, snapshot, `.partial`, `.claim`, or
 This does not claim that no transient package file or preflight claim existed.
 Repair/reacquisition
 evidence must prove the marker preserves or refreshes that prior-presence field
-at the exact ownership boundary. The post-removal failure case must
-prove the old product's payload and registration return exactly and that its
-upgrade transaction cannot consume the new product's ProductCode-qualified PATH
-snapshot.
+at the exact ownership boundary. Major-upgrade authoring must schedule
+`RemoveExistingProducts` after `InstallFinalize` and must not ignore an
+old-product removal failure. The retained successful-upgrade log must prove the
+incoming transaction finalized before old-product removal began, then prove the
+new product is exact and the old ProductCode is absent.
 The lifecycle preflight must also prove both fixture ProductCode-qualified
 snapshot, `.partial`, `.claim`, and `.claim.partial` paths are absent. Static/package evidence must
 prove the same-product stale-state check executes immediately before rollback is
@@ -542,9 +543,13 @@ prove `PreflightUserPathState` refuses uninstall before the first
 `InstallExecute` or `InstallFinalize` script. Product registration, payload,
 marker, PATH bytes/type, and the fixture itself must remain exact until the
 harness removes only that fixture. Do not deliberately inject a deferred failure
-after complete-removal execution begins: Windows Installer automatically adds
+after complete-removal execution begins, including inside the nested old-product
+uninstall during a major upgrade. Windows Installer automatically adds
 product-registration removal to that script, and a standard-user package cannot
-promise exact registration rollback across that platform boundary.
+promise exact registration rollback across that platform boundary. Because the
+incoming package commits first, an old-product removal failure must leave the
+newer product available for repair/retry; evidence must report any older
+registration residue rather than claiming atomic two-product rollback.
 Static inspection must also compare the complete seven-row Registry table—root,
 key, name, encoded value, owning component, and component key-path reference—to
 the expected mapping; checking only the provenance row is insufficient.
@@ -584,9 +589,9 @@ proves only persisted PATH bytes/type, marker/transaction behavior, and direct
 execution of the installed executable.
 The rollback-disabled case passes public `DISABLEROLLBACK=1` and retains the MSI
 log proving the package's LaunchConditions action emitted the rollback-required
-message and failed before mutation. The post-`RemoveExistingProducts` failure log
-must prove that standard action returned success before the injected action ran
-and failed. The pre-execution uninstall-refusal log must prove the stale-state
+message and failed before mutation. The successful-upgrade log must prove
+`InstallFinalize` returned success before `RemoveExistingProducts` started and
+that old-product removal then succeeded. The pre-execution uninstall-refusal log must prove the stale-state
 preflight failed before `InstallExecute`, `InstallFinalize`, product-unregister,
 product-unpublish, or source-list-unpublish activity. A successful uninstall log
 must prove `FinalizeUserPathMarker` ran successfully and `InstallFinalize`

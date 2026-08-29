@@ -194,7 +194,6 @@ try {
         UninstallUserPath = '--action uninstall'
         FinalizeUserPathMarker = '--action finalize'
         FailAfterUserPath = '--action fail'
-        FailAfterRemoveExistingProducts = '--action fail'
         CommitUserPath = '--action commit'
     }
     foreach ($action in $DeferredCommands.Keys) {
@@ -233,22 +232,19 @@ try {
         $WixSource.SelectNodes('//wix:Component[@Permanent="yes"]', $Namespace).Count -ne 0) {
         throw 'PATH provenance must be consumed before MSI removes registry values, then its exact empty marker/Components tree finalized while rollback remains available.'
     }
-    if ($WixSource.SelectNodes('//wix:CustomAction[@Id="FailAfterFinalizeUserPathMarker"]|//wix:InstallExecuteSequence/wix:Custom[@Action="FailAfterFinalizeUserPathMarker"]', $Namespace).Count -ne 0) {
-        throw 'The MSI must not retain the unsafe deferred complete-uninstall failure hook.'
+    if ($WixSource.SelectNodes('//wix:CustomAction[@Id="FailAfterFinalizeUserPathMarker" or @Id="FailAfterRemoveExistingProducts"]|//wix:InstallExecuteSequence/wix:Custom[@Action="FailAfterFinalizeUserPathMarker" or @Action="FailAfterRemoveExistingProducts"]', $Namespace).Count -ne 0) {
+        throw 'The MSI must not retain a failure hook after complete-uninstall or old-product-removal execution begins.'
     }
+    $MajorUpgrade = $WixSource.SelectSingleNode('//wix:MajorUpgrade[@Schedule="afterInstallFinalize" and @IgnoreRemoveFailure="no"]', $Namespace)
     $TransactionSetter = $WixSource.SelectSingleNode('//wix:SetProperty[@Id="InlaidPathTransactionActive" and @After="PreflightUserPathState" and @Condition="NOT UPGRADINGPRODUCTCODE"]', $Namespace)
     $RollbackSequence = $WixSource.SelectSingleNode('//wix:InstallExecuteSequence/wix:Custom[@Action="RollbackUserPath" and @After="SetInlaidPathTransactionActive"]', $Namespace)
     $CommitSequence = $WixSource.SelectSingleNode('//wix:InstallExecuteSequence/wix:Custom[@Action="CommitUserPath"]', $Namespace)
-    $PostRemovalFailure = $WixSource.SelectSingleNode('//wix:InstallExecuteSequence/wix:Custom[@Action="FailAfterRemoveExistingProducts" and @After="RemoveExistingProducts"]', $Namespace)
-    if ($null -eq $TransactionSetter -or
+    if ($null -eq $MajorUpgrade -or $null -eq $TransactionSetter -or
         $null -eq $RollbackSequence -or -not $RollbackSequence.Condition.Contains('InlaidPathTransactionActive') -or -not $RollbackSequence.Condition.Contains('NOT UPGRADINGPRODUCTCODE') -or
-        $null -eq $CommitSequence -or -not $CommitSequence.Condition.Contains('InlaidPathTransactionActive') -or -not $CommitSequence.Condition.Contains('NOT UPGRADINGPRODUCTCODE') -or
-        $null -eq $PostRemovalFailure -or
-        -not $PostRemovalFailure.Condition.Contains('INLAID_TEST_FAIL_AFTER_REMOVE_EXISTING_PRODUCTS') -or
-        -not $PostRemovalFailure.Condition.Contains('WIX_UPGRADE_DETECTED')) {
-        throw 'PATH rollback/commit is not transaction-conditioned or the post-RemoveExistingProducts failure regression hook is missing.'
+        $null -eq $CommitSequence -or -not $CommitSequence.Condition.Contains('InlaidPathTransactionActive') -or -not $CommitSequence.Condition.Contains('NOT UPGRADINGPRODUCTCODE')) {
+        throw 'The major upgrade does not commit before old-product removal, or PATH rollback/commit is not transaction-conditioned.'
     }
-    foreach ($action in @('RollbackUserPath', 'ApplyUserPath', 'UninstallUserPath', 'FinalizeUserPathMarker', 'FailAfterUserPath', 'FailAfterRemoveExistingProducts', 'CommitUserPath')) {
+    foreach ($action in @('RollbackUserPath', 'ApplyUserPath', 'UninstallUserPath', 'FinalizeUserPathMarker', 'FailAfterUserPath', 'CommitUserPath')) {
         $sequence = $WixSource.SelectSingleNode("//wix:InstallExecuteSequence/wix:Custom[@Action='$action']", $Namespace)
         if ($null -eq $sequence -or -not $sequence.Condition.Contains('NOT UPGRADINGPRODUCTCODE') -or
             -not $sequence.Condition.Contains('InlaidPathTransactionActive')) {
@@ -277,8 +273,7 @@ try {
     foreach ($requiredLifecycleEvidence in @(
         'DISABLEROLLBACK=1',
         'Assert-RollbackDisabledLog',
-        'INLAID_TEST_FAIL_AFTER_REMOVE_EXISTING_PRODUCTS=1',
-        'Assert-PostRemoveExistingProductsFailureLog',
+        'Assert-PostFinalizeUpgradeLog',
         'Get-InlaidRegistrationSnapshot',
         'volatileExclusions = @()',
         'Get-UserDataSnapshot',

@@ -580,18 +580,16 @@ function Assert-RollbackDisabledLog([string]$LogName) {
     }
 }
 
-function Assert-PostRemoveExistingProductsFailureLog([string]$LogName) {
+function Assert-PostFinalizeUpgradeLog([string]$LogName) {
     $path = Join-Path $TemporaryRoot $LogName
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Post-RemoveExistingProducts MSI log is missing: $path" }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Major-upgrade MSI log is missing: $path" }
     $text = Get-Content -LiteralPath $path -Raw
+    $finalizeCompleted = [regex]::Match($text, '(?m)^Action ended .*: InstallFinalize\. Return value 1\.\s*$')
+    $removeStarted = [regex]::Match($text, '(?m)^Action start .*: RemoveExistingProducts\.\s*$')
     $removeCompleted = [regex]::Match($text, '(?m)^Action ended .*: RemoveExistingProducts\. Return value 1\.\s*$')
-    $failureStarted = [regex]::Match($text, '(?m)^MSI .*Executing op: ActionStart\(Name=FailAfterRemoveExistingProducts(?:,|\))')
-    $failureScheduled = [regex]::Match($text, '(?m)^MSI .*Executing op: CustomActionSchedule\(Action=FailAfterRemoveExistingProducts,')
-    $failureReturned = [regex]::Match($text, '(?m)^CustomAction FailAfterRemoveExistingProducts returned actual error code (?!0(?:\s|$))\d+')
-    if (-not $removeCompleted.Success -or -not $failureStarted.Success -or -not $failureScheduled.Success -or -not $failureReturned.Success -or
-        $removeCompleted.Index -ge $failureStarted.Index -or $failureStarted.Index -ge $failureScheduled.Index -or
-        $failureScheduled.Index -ge $failureReturned.Index) {
-        throw 'Failed-upgrade log does not prove RemoveExistingProducts completed before FailAfterRemoveExistingProducts executed and failed.'
+    if (-not $finalizeCompleted.Success -or -not $removeStarted.Success -or -not $removeCompleted.Success -or
+        $finalizeCompleted.Index -ge $removeStarted.Index -or $removeStarted.Index -ge $removeCompleted.Index) {
+        throw 'Major-upgrade log does not prove the incoming product committed before the older product was removed successfully.'
     }
 }
 
@@ -1602,36 +1600,22 @@ function Assert-UserData {
     Assert-UserData
     Save-LifecycleSnapshot '12-failed-upgrade-before-remove-existing-products'
 
-    Assert-FailedMsi @('/i', $Second, '/qn', 'INLAID_TEST_FAIL_AFTER_REMOVE_EXISTING_PRODUCTS=1') 'Injected failed major upgrade after RemoveExistingProducts' 'failed-upgrade-after-remove-existing-products.log'
-    Assert-PostRemoveExistingProductsFailureLog 'failed-upgrade-after-remove-existing-products.log'
-    Assert-InstalledPayload $FirstVersion $FirstMsiVersion $FirstProductCode $FirstEvidence
-    Assert-ProductAbsent $SecondProductCode
-    Assert-Marker $true $InstallRoot $PathPresent
-    if ((Get-ExactUserPathSnapshot) -cne $BeforeUpgradePath -or
-        (Get-MarkerSnapshot) -cne $BeforeUpgradeMarker -or
-        (Get-InstallTreeSnapshot) -cne $BeforeUpgradePayload -or
-        (Get-InlaidRegistrationSnapshot) -cne $BeforeUpgradeRegistration) {
-        throw 'Failed upgrade after RemoveExistingProducts did not restore PATH kind/text, provenance, registration, and payload exactly.'
-    }
-    Assert-TransactionSnapshotsAbsent -ProductCodes $LifecycleProductCodes -Context 'Failed upgrade after RemoveExistingProducts'
-    Assert-UserData
-    Save-LifecycleSnapshot '13-failed-upgrade-after-remove-existing-products'
-
     Invoke-Msi @('/i', $Second, '/qn') 'Major upgrade' 'upgrade.log'
     $InstalledMsi = $Second
+    Assert-PostFinalizeUpgradeLog 'upgrade.log'
     Assert-InstalledPayload $SecondVersion $SecondMsiVersion $SecondProductCode $SecondEvidence
     Assert-Marker $true $InstallRoot $PathPresent
     Assert-ExactUserPathState $true $ExpectedOwnedPath $OwnedPathKind 'Successful major upgrade'
     Assert-ProductAbsent $FirstProductCode
     Assert-TransactionSnapshotsAbsent -ProductCodes $LifecycleProductCodes -Context 'Successful major upgrade'
     Assert-UserData
-    Save-LifecycleSnapshot '14-successful-upgrade'
+    Save-LifecycleSnapshot '13-successful-upgrade'
 
     Assert-FailedMsi @('/i', $First, '/qn') 'Downgrade' 'downgrade.log'
     Assert-ActionFailureLog 'downgrade.log' 'LaunchConditions' 'A newer version of Inlaid is already installed.'
     Assert-InstalledPayload $SecondVersion $SecondMsiVersion $SecondProductCode $SecondEvidence
     Assert-UserData
-    Save-LifecycleSnapshot '15-blocked-downgrade'
+    Save-LifecycleSnapshot '14-blocked-downgrade'
 
     $CollisionDirectory = Join-Path $TemporaryRoot 'collision'
     New-Item -ItemType Directory -Path $CollisionDirectory | Out-Null

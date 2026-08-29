@@ -6,7 +6,8 @@
            UpgradeCode="E1D7019B-07CD-4A8E-8D65-C6FA20B7F07D"
            Scope="perUser"
            Compressed="yes">
-    <MajorUpgrade Schedule="afterInstallExecute"
+    <MajorUpgrade Schedule="afterInstallFinalize"
+                  IgnoreRemoveFailure="no"
                   DowngradeErrorMessage="A newer version of Inlaid is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Launch Condition="NOT RollbackDisabled"
@@ -87,9 +88,6 @@
     <CustomAction Id="FailAfterUserPath" BinaryRef="InlaidPathHelper"
                   ExeCommand='--action fail --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
                   Execute="deferred" Impersonate="yes" Return="check" />
-    <CustomAction Id="FailAfterRemoveExistingProducts" BinaryRef="InlaidPathHelper"
-                  ExeCommand='--action fail --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
-                  Execute="deferred" Impersonate="yes" Return="check" />
     <CustomAction Id="CommitUserPath" BinaryRef="InlaidPathHelper"
                   ExeCommand='--action commit --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
                   Execute="commit" Impersonate="yes" Return="check" />
@@ -109,8 +107,6 @@
               Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot; AND (REMOVE~=&quot;ALL&quot;)" />
       <Custom Action="FinalizeUserPathMarker" After="RemoveRegistryValues"
               Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot; AND (REMOVE~=&quot;ALL&quot;)" />
-      <Custom Action="FailAfterRemoveExistingProducts" After="RemoveExistingProducts"
-              Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot; AND INLAID_TEST_FAIL_AFTER_REMOVE_EXISTING_PRODUCTS=&quot;1&quot; AND WIX_UPGRADE_DETECTED" />
       <Custom Action="CommitUserPath" Before="InstallFinalize"
               Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot;" />
     </InstallExecuteSequence>
