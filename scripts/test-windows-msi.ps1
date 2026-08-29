@@ -584,11 +584,35 @@ function Assert-PostFinalizeUserPathMarkerFailureLog([string]$LogName) {
     $failureStarted = [regex]::Match($text, '(?m)^MSI .*Executing op: ActionStart\(Name=FailAfterFinalizeUserPathMarker(?:,|\))')
     $failureScheduled = [regex]::Match($text, '(?m)^MSI .*Executing op: CustomActionSchedule\(Action=FailAfterFinalizeUserPathMarker,')
     $failureReturned = [regex]::Match($text, '(?m)^CustomAction FailAfterFinalizeUserPathMarker returned actual error code (?!0(?:\s|$))\d+')
+    $installExecuteStarted = [regex]::Match($text, '(?m)^Action start .*: InstallExecute\.\s*$')
     if (-not $finalizeStarted.Success -or -not $finalizeScheduled.Success -or -not $failureStarted.Success -or
-        -not $failureScheduled.Success -or -not $failureReturned.Success -or
+        -not $failureScheduled.Success -or -not $failureReturned.Success -or -not $installExecuteStarted.Success -or
+        $installExecuteStarted.Index -ge $finalizeStarted.Index -or
         $finalizeStarted.Index -ge $finalizeScheduled.Index -or $finalizeScheduled.Index -ge $failureStarted.Index -or
         $failureStarted.Index -ge $failureScheduled.Index -or $failureScheduled.Index -ge $failureReturned.Index) {
         throw 'Failed-uninstall log does not prove marker finalization completed before the test-only action executed and failed.'
+    }
+    $beforeFailure = $text.Substring(0, $failureReturned.Index)
+    if ($beforeFailure -match '(?m)^MSI .*Executing op: (?:ProductUnregister|ProductUnpublish|SourceListUnpublish|ActionStart\(Name=(?:ProcessComponents|UnpublishFeatures)(?:,|\)))') {
+        throw 'Failed-uninstall log shows Windows Installer registration teardown before the injected rollback checkpoint.'
+    }
+    if ($beforeFailure -match '(?m)^Action start .*: InstallFinalize\.\s*$') {
+        throw 'Failed-uninstall log reached InstallFinalize before the injected rollback checkpoint.'
+    }
+}
+
+function Assert-SplitUninstallRegistrationLog([string]$LogName) {
+    $path = Join-Path $TemporaryRoot $LogName
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Successful uninstall MSI log is missing: $path" }
+    $text = Get-Content -LiteralPath $path -Raw
+    $finalizeScheduled = [regex]::Match($text, '(?m)^MSI .*Executing op: CustomActionSchedule\(Action=FinalizeUserPathMarker,')
+    $installExecuteCompleted = [regex]::Match($text, '(?m)^Action ended .*: InstallExecute\. Return value 1\.\s*$')
+    $installFinalizeStarted = [regex]::Match($text, '(?m)^Action start .*: InstallFinalize\.\s*$')
+    $productUnregistered = [regex]::Match($text, '(?m)^MSI .*Executing op: ProductUnregister\(')
+    if (-not $finalizeScheduled.Success -or -not $installExecuteCompleted.Success -or -not $installFinalizeStarted.Success -or
+        -not $productUnregistered.Success -or $finalizeScheduled.Index -ge $installExecuteCompleted.Index -or
+        $installExecuteCompleted.Index -ge $installFinalizeStarted.Index -or $installFinalizeStarted.Index -ge $productUnregistered.Index) {
+        throw 'Successful uninstall log does not prove PATH finalization in the first script and product-registration teardown in the final script.'
     }
 }
 
@@ -1278,6 +1302,7 @@ function Assert-UserData {
         $uninstallLog = "raw-$($rawCase.Name)-uninstall.log"
         Invoke-Msi @('/x', $First, '/qn') "Uninstall for $($rawCase.Name)" $uninstallLog
         Assert-ActionSuccessLog $uninstallLog 'FinalizeUserPathMarker'
+        Assert-SplitUninstallRegistrationLog $uninstallLog
         $InstalledMsi = ''
         Assert-NoInlaidRegistration
         if (Test-Path -LiteralPath $InstallRoot) { throw "$($rawCase.Name) uninstall retained package payload." }
@@ -1364,6 +1389,7 @@ function Assert-UserData {
     Save-LifecycleSnapshot '05-absent-path-failed-uninstall'
     Invoke-Msi @('/x', $First, '/qn') 'Absent-PATH uninstall' 'absent-path-uninstall.log'
     Assert-ActionSuccessLog 'absent-path-uninstall.log' 'FinalizeUserPathMarker'
+    Assert-SplitUninstallRegistrationLog 'absent-path-uninstall.log'
     $InstalledMsi = ''
     Assert-NoInlaidRegistration
     Assert-ExactUserPathState $false '' $null 'Absent-PATH uninstall restore'
@@ -1406,6 +1432,7 @@ function Assert-UserData {
     Save-LifecycleSnapshot '09-present-empty-path-failed-uninstall'
     Invoke-Msi @('/x', $First, '/qn') 'Present-empty-PATH uninstall' 'present-empty-path-uninstall.log'
     Assert-ActionSuccessLog 'present-empty-path-uninstall.log' 'FinalizeUserPathMarker'
+    Assert-SplitUninstallRegistrationLog 'present-empty-path-uninstall.log'
     $InstalledMsi = ''
     Assert-NoInlaidRegistration
     Assert-ExactUserPathState $true '' ([Microsoft.Win32.RegistryValueKind]::ExpandString) 'Present-empty-PATH uninstall restore'
@@ -1583,6 +1610,7 @@ function Assert-UserData {
 
     Invoke-Msi @('/x', $Second, '/qn') 'Final uninstall' 'uninstall.log'
     Assert-ActionSuccessLog 'uninstall.log' 'FinalizeUserPathMarker'
+    Assert-SplitUninstallRegistrationLog 'uninstall.log'
     $InstalledMsi = ''
     Assert-NoInlaidRegistration
     if (Test-Path -LiteralPath $InstallRoot) { throw 'Uninstall retained the MSI-owned program directory.' }

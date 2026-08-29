@@ -339,6 +339,13 @@ $executeFailAfterPath = @($executeSequence | Where-Object { $_.Action -ceq 'Fail
 $executeRemoveRegistry = @($executeSequence | Where-Object { $_.Action -ceq 'RemoveRegistryValues' })
 $executeRemoveExisting = @($executeSequence | Where-Object { $_.Action -ceq 'RemoveExistingProducts' })
 $executePostRemovalFailure = @($executeSequence | Where-Object { $_.Action -ceq 'FailAfterRemoveExistingProducts' })
+$executeProcessComponents = @($executeSequence | Where-Object { $_.Action -ceq 'ProcessComponents' })
+$executeUnpublishFeatures = @($executeSequence | Where-Object { $_.Action -ceq 'UnpublishFeatures' })
+$executeInstallExecute = @($executeSequence | Where-Object { $_.Action -ceq 'InstallExecute' })
+$executeRegisterUser = @($executeSequence | Where-Object { $_.Action -ceq 'RegisterUser' })
+$executeRegisterProduct = @($executeSequence | Where-Object { $_.Action -ceq 'RegisterProduct' })
+$executePublishFeatures = @($executeSequence | Where-Object { $_.Action -ceq 'PublishFeatures' })
+$executePublishProduct = @($executeSequence | Where-Object { $_.Action -ceq 'PublishProduct' })
 $executeCommitPath = @($executeSequence | Where-Object { $_.Action -ceq 'CommitUserPath' })
 Require ($executeCostFinalize.Count -eq 1 -and $executePathDirectory.Count -eq 1 -and
     [int]$executePathDirectory[0].Sequence -gt [int]$executeCostFinalize[0].Sequence) 'MSI execute sequence does not capture INSTALLFOLDER after costing.'
@@ -367,6 +374,19 @@ Require ($executeRemoveExisting.Count -eq 1 -and $executePostRemovalFailure.Coun
     [int]$executePostRemovalFailure[0].Sequence -lt [int]$executeCommitPath[0].Sequence -and
     $executePostRemovalFailure[0].Condition.Contains('INLAID_TEST_FAIL_AFTER_REMOVE_EXISTING_PRODUCTS="1"') -and
     $executePostRemovalFailure[0].Condition.Contains('WIX_UPGRADE_DETECTED')) 'MSI lacks the test-only failure seam after RemoveExistingProducts and before PATH commit.'
+Require ($executeProcessComponents.Count -eq 1 -and [int]$executeProcessComponents[0].Sequence -eq 6497 -and
+    $executeUnpublishFeatures.Count -eq 1 -and [int]$executeUnpublishFeatures[0].Sequence -eq 6498 -and
+    $executeInstallExecute.Count -eq 1 -and [int]$executeInstallExecute[0].Sequence -eq 6500 -and
+    $executeInstallExecute[0].Condition -ceq 'NOT Installed OR (REMOVE~="ALL")' -and
+    [int]$executePostFinalizeFailure[0].Sequence -lt [int]$executeProcessComponents[0].Sequence -and
+    [int]$executeUnpublishFeatures[0].Sequence -lt [int]$executeInstallExecute[0].Sequence) 'MSI does not execute the complete-uninstall failure seam before component and feature registration teardown.'
+Require ($executeRegisterUser.Count -eq 1 -and [int]$executeRegisterUser[0].Sequence -eq 6503 -and
+    $executeRegisterProduct.Count -eq 1 -and [int]$executeRegisterProduct[0].Sequence -eq 6504 -and
+    $executePublishFeatures.Count -eq 1 -and [int]$executePublishFeatures[0].Sequence -eq 6505 -and
+    $executePublishProduct.Count -eq 1 -and [int]$executePublishProduct[0].Sequence -eq 6506 -and
+    [int]$executeInstallExecute[0].Sequence -lt [int]$executeRemoveExisting[0].Sequence -and
+    [int]$executePostRemovalFailure[0].Sequence -lt [int]$executeRegisterUser[0].Sequence -and
+    [int]$executePublishProduct[0].Sequence -lt [int]$executeCommitPath[0].Sequence) 'MSI product publication actions are not isolated in the final transaction script after the rollback checkpoints.'
 
 $upgradeRows = Read-MsiRows $database 'SELECT `UpgradeCode`, `VersionMin`, `VersionMax`, `Attributes`, `ActionProperty` FROM `Upgrade`' @('UpgradeCode', 'VersionMin', 'VersionMax', 'Attributes', 'ActionProperty')
 Require (@($upgradeRows | Where-Object { $_.UpgradeCode -ceq $ExpectedUpgradeCode }).Count -ge 1) 'MSI Upgrade table does not use the stable UpgradeCode.'

@@ -571,10 +571,14 @@ message and failed before mutation. The post-`RemoveExistingProducts` failure lo
 must prove that standard action returned success before the injected action ran
 and failed. Each failed-uninstall log must likewise prove
 `FinalizeUserPathMarker` returned success before its test-only action ran and
-failed, then prove exact rollback of product registration, all package-evidenced
-payload hashes/lengths, marker, PATH presence/type/raw value, and all
-ProductCode-qualified transaction paths. Successful lifecycle evidence retains
-those logs, complete recursive
+failed. It must also prove that this first `InstallExecute` script reached no
+`ProcessComponents`, `UnpublishFeatures`, product-unregister, product-unpublish,
+or source-list-unpublish operation before the failure. Then prove exact rollback
+of product registration, all package-evidenced payload hashes/lengths, marker,
+PATH presence/type/raw value, and all ProductCode-qualified transaction paths.
+A successful uninstall must prove that first script completed before
+`InstallFinalize` performed product-registration teardown. Successful lifecycle
+evidence retains those logs, complete recursive
 registration key/value-kind/raw-value inventories with no volatile exclusions,
 cached-MSI hashes, and exact path/length/SHA-256 inventories for every user-data
 fixture.

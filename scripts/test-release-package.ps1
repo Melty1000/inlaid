@@ -246,6 +246,25 @@ try {
         -not $PostRemovalFailure.Condition.Contains('WIX_UPGRADE_DETECTED')) {
         throw 'PATH rollback/commit is not transaction-conditioned or the post-RemoveExistingProducts failure regression hook is missing.'
     }
+    $SplitSequence = [ordered]@{
+        ProcessComponents = '6497'
+        UnpublishFeatures = '6498'
+        InstallExecute = '6500'
+        RegisterUser = '6503'
+        RegisterProduct = '6504'
+        PublishFeatures = '6505'
+        PublishProduct = '6506'
+    }
+    foreach ($action in $SplitSequence.Keys) {
+        $standard = $WixSource.SelectSingleNode("//wix:InstallExecuteSequence/wix:$action", $Namespace)
+        if ($null -eq $standard -or $standard.Sequence -cne $SplitSequence[$action]) {
+            throw "MSI standard action $action does not retain the split-transaction sequence boundary."
+        }
+    }
+    $SplitInstallExecute = $WixSource.SelectSingleNode('//wix:InstallExecuteSequence/wix:InstallExecute', $Namespace)
+    if ($null -eq $SplitInstallExecute -or $SplitInstallExecute.Condition -cne 'NOT Installed OR (REMOVE~="ALL")') {
+        throw 'InstallExecute must run the pre-registration script for clean install and complete uninstall.'
+    }
     foreach ($action in @('RollbackUserPath', 'ApplyUserPath', 'UninstallUserPath', 'FinalizeUserPathMarker', 'FailAfterUserPath', 'FailAfterRemoveExistingProducts', 'CommitUserPath')) {
         $sequence = $WixSource.SelectSingleNode("//wix:InstallExecuteSequence/wix:Custom[@Action='$action']", $Namespace)
         if ($null -eq $sequence -or -not $sequence.Condition.Contains('NOT UPGRADINGPRODUCTCODE') -or
