@@ -125,11 +125,11 @@ To import settings and custom filters from a portable folder into an installed c
 inlaid --import-portable 'D:\Portable Apps\Inlaid'
 ```
 
-Import accepts current portable installs that carry their direct regular `inlaid-portable.json` marker. The only markerless exception is the exactly pinned release-owned file and directory shape of the published `v0.2.0-beta.1` ZIP; arbitrary, ambiguous, source-tree, and current-layout markerless folders are refused before anything is copied. Accepted imports copy without deleting or overwriting, report copied, skipped, and conflicting items, leave recordings/snapshots/reports where they are, and refuse a folder containing live recovery tapes. Finish or abandon recovery in the portable copy first.
+Import accepts current portable installs that carry their direct regular `inlaid-portable.json` marker. The only markerless exception is the exactly pinned release-owned file and directory shape of the published `v0.2.0-beta.1` ZIP; arbitrary, ambiguous, source-tree, and current-layout markerless folders are refused before anything is copied. Accepted imports prefer `inlaid-settings.json`; when it is absent, a direct regular legacy `webcam-settings.json` is copied to the installed `inlaid-settings.json` name. The source file remains unchanged. Imports otherwise copy without deleting or overwriting, report copied, skipped, and conflicting items, leave recordings/snapshots/reports where they are, and refuse a folder containing live recovery tapes. Finish or abandon recovery in the portable copy first.
 
 The app has no telemetry or upload feature. A support report is written only after two deliberate button presses, and it excludes camera media and machine-specific identifiers. Review it before manually attaching it to a public issue.
 
-If this folder already contains `webcam-settings.json` from a pre-Inlaid build, Inlaid uses it as the starting settings and saves later changes to `inlaid-settings.json`. The old file is not copied, overwritten, or deleted.
+When Inlaid runs directly from a folder containing only `webcam-settings.json` from a pre-Inlaid build, it uses that file as the starting settings and saves later changes to `inlaid-settings.json`. The old file is not overwritten or deleted.
 
 ## Build from source
 

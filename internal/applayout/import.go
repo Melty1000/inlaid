@@ -98,8 +98,7 @@ func importPortable(sourceRoot string, destination Layout, apply importApplier) 
 		return ImportReport{}, err
 	}
 
-	settings := filepath.Join(sourceRoot, "inlaid-settings.json")
-	settingsPlan, err := preflightImportFile(settings, destination.SettingsFile)
+	settingsPlan, err := preflightPortableSettings(sourceRoot, destination.SettingsFile)
 	if err != nil {
 		return ImportReport{}, fmt.Errorf("import settings: %w", err)
 	}
@@ -127,6 +126,34 @@ func importPortable(sourceRoot string, destination Layout, apply importApplier) 
 		ImportItem{Path: filepath.Join(sourceRoot, "support-reports"), Action: ImportRetained, Detail: "support reports stay in the portable folder"},
 	)
 	return report, nil
+}
+
+func preflightPortableSettings(sourceRoot, destination string) (importPlan, error) {
+	current := filepath.Join(sourceRoot, "inlaid-settings.json")
+	if err := directFile(current); err == nil {
+		return preflightImportFile(current, destination)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return importPlan{}, fmt.Errorf("current settings source: %w", err)
+	}
+
+	legacy := filepath.Join(sourceRoot, "webcam-settings.json")
+	if err := directFile(legacy); err == nil {
+		plan, err := preflightImportFile(legacy, destination)
+		if err != nil {
+			return importPlan{}, fmt.Errorf("legacy settings source: %w", err)
+		}
+		if plan.item.Action == ImportCopied {
+			plan.item.Detail = "copied legacy webcam-settings.json to the current settings name without removing the portable source"
+		}
+		return plan, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return importPlan{}, fmt.Errorf("legacy settings source: %w", err)
+	}
+
+	return importPlan{item: ImportItem{
+		Path: current, Action: ImportSkipped,
+		Detail: "current and legacy source settings files are absent",
+	}}, nil
 }
 
 func validatePortableImportRoot(root string) error {

@@ -436,6 +436,10 @@ preserves development without pretending an installed layout has been accepted.
   user-selected portable root. It validates that root, copies settings and
   custom filters into the installed locations without deleting the source, and
   reports every copied, skipped, or conflicting file.
+- Import prefers the direct regular `inlaid-settings.json`. When it is absent,
+  a direct regular legacy `webcam-settings.json` supplies the bytes copied to
+  the installed `inlaid-settings.json` name. If both exist, the current name
+  wins; neither source file is overwritten or deleted.
 - The published `v0.2.0-beta.1` ZIP predates the portable marker. Import accepts
   that one markerless baseline only when its direct release-owned file and
   directory shape matches the pinned published package and no source-tree or

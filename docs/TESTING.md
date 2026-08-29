@@ -684,7 +684,12 @@ arbitrary markerless folder, a source tree, a current root-level
 executable without its marker, and a legacy/current hybrid are each refused
 before settings or filters are written. Both accepted routes remain explicit,
 copy only settings and top-level `.cube` filters without overwrite, retain media
-and support reports in place, and refuse live recovery tapes.
+and support reports in place, and refuse live recovery tapes. For both accepted
+roots, prove a legacy-only `webcam-settings.json` is copied byte-for-byte to the
+installed `inlaid-settings.json` name while the source remains unchanged. Prove
+the current name wins when both exist, missing settings are reported as skipped,
+wrong-type or symlinked selected settings fail before writes, and a destination
+conflict is reported without overwrite.
 
 For Phase 3 portable-update evidence, populate an older portable root with its
 marker/versioned manifest, settings, recovery data, recordings, snapshots,

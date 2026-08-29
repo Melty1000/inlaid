@@ -83,6 +83,163 @@ func TestImportPortableCopiesSettingsAndTopLevelFiltersWithoutMovingMedia(t *tes
 	}
 }
 
+func TestImportPortableCopiesLegacySettingsToCurrentInstalledName(t *testing.T) {
+	fixtures := []struct {
+		name string
+		root func(*testing.T) string
+	}{
+		{name: "marked portable", root: portableRoot},
+		{name: "pinned markerless v0.2.0-beta.1", root: legacyPublishedV020Root},
+	}
+	for _, fixture := range fixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			source := fixture.root(t)
+			legacyPath := filepath.Join(source, "webcam-settings.json")
+			legacyData := []byte("{\"Device\":\"Legacy Camera\"}\n")
+			if err := os.WriteFile(legacyPath, legacyData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			destination := installedLayout(t)
+			report, err := ImportPortable(source, destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			installedData, err := os.ReadFile(destination.SettingsFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(installedData) != string(legacyData) {
+				t.Fatalf("installed settings = %q, want legacy bytes %q", installedData, legacyData)
+			}
+			retainedData, err := os.ReadFile(legacyPath)
+			if err != nil || string(retainedData) != string(legacyData) {
+				t.Fatalf("legacy source changed or disappeared: %q, %v", retainedData, err)
+			}
+			if len(report.Items) == 0 || report.Items[0].Action != ImportCopied {
+				t.Fatalf("legacy settings result = %#v", report.Items)
+			}
+		})
+	}
+}
+
+func TestImportPortablePrefersCurrentSettingsWhenBothNamesExist(t *testing.T) {
+	source := portableRoot(t)
+	currentData := []byte("{\"Device\":\"Current Camera\"}\n")
+	legacyData := []byte("{\"Device\":\"Legacy Camera\"}\n")
+	if err := os.WriteFile(filepath.Join(source, "inlaid-settings.json"), currentData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "webcam-settings.json"), legacyData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	destination := installedLayout(t)
+	if _, err := ImportPortable(source, destination); err != nil {
+		t.Fatal(err)
+	}
+	installedData, err := os.ReadFile(destination.SettingsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(installedData) != string(currentData) {
+		t.Fatalf("installed settings = %q, want current settings %q", installedData, currentData)
+	}
+}
+
+func TestImportPortableHandlesLegacySettingsAbsenceConflictAndInvalidTypes(t *testing.T) {
+	t.Run("both absent", func(t *testing.T) {
+		source := portableRoot(t)
+		destination := installedLayout(t)
+		report, err := ImportPortable(source, destination)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(report.Items) == 0 || report.Items[0].Action != ImportSkipped ||
+			!strings.Contains(report.Items[0].Detail, "current and legacy") {
+			t.Fatalf("missing-settings result = %#v", report.Items)
+		}
+		if _, err := os.Stat(destination.SettingsFile); !os.IsNotExist(err) {
+			t.Fatalf("missing settings created a destination: %v", err)
+		}
+	})
+
+	t.Run("legacy conflicts without overwrite", func(t *testing.T) {
+		source := portableRoot(t)
+		legacyPath := filepath.Join(source, "webcam-settings.json")
+		if err := os.WriteFile(legacyPath, []byte("legacy"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		destination := installedLayout(t)
+		if err := os.MkdirAll(filepath.Dir(destination.SettingsFile), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(destination.SettingsFile, []byte("installed"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		report, err := ImportPortable(source, destination)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(report.Items) == 0 || report.Items[0].Action != ImportConflict {
+			t.Fatalf("legacy conflict result = %#v", report.Items)
+		}
+		data, err := os.ReadFile(destination.SettingsFile)
+		if err != nil || string(data) != "installed" {
+			t.Fatalf("legacy conflict overwrote destination: %q, %v", data, err)
+		}
+	})
+
+	for _, name := range []string{"inlaid-settings.json", "webcam-settings.json"} {
+		t.Run("reject wrong type "+name, func(t *testing.T) {
+			source := portableRoot(t)
+			if name == "inlaid-settings.json" {
+				if err := os.WriteFile(filepath.Join(source, "webcam-settings.json"), []byte("valid fallback"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Mkdir(filepath.Join(source, name), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			destination := installedLayout(t)
+			if _, err := ImportPortable(source, destination); err == nil || !strings.Contains(err.Error(), "must be a direct regular file") {
+				t.Fatalf("wrong-type %s error = %v", name, err)
+			}
+			if _, err := os.Stat(destination.SettingsFile); !os.IsNotExist(err) {
+				t.Fatalf("wrong-type %s wrote settings: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestImportPortableRejectsSymlinkedSelectedSettings(t *testing.T) {
+	for _, name := range []string{"inlaid-settings.json", "webcam-settings.json"} {
+		t.Run(name, func(t *testing.T) {
+			source := portableRoot(t)
+			if name == "inlaid-settings.json" {
+				if err := os.WriteFile(filepath.Join(source, "webcam-settings.json"), []byte("valid fallback"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			target := filepath.Join(t.TempDir(), "settings-target.json")
+			if err := os.WriteFile(target, []byte("symlink target"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Join(source, name)); err != nil {
+				t.Skipf("file symlinks are unavailable on this host: %v", err)
+			}
+
+			destination := installedLayout(t)
+			if _, err := ImportPortable(source, destination); err == nil || !strings.Contains(err.Error(), "must be a direct regular file") {
+				t.Fatalf("symlinked %s error = %v", name, err)
+			}
+			if _, err := os.Stat(destination.SettingsFile); !os.IsNotExist(err) {
+				t.Fatalf("symlinked %s wrote settings: %v", name, err)
+			}
+		})
+	}
+}
+
 func TestImportPortableAcceptsPinnedMarkerlessPublishedZIPShapeWithoutExecution(t *testing.T) {
 	source := legacyPublishedV020Root(t)
 	if err := os.WriteFile(filepath.Join(source, "inlaid-settings.json"), []byte("{\"Device\":\"Camera\"}\n"), 0o600); err != nil {
