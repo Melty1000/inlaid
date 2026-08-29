@@ -101,6 +101,12 @@ type registryValueSnapshot struct {
 	Data    []byte `json:"data,omitempty"`
 }
 
+type testFailureDiagnostic struct {
+	Schema int    `json:"schema"`
+	Action string `json:"action"`
+	Error  string `json:"error"`
+}
+
 func main() {
 	action := flag.String("action", "", "preflight, apply, uninstall, finalize, rollback, commit, or fail")
 	programDir := flag.String("program-dir", "", "resolved program directory used by PATH policy")
@@ -109,9 +115,50 @@ func main() {
 	userSID := flag.String("user-sid", "", "SID of the per-user MSI owner")
 	flag.Parse()
 	if err := run(*action, *programDir, *installDir, *stateFile, *userSID); err != nil {
+		if _, diagnosticErr := writeTestFailureDiagnostic(*stateFile, *action, err); diagnosticErr != nil {
+			fmt.Fprintln(os.Stderr, "Inlaid PATH helper test diagnostic:", diagnosticErr)
+		}
 		fmt.Fprintln(os.Stderr, "Inlaid PATH helper:", err)
 		os.Exit(1)
 	}
+}
+
+func writeTestFailureDiagnostic(stateFile, action string, runErr error) (string, error) {
+	if testHooks != "true" || runErr == nil {
+		return "", nil
+	}
+	switch action {
+	case "preflight", "apply", "uninstall", "finalize", "rollback", "commit", "fail":
+	default:
+		return "", nil
+	}
+	if strings.TrimSpace(stateFile) == "" || !filepath.IsAbs(stateFile) {
+		return "", errors.New("test diagnostic state path must be absolute")
+	}
+	diagnosticPath := fmt.Sprintf("%s.%s.%d.test-error.json", stateFile, action, os.Getpid())
+	data, err := json.Marshal(testFailureDiagnostic{Schema: 1, Action: action, Error: runErr.Error()})
+	if err != nil {
+		return "", fmt.Errorf("encode test failure diagnostic: %w", err)
+	}
+	file, err := os.OpenFile(diagnosticPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("exclusively create test failure diagnostic: %w", err)
+	}
+	written, writeErr := file.Write(data)
+	if writeErr == nil && written != len(data) {
+		writeErr = fmt.Errorf("short write: %d of %d bytes", written, len(data))
+	}
+	if writeErr == nil {
+		writeErr = file.Sync()
+	}
+	closeErr := file.Close()
+	if writeErr != nil {
+		return "", fmt.Errorf("write test failure diagnostic: %w", writeErr)
+	}
+	if closeErr != nil {
+		return "", fmt.Errorf("close test failure diagnostic: %w", closeErr)
+	}
+	return diagnosticPath, nil
 }
 
 func run(action, programDir, installDir, stateFile, userSID string) error {

@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -233,6 +234,77 @@ func TestInjectedFailureRequiresTestBuild(t *testing.T) {
 	testHooks = "true"
 	if err := run("fail", "", "", state, ""); err == nil {
 		t.Fatal("test helper did not inject the requested failure")
+	}
+}
+
+func TestFailureDiagnosticRequiresTestBuild(t *testing.T) {
+	previous := testHooks
+	t.Cleanup(func() { testHooks = previous })
+	state := filepath.Join(t.TempDir(), "state.json")
+	testHooks = "false"
+	path, err := writeTestFailureDiagnostic(state, "apply", errors.New("expected failure"))
+	if err != nil || path != "" {
+		t.Fatalf("production diagnostic = %q, %v", path, err)
+	}
+	matches, err := filepath.Glob(state + ".*.test-error.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("production build emitted diagnostics: %v", matches)
+	}
+}
+
+func TestFailureDiagnosticIsExactAndExclusive(t *testing.T) {
+	previous := testHooks
+	t.Cleanup(func() { testHooks = previous })
+	testHooks = "true"
+	state := filepath.Join(t.TempDir(), "state.json")
+	path, err := writeTestFailureDiagnostic(state, "apply", errors.New("wrapped operation: exact cause"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPath := state + fmt.Sprintf(".apply.%d.test-error.json", os.Getpid())
+	if path != wantPath {
+		t.Fatalf("diagnostic path = %q; want %q", path, wantPath)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got testFailureDiagnostic
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got != (testFailureDiagnostic{Schema: 1, Action: "apply", Error: "wrapped operation: exact cause"}) {
+		t.Fatalf("diagnostic = %+v", got)
+	}
+	original := append([]byte(nil), data...)
+	if _, err := writeTestFailureDiagnostic(state, "apply", errors.New("replacement")); err == nil || !strings.Contains(err.Error(), "exclusively create") {
+		t.Fatalf("second diagnostic write error = %v", err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, original) {
+		t.Fatalf("second diagnostic write changed the first record: %q", data)
+	}
+}
+
+func TestFailureDiagnosticRejectsUnsafeInputs(t *testing.T) {
+	previous := testHooks
+	t.Cleanup(func() { testHooks = previous })
+	testHooks = "true"
+	if path, err := writeTestFailureDiagnostic("relative-state.json", "apply", errors.New("failure")); err == nil || path != "" {
+		t.Fatalf("relative diagnostic state = %q, %v", path, err)
+	}
+	state := filepath.Join(t.TempDir(), "state.json")
+	if path, err := writeTestFailureDiagnostic(state, "unknown", errors.New("failure")); err != nil || path != "" {
+		t.Fatalf("unsupported diagnostic action = %q, %v", path, err)
+	}
+	if path, err := writeTestFailureDiagnostic(state, "apply", nil); err != nil || path != "" {
+		t.Fatalf("nil diagnostic failure = %q, %v", path, err)
 	}
 }
 

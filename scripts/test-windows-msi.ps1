@@ -25,6 +25,8 @@ $MsiClientTimeoutSeconds = 360
 $MsiClientRecords = @()
 $MsiInvocationCounter = 0
 $LifecycleMutationStarted = $false
+$LifecycleEvidenceRetained = $false
+$RetainedHelperDiagnosticPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 $OriginalProcessPath = $env:PATH
 $OriginalPathCaptured = $false
 $EnvironmentKey = $null
@@ -557,6 +559,17 @@ function Assert-PostFinalizeUserPathMarkerFailureLog([string]$LogName) {
     }
 }
 
+function Get-TestFailureDiagnosticFiles([string[]]$ProductCodes) {
+    if ([string]::IsNullOrWhiteSpace($TemporaryBase) -or -not (Test-Path -LiteralPath $TemporaryBase -PathType Container)) { return }
+    foreach ($productCode in @($ProductCodes | Sort-Object -Unique)) {
+        $stateLeaf = [System.IO.Path]::GetFileName((Join-Path $TemporaryBase "inlaid-path-$productCode.json"))
+        $namePattern = '^' + [regex]::Escape($stateLeaf) + '\.(preflight|apply|uninstall|finalize|rollback|commit|fail)\.\d+\.test-error\.json$'
+        foreach ($file in @(Get-ChildItem -LiteralPath $TemporaryBase -Filter ($stateLeaf + '.*.test-error.json') -File -ErrorAction Stop | Sort-Object Name)) {
+            if ($file.Name -cmatch $namePattern) { Write-Output $file }
+        }
+    }
+}
+
 function Retain-LifecycleEvidence([string]$Outcome, [string]$Phase) {
     $run = $RetainedLifecycleEvidence
     New-Item -ItemType Directory -Force -Path $run | Out-Null
@@ -583,6 +596,13 @@ function Retain-LifecycleEvidence([string]$Outcome, [string]$Phase) {
     $candidates += @(Get-EvidenceTreeCandidates $FirstEvidenceDirectory (Join-Path $artifactRoot 'first-evidence'))
     $candidates += @(Get-EvidenceTreeCandidates $SecondEvidenceDirectory (Join-Path $artifactRoot 'second-evidence'))
     $candidates += @(Get-EvidenceTreeCandidates $LifecycleSnapshotDirectory (Join-Path $artifactRoot 'snapshots'))
+    foreach ($diagnostic in @(Get-TestFailureDiagnosticFiles $LifecycleProductCodes)) {
+        $candidates += [pscustomobject]@{
+            source = $diagnostic.FullName
+            destination = Join-Path $artifactRoot ('helper-diagnostics\' + $diagnostic.Name)
+            helperDiagnostic = $true
+        }
+    }
     foreach ($msi in @($First, $Second)) {
         if (-not [string]::IsNullOrWhiteSpace($msi)) {
             foreach ($artifact in @($msi, [System.IO.Path]::ChangeExtension($msi, '.wixpdb'), $msi + '.payload.json')) {
@@ -607,6 +627,9 @@ function Retain-LifecycleEvidence([string]$Outcome, [string]$Phase) {
         $destinationParent = Split-Path -Parent $candidate.destination
         New-Item -ItemType Directory -Force -Path $destinationParent | Out-Null
         Copy-Item -LiteralPath $candidate.source -Destination $candidate.destination -Force
+        if ($candidate.PSObject.Properties.Name -contains 'helperDiagnostic' -and $candidate.helperDiagnostic) {
+            [void]$RetainedHelperDiagnosticPaths.Add([System.IO.Path]::GetFullPath($file.FullName))
+        }
         $copiedFiles++
         $copiedBytes += $file.Length
     }
@@ -636,6 +659,9 @@ function Retain-LifecycleEvidence([string]$Outcome, [string]$Phase) {
         cleanupSuppressedReason = $CleanupSuppressedReason
         inventoryCount = $inventory.Count
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $run 'run.json') -Encoding utf8NoBOM
+    if ($Outcome -ceq 'passed' -and $omitted.Count -ne 0) {
+        throw "Passing MSI lifecycle evidence exceeded bounded retention limits; original working evidence is preserved. Omitted files: $($omitted.Count)"
+    }
     return $run
 }
 
@@ -647,7 +673,7 @@ function Get-ExpectedAppend([string]$Before) {
 function Assert-TransactionSnapshotsAbsent([string[]]$ProductCodes, [string]$Context) {
     foreach ($productCode in $ProductCodes) {
         $state = Join-Path $TemporaryBase "inlaid-path-$productCode.json"
-        foreach ($candidate in @($state, $state + '.partial', $state + '.claim', $state + '.claim.partial')) {
+        foreach ($candidate in @($state, ($state + '.partial'), ($state + '.claim'), ($state + '.claim.partial'))) {
             if (Test-Path -LiteralPath $candidate) {
                 throw "$Context found stale MSI PATH transaction state: $candidate"
             }
@@ -659,7 +685,7 @@ function Get-TransactionFilesSnapshot([string[]]$ProductCodes) {
     $rows = @()
     foreach ($productCode in @($ProductCodes | Sort-Object -Unique)) {
         $state = Join-Path $TemporaryBase "inlaid-path-$productCode.json"
-        foreach ($candidate in @($state, $state + '.partial', $state + '.claim', $state + '.claim.partial')) {
+        foreach ($candidate in @($state, ($state + '.partial'), ($state + '.claim'), ($state + '.claim.partial'))) {
             if (Test-Path -LiteralPath $candidate -PathType Leaf) {
                 $file = Get-Item -LiteralPath $candidate
                 $rows += [ordered]@{ path = $candidate; present = $true; length = $file.Length; sha256 = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash }
@@ -1543,7 +1569,10 @@ finally {
     try { Write-LifecycleStateEvidence 'pre-cleanup' $LifecycleFailure }
     catch { $CleanupErrors += "pre-cleanup state evidence: $($_.Exception.Message)"; Write-Warning $CleanupErrors[-1] }
     if ($null -ne (Get-Command Retain-LifecycleEvidence -CommandType Function -ErrorAction SilentlyContinue)) {
-        try { [void](Retain-LifecycleEvidence $(if ($LifecyclePassed) { 'passed' } else { 'failed' }) 'pre-cleanup') }
+        try {
+            [void](Retain-LifecycleEvidence $(if ($LifecyclePassed) { 'passed' } else { 'failed' }) 'pre-cleanup')
+            $LifecycleEvidenceRetained = $true
+        }
         catch { $CleanupErrors += "pre-cleanup artifact retention: $($_.Exception.Message)"; Write-Warning $CleanupErrors[-1] }
     }
     $env:PATH = $OriginalProcessPath
@@ -1589,6 +1618,7 @@ finally {
     try {
         if ($null -ne (Get-Command Retain-LifecycleEvidence -CommandType Function -ErrorAction SilentlyContinue)) {
             [void](Retain-LifecycleEvidence $(if ($LifecyclePassed) { 'passed' } else { 'failed' }) $postCleanupPhase)
+            $LifecycleEvidenceRetained = $true
         }
     }
     catch {
@@ -1597,8 +1627,14 @@ finally {
     }
     try { if ($null -ne $EnvironmentKey) { $EnvironmentKey.Close() } }
     catch { $CleanupErrors += "close Environment key: $($_.Exception.Message)"; Write-Warning $CleanupErrors[-1] }
-    if ($LifecyclePassed -and -not $MsiClientTimedOut -and -not [string]::IsNullOrWhiteSpace($RetainedLifecycleEvidence) -and
+    if ($LifecyclePassed -and $LifecycleEvidenceRetained -and -not $MsiClientTimedOut -and -not [string]::IsNullOrWhiteSpace($RetainedLifecycleEvidence) -and
         (Test-Path -LiteralPath $TemporaryRoot -PathType Container)) {
+        foreach ($diagnostic in @(Get-TestFailureDiagnosticFiles $LifecycleProductCodes)) {
+            $diagnosticPath = [System.IO.Path]::GetFullPath($diagnostic.FullName)
+            if (-not $RetainedHelperDiagnosticPaths.Contains($diagnosticPath)) { continue }
+            try { Remove-Item -LiteralPath $diagnosticPath -Force -ErrorAction Stop }
+            catch { $CleanupErrors += "remove retained helper diagnostic $($diagnostic.FullName): $($_.Exception.Message)"; Write-Warning $CleanupErrors[-1] }
+        }
         $resolved = [System.IO.Path]::GetFullPath($TemporaryRoot)
         if ($resolved.StartsWith($TemporaryBase, [System.StringComparison]::OrdinalIgnoreCase)) {
             try { Remove-Item -LiteralPath $resolved -Recurse -Force }
