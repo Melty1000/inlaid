@@ -188,29 +188,35 @@ try {
         $null -eq $DefaultProgramDirectorySequence -or $DefaultProgramDirectorySequence.Condition -cne 'NOT INLAID_PATH_PROGRAM_DIR') {
         throw 'WiX authoring does not default the PATH program directory to the resolved install folder.'
     }
-    foreach ($action in @('RollbackUserPath', 'ApplyUserPath', 'UninstallUserPath', 'FinalizeUserPathMarker', 'FailAfterUserPath', 'FailAfterRemoveExistingProducts', 'CommitUserPath')) {
-        $data = $WixSource.SelectSingleNode("//wix:SetProperty[@Id='$action']", $Namespace)
+    $DeferredCommands = [ordered]@{
+        RollbackUserPath = '--action rollback'
+        ApplyUserPath = '--action apply'
+        UninstallUserPath = '--action uninstall'
+        FinalizeUserPathMarker = '--action finalize'
+        FailAfterFinalizeUserPathMarker = '--action fail'
+        FailAfterUserPath = '--action fail'
+        FailAfterRemoveExistingProducts = '--action fail'
+        CommitUserPath = '--action commit'
+    }
+    foreach ($action in $DeferredCommands.Keys) {
         $custom = $WixSource.SelectSingleNode("//wix:CustomAction[@Id='$action']", $Namespace)
-        $orderingMatches = if ($action -ceq 'RollbackUserPath') {
-            $data.After -ceq 'SetInlaidPathTransactionActive'
-        }
-        else { $data.Before -ceq $action }
-        if ($null -eq $data -or -not $orderingMatches -or $data.Sequence -cne 'execute' -or
-            -not $data.Value.Contains('[TempFolder]inlaid-path-[ProductCode].json') -or
-            $data.Value.Contains('inlaid-path-E1D7019B.json') -or
-            $null -eq $custom -or $custom.ExeCommand -cne '[CustomActionData]') {
-            throw "Deferred MSI action $action does not receive its formatted data through CustomActionData."
+        if ($WixSource.SelectNodes("//wix:SetProperty[@Id='$action']", $Namespace).Count -ne 0 -or
+            $null -eq $custom -or -not $custom.ExeCommand.Contains($DeferredCommands[$action]) -or
+            -not $custom.ExeCommand.Contains('[TempFolder]inlaid-path-[ProductCode].json') -or
+            $custom.ExeCommand.Contains('inlaid-path-E1D7019B.json') -or
+            $custom.ExeCommand.Contains('[CustomActionData]')) {
+            throw "Deferred MSI action $action does not embed its formatted Type-2 executable command directly."
         }
     }
     foreach ($action in @('RollbackUserPath', 'ApplyUserPath', 'UninstallUserPath')) {
-        $data = $WixSource.SelectSingleNode("//wix:SetProperty[@Id='$action']", $Namespace)
-        if (-not $data.Value.Contains('[INLAID_PATH_PROGRAM_DIR].') -or -not $data.Value.Contains('[INSTALLFOLDER].')) {
+        $custom = $WixSource.SelectSingleNode("//wix:CustomAction[@Id='$action']", $Namespace)
+        if (-not $custom.ExeCommand.Contains('[INLAID_PATH_PROGRAM_DIR].') -or -not $custom.ExeCommand.Contains('[INSTALLFOLDER].')) {
             throw "Deferred MSI directory arguments for $action are not safe when MSI folder properties end in a backslash."
         }
     }
     foreach ($action in @('ApplyUserPath', 'UninstallUserPath')) {
-        $data = $WixSource.SelectSingleNode("//wix:SetProperty[@Id='$action']", $Namespace)
-        if (-not $data.Value.Contains('--user-sid "[UserSID]"')) {
+        $custom = $WixSource.SelectSingleNode("//wix:CustomAction[@Id='$action']", $Namespace)
+        if (-not $custom.ExeCommand.Contains('--user-sid "[UserSID]"')) {
             throw "Deferred MSI action $action does not address the explicit per-user registry hive."
         }
     }
@@ -229,11 +235,10 @@ try {
         throw 'PATH provenance must be consumed before MSI removes registry values, then its exact empty marker/Components tree finalized while rollback remains available.'
     }
     $TransactionSetter = $WixSource.SelectSingleNode('//wix:SetProperty[@Id="InlaidPathTransactionActive" and @After="PreflightUserPathState" and @Condition="NOT UPGRADINGPRODUCTCODE"]', $Namespace)
-    $RollbackDataSetter = $WixSource.SelectSingleNode('//wix:SetProperty[@Id="RollbackUserPath" and @After="SetInlaidPathTransactionActive"]', $Namespace)
-    $RollbackSequence = $WixSource.SelectSingleNode('//wix:InstallExecuteSequence/wix:Custom[@Action="RollbackUserPath" and @After="SetRollbackUserPath"]', $Namespace)
+    $RollbackSequence = $WixSource.SelectSingleNode('//wix:InstallExecuteSequence/wix:Custom[@Action="RollbackUserPath" and @After="SetInlaidPathTransactionActive"]', $Namespace)
     $CommitSequence = $WixSource.SelectSingleNode('//wix:InstallExecuteSequence/wix:Custom[@Action="CommitUserPath"]', $Namespace)
     $PostRemovalFailure = $WixSource.SelectSingleNode('//wix:InstallExecuteSequence/wix:Custom[@Action="FailAfterRemoveExistingProducts" and @After="RemoveExistingProducts"]', $Namespace)
-    if ($null -eq $TransactionSetter -or $null -eq $RollbackDataSetter -or
+    if ($null -eq $TransactionSetter -or
         $null -eq $RollbackSequence -or -not $RollbackSequence.Condition.Contains('InlaidPathTransactionActive') -or -not $RollbackSequence.Condition.Contains('NOT UPGRADINGPRODUCTCODE') -or
         $null -eq $CommitSequence -or -not $CommitSequence.Condition.Contains('InlaidPathTransactionActive') -or -not $CommitSequence.Condition.Contains('NOT UPGRADINGPRODUCTCODE') -or
         $null -eq $PostRemovalFailure -or

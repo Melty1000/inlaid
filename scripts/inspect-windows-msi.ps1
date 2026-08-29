@@ -292,20 +292,17 @@ $pathDirectoryAction = @($customActions | Where-Object { $_.Action -ceq 'SetINLA
 Require (@($customActions | Where-Object { $_.Action -ceq 'SetProgramFiles64Folder' }).Count -eq 0) 'MSI retains the superseded ProgramFiles64Folder override.'
 Require ($pathDirectoryAction.Count -eq 1 -and [int]$pathDirectoryAction[0].Type -eq 51 -and
     $pathDirectoryAction[0].Source -ceq 'INLAID_PATH_PROGRAM_DIR' -and $pathDirectoryAction[0].Target -ceq '[INSTALLFOLDER]') 'MSI does not capture the resolved install directory for PATH ownership.'
-foreach ($name in @('SetRollbackUserPath', 'SetApplyUserPath', 'SetUninstallUserPath')) {
-    $dataAction = @($customActions | Where-Object { $_.Action -ceq $name })
-    Require ($dataAction.Count -eq 1 -and $dataAction[0].Target.Contains('[INLAID_PATH_PROGRAM_DIR].') -and
-        $dataAction[0].Target.Contains('[INSTALLFOLDER].')) "MSI formatted directory arguments are not safe for trailing-backslash folder properties: $name"
+foreach ($name in @('RollbackUserPath', 'ApplyUserPath', 'UninstallUserPath')) {
+    $pathAction = @($customActions | Where-Object { $_.Action -ceq $name })
+    Require ($pathAction.Count -eq 1 -and $pathAction[0].Target.Contains('[INLAID_PATH_PROGRAM_DIR].') -and
+        $pathAction[0].Target.Contains('[INSTALLFOLDER].')) "MSI formatted directory arguments are not safe for trailing-backslash folder properties: $name"
 }
-foreach ($name in @('SetApplyUserPath', 'SetUninstallUserPath')) {
-    $dataAction = @($customActions | Where-Object { $_.Action -ceq $name })
-    Require ($dataAction.Count -eq 1 -and $dataAction[0].Target.Contains('--user-sid "[UserSID]"')) "MSI deferred action does not address the explicit per-user registry hive: $name"
+foreach ($name in @('ApplyUserPath', 'UninstallUserPath')) {
+    $pathAction = @($customActions | Where-Object { $_.Action -ceq $name })
+    Require ($pathAction.Count -eq 1 -and $pathAction[0].Target.Contains('--user-sid "[UserSID]"')) "MSI deferred action does not address the explicit per-user registry hive: $name"
 }
 foreach ($name in @('SetRollbackUserPath', 'SetApplyUserPath', 'SetUninstallUserPath', 'SetFinalizeUserPathMarker', 'SetFailAfterFinalizeUserPathMarker', 'SetFailAfterUserPath', 'SetFailAfterRemoveExistingProducts', 'SetCommitUserPath')) {
-    $dataAction = @($customActions | Where-Object { $_.Action -ceq $name })
-    Require ($dataAction.Count -eq 1 -and
-        $dataAction[0].Target.Contains('[TempFolder]inlaid-path-[ProductCode].json') -and
-        -not $dataAction[0].Target.Contains('inlaid-path-E1D7019B.json')) "MSI transaction snapshot is not isolated by ProductCode: $name"
+    Require (@($customActions | Where-Object { $_.Action -ceq $name }).Count -eq 0) "MSI retains obsolete deferred-data setter: $name"
 }
 $preflightAction = @($customActions | Where-Object { $_.Action -ceq 'PreflightUserPathState' })
 Require ($preflightAction.Count -eq 1 -and [int]$preflightAction[0].Type -eq 2 -and
@@ -316,10 +313,15 @@ $transactionSetter = @($customActions | Where-Object { $_.Action -ceq 'SetInlaid
 Require ($transactionSetter.Count -eq 1 -and [int]$transactionSetter[0].Type -eq 51 -and
     $transactionSetter[0].Source -ceq 'InlaidPathTransactionActive' -and $transactionSetter[0].Target -ceq '1') 'MSI private transaction-active property setter is missing or malformed.'
 $expectedActionTypes = [ordered]@{ RollbackUserPath = 1282; ApplyUserPath = 1026; UninstallUserPath = 1026; FinalizeUserPathMarker = 1026; FailAfterFinalizeUserPathMarker = 1026; FailAfterUserPath = 1026; FailAfterRemoveExistingProducts = 1026; CommitUserPath = 1538 }
+$expectedActionCommands = [ordered]@{ RollbackUserPath = '--action rollback'; ApplyUserPath = '--action apply'; UninstallUserPath = '--action uninstall'; FinalizeUserPathMarker = '--action finalize'; FailAfterFinalizeUserPathMarker = '--action fail'; FailAfterUserPath = '--action fail'; FailAfterRemoveExistingProducts = '--action fail'; CommitUserPath = '--action commit' }
 foreach ($name in $expectedActionTypes.Keys) {
     $action = @($customActions | Where-Object { $_.Action -ceq $name })
     Require ($action.Count -eq 1 -and [int]$action[0].Type -eq $expectedActionTypes[$name] -and
-        $action[0].Source -ceq 'InlaidPathHelper' -and $action[0].Target -ceq '[CustomActionData]') "MSI custom action mismatch: $name"
+        $action[0].Source -ceq 'InlaidPathHelper' -and
+        $action[0].Target.Contains($expectedActionCommands[$name]) -and
+        $action[0].Target.Contains('[TempFolder]inlaid-path-[ProductCode].json') -and
+        -not $action[0].Target.Contains('inlaid-path-E1D7019B.json') -and
+        -not $action[0].Target.Contains('[CustomActionData]')) "MSI custom action mismatch: $name"
     Require (([int]$action[0].Type -band 2048) -eq 0) "MSI custom action unexpectedly requests no-impersonate/elevated execution: $name"
 }
 
@@ -328,7 +330,6 @@ $executeCostFinalize = @($executeSequence | Where-Object { $_.Action -ceq 'CostF
 $executePathDirectory = @($executeSequence | Where-Object { $_.Action -ceq 'SetINLAID_PATH_PROGRAM_DIR' })
 $executePreflight = @($executeSequence | Where-Object { $_.Action -ceq 'PreflightUserPathState' })
 $executeTransactionSetter = @($executeSequence | Where-Object { $_.Action -ceq 'SetInlaidPathTransactionActive' })
-$executeRollbackSetter = @($executeSequence | Where-Object { $_.Action -ceq 'SetRollbackUserPath' })
 $executeRollbackPath = @($executeSequence | Where-Object { $_.Action -ceq 'RollbackUserPath' })
 $executeApplyPath = @($executeSequence | Where-Object { $_.Action -ceq 'ApplyUserPath' })
 $executeUninstallPath = @($executeSequence | Where-Object { $_.Action -ceq 'UninstallUserPath' })
@@ -352,12 +353,11 @@ Require ($executePostFinalizeFailure.Count -eq 1 -and
     [int]$executePostFinalizeFailure[0].Sequence -lt [int]$executeCommitPath[0].Sequence -and
     $executePostFinalizeFailure[0].Condition.Contains('INLAID_TEST_FAIL_AFTER_FINALIZE_USER_PATH_MARKER="1"') -and
     $executePostFinalizeFailure[0].Condition.Contains('REMOVE~="ALL"')) 'MSI lacks the test-only failed-uninstall seam after marker finalization and before commit.'
-Require ($executePreflight.Count -eq 1 -and $executeTransactionSetter.Count -eq 1 -and $executeRollbackSetter.Count -eq 1 -and $executeRollbackPath.Count -eq 1 -and
+Require ($executePreflight.Count -eq 1 -and $executeTransactionSetter.Count -eq 1 -and $executeRollbackPath.Count -eq 1 -and
     $executePreflight[0].Condition -ceq 'NOT UPGRADINGPRODUCTCODE' -and
     $executeTransactionSetter[0].Condition -ceq 'NOT UPGRADINGPRODUCTCODE' -and
     [int]$executePreflight[0].Sequence -lt [int]$executeTransactionSetter[0].Sequence -and
-    [int]$executeTransactionSetter[0].Sequence -lt [int]$executeRollbackSetter[0].Sequence -and
-    [int]$executeRollbackSetter[0].Sequence -lt [int]$executeRollbackPath[0].Sequence) 'Stale-state preflight and data setup do not run explicitly before rollback scheduling or the upgrading-away package is not excluded.'
+    [int]$executeTransactionSetter[0].Sequence -lt [int]$executeRollbackPath[0].Sequence) 'Stale-state preflight and private transaction activation do not run explicitly before rollback scheduling or the upgrading-away package is not excluded.'
 foreach ($action in @($executeRollbackPath, $executeApplyPath, $executeUninstallPath, $executeFinalizeMarker, $executePostFinalizeFailure, $executeFailAfterPath, $executePostRemovalFailure, $executeCommitPath)) {
     Require ($action.Count -eq 1 -and $action[0].Condition.Contains('NOT UPGRADINGPRODUCTCODE') -and
         $action[0].Condition.Contains('InlaidPathTransactionActive="1"')) "MSI PATH cleanup action is not directly upgrade-excluded and transaction-conditioned: $($action[0].Action)"

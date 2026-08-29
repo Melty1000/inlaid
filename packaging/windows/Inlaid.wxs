@@ -72,54 +72,29 @@
                  Value="1"
                  After="PreflightUserPathState" Sequence="execute"
                  Condition="NOT UPGRADINGPRODUCTCODE" />
-    <SetProperty Id="RollbackUserPath"
-                 Value='--action rollback --program-dir &quot;[INLAID_PATH_PROGRAM_DIR].&quot; --install-dir &quot;[INSTALLFOLDER].&quot; --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
-                 After="SetInlaidPathTransactionActive" Sequence="execute"
-                 Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot;" />
     <CustomAction Id="RollbackUserPath" BinaryRef="InlaidPathHelper"
-                  ExeCommand="[CustomActionData]"
+                  ExeCommand='--action rollback --program-dir &quot;[INLAID_PATH_PROGRAM_DIR].&quot; --install-dir &quot;[INSTALLFOLDER].&quot; --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
                   Execute="rollback" Impersonate="yes" Return="check" />
-    <SetProperty Id="ApplyUserPath"
-                 Value='--action apply --program-dir &quot;[INLAID_PATH_PROGRAM_DIR].&quot; --install-dir &quot;[INSTALLFOLDER].&quot; --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot; --user-sid &quot;[UserSID]&quot;'
-                 Before="ApplyUserPath" Sequence="execute" />
     <CustomAction Id="ApplyUserPath" BinaryRef="InlaidPathHelper"
-                  ExeCommand="[CustomActionData]"
+                  ExeCommand='--action apply --program-dir &quot;[INLAID_PATH_PROGRAM_DIR].&quot; --install-dir &quot;[INSTALLFOLDER].&quot; --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot; --user-sid &quot;[UserSID]&quot;'
                   Execute="deferred" Impersonate="yes" Return="check" />
-    <SetProperty Id="UninstallUserPath"
-                 Value='--action uninstall --program-dir &quot;[INLAID_PATH_PROGRAM_DIR].&quot; --install-dir &quot;[INSTALLFOLDER].&quot; --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot; --user-sid &quot;[UserSID]&quot;'
-                 Before="UninstallUserPath" Sequence="execute" />
     <CustomAction Id="UninstallUserPath" BinaryRef="InlaidPathHelper"
-                  ExeCommand="[CustomActionData]"
+                  ExeCommand='--action uninstall --program-dir &quot;[INLAID_PATH_PROGRAM_DIR].&quot; --install-dir &quot;[INSTALLFOLDER].&quot; --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot; --user-sid &quot;[UserSID]&quot;'
                   Execute="deferred" Impersonate="yes" Return="check" />
-    <SetProperty Id="FinalizeUserPathMarker"
-                 Value='--action finalize --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
-                 Before="FinalizeUserPathMarker" Sequence="execute" />
     <CustomAction Id="FinalizeUserPathMarker" BinaryRef="InlaidPathHelper"
-                  ExeCommand="[CustomActionData]"
+                  ExeCommand='--action finalize --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
                   Execute="deferred" Impersonate="yes" Return="check" />
-    <SetProperty Id="FailAfterFinalizeUserPathMarker"
-                 Value='--action fail --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
-                 Before="FailAfterFinalizeUserPathMarker" Sequence="execute" />
     <CustomAction Id="FailAfterFinalizeUserPathMarker" BinaryRef="InlaidPathHelper"
-                  ExeCommand="[CustomActionData]"
+                  ExeCommand='--action fail --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
                   Execute="deferred" Impersonate="yes" Return="check" />
-    <SetProperty Id="FailAfterUserPath"
-                 Value='--action fail --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
-                 Before="FailAfterUserPath" Sequence="execute" />
     <CustomAction Id="FailAfterUserPath" BinaryRef="InlaidPathHelper"
-                  ExeCommand="[CustomActionData]"
+                  ExeCommand='--action fail --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
                   Execute="deferred" Impersonate="yes" Return="check" />
-    <SetProperty Id="FailAfterRemoveExistingProducts"
-                 Value='--action fail --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
-                 Before="FailAfterRemoveExistingProducts" Sequence="execute" />
     <CustomAction Id="FailAfterRemoveExistingProducts" BinaryRef="InlaidPathHelper"
-                  ExeCommand="[CustomActionData]"
+                  ExeCommand='--action fail --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
                   Execute="deferred" Impersonate="yes" Return="check" />
-    <SetProperty Id="CommitUserPath"
-                 Value='--action commit --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
-                 Before="CommitUserPath" Sequence="execute" />
     <CustomAction Id="CommitUserPath" BinaryRef="InlaidPathHelper"
-                  ExeCommand="[CustomActionData]"
+                  ExeCommand='--action commit --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
                   Execute="commit" Impersonate="yes" Return="check" />
 
     <InstallExecuteSequence>
@@ -127,7 +102,7 @@
               Condition="NOT INLAID_PATH_PROGRAM_DIR" />
       <Custom Action="PreflightUserPathState" After="InstallInitialize"
               Condition="NOT UPGRADINGPRODUCTCODE" />
-      <Custom Action="RollbackUserPath" After="SetRollbackUserPath"
+      <Custom Action="RollbackUserPath" After="SetInlaidPathTransactionActive"
               Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot;" />
       <Custom Action="ApplyUserPath" After="InstallFiles"
               Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot; AND NOT (REMOVE~=&quot;ALL&quot;)" />
