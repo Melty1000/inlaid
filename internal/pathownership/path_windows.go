@@ -73,7 +73,13 @@ func PlanApply(currentPath string, currentPathPresent bool, marker Marker, progr
 	ownedMatches := 0
 	for _, segment := range segments {
 		normalized, ok := NormalizeSegment(segment, expand)
-		equivalentMatch := ok && strings.EqualFold(normalized, program)
+		equivalentMatch := false
+		if ok {
+			equivalentMatch, err = EqualOrdinalIgnoreCase(normalized, program)
+			if err != nil {
+				return Plan{}, fmt.Errorf("compare user PATH segment: %w", err)
+			}
+		}
 		if equivalentMatch {
 			equivalent++
 		}
@@ -119,6 +125,9 @@ func PlanUninstall(currentPath string, currentPathPresent bool, marker Marker, p
 		return result, nil
 	}
 	if err := validateMarker(marker, program, expand); err != nil {
+		if isOrdinalComparisonError(err) {
+			return Plan{}, err
+		}
 		result.Warn = "PATH was preserved because installer ownership was absent, false, malformed, or stale"
 		return result, nil
 	}
@@ -132,7 +141,13 @@ func PlanUninstall(currentPath string, currentPathPresent bool, marker Marker, p
 	ownedMatches := 0
 	for index, segment := range segments {
 		normalized, ok := NormalizeSegment(segment, expand)
-		equivalentMatch := ok && strings.EqualFold(normalized, program)
+		equivalentMatch := false
+		if ok {
+			equivalentMatch, err = EqualOrdinalIgnoreCase(normalized, program)
+			if err != nil {
+				return Plan{}, fmt.Errorf("compare user PATH segment: %w", err)
+			}
+		}
 		if equivalentMatch {
 			equivalent++
 		}
@@ -163,12 +178,23 @@ func validateMarker(marker Marker, program string, expand ExpandFunc) error {
 	if !ok {
 		return fmt.Errorf("installer PATH provenance marker is malformed")
 	}
-	if !strings.EqualFold(normalizedMarker, program) {
+	equal, err := EqualOrdinalIgnoreCase(normalizedMarker, program)
+	if err != nil {
+		return fmt.Errorf("compare installer PATH provenance marker: %w", err)
+	}
+	if !equal {
 		return fmt.Errorf("installer PATH provenance marker is stale")
 	}
 	if marker.Owned {
 		inserted, ok := NormalizeSegment(marker.InsertedSegment, expand)
-		if !ok || !strings.EqualFold(inserted, normalizedMarker) {
+		if !ok {
+			return fmt.Errorf("installer PATH provenance marker is malformed")
+		}
+		equal, err = EqualOrdinalIgnoreCase(inserted, normalizedMarker)
+		if err != nil {
+			return fmt.Errorf("compare installer PATH provenance marker: %w", err)
+		}
+		if !equal {
 			return fmt.Errorf("installer PATH provenance marker is malformed")
 		}
 		return nil

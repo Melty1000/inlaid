@@ -200,8 +200,10 @@ func run(action, programDir, installDir, stateFile, userSID string) error {
 	if err != nil {
 		return err
 	}
-	if testHooks != "true" && !strings.EqualFold(actual, requested) {
-		return errors.New("PATH program directory differs from the actual MSI install directory")
+	if testHooks != "true" {
+		if err := validateProgramDirectoryMatch(actual, requested); err != nil {
+			return err
+		}
 	}
 
 	claimToken, err := requireTransactionClaimPhase(stateFile, claimPhasePreflight)
@@ -243,6 +245,17 @@ func run(action, programDir, installDir, stateFile, userSID string) error {
 	broadcastEnvironmentChange()
 	if plan.Warn != "" {
 		fmt.Fprintln(os.Stderr, "Inlaid PATH helper warning:", plan.Warn)
+	}
+	return nil
+}
+
+func validateProgramDirectoryMatch(actual, requested string) error {
+	equal, err := pathownership.EqualOrdinalIgnoreCase(actual, requested)
+	if err != nil {
+		return fmt.Errorf("compare PATH program directory with the actual MSI install directory: %w", err)
+	}
+	if !equal {
+		return errors.New("PATH program directory differs from the actual MSI install directory")
 	}
 	return nil
 }

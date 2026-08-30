@@ -602,6 +602,12 @@ fixture.
 The lifecycle script must acquire raw PATH evidence through bounded native
 `RegQueryValueExW` calls and restore fixtures through `RegSetValueExW`; decoded
 .NET strings may support semantic PATH checks but are not raw-byte evidence.
+Focused Windows helper tests must prove PATH, install-directory, and provenance
+comparisons use native `CompareStringOrdinal(..., TRUE)` semantics: ordinary
+ASCII and non-ASCII casing compare equal, canonically different text remains
+different, and the Unicode Kelvin sign never compares equal to ASCII `K`.
+Exercise that last distinction through apply, uninstall, and stale-marker paths;
+Go Unicode simple folding is not acceptable evidence for Windows path equality.
 The basic-UI route is automation evidence for Windows Installer UI level 3, not
 a claim that a human completed a full installer wizard walkthrough. Its MSI log
 must contain the exact UI level, while separate `/qn` evidence remains mandatory.

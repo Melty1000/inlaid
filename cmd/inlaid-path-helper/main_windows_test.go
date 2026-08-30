@@ -17,6 +17,30 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
+func TestValidateProgramDirectoryMatchUsesWindowsOrdinalSemantics(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		actual      string
+		requested   string
+		wantFailure bool
+	}{
+		{name: "ASCII casing", actual: `C:\Programs\Inlaid`, requested: `c:\programs\INLAID`},
+		{name: "non-ASCII casing", actual: `C:\TÉST\Inlaid`, requested: `c:\tést\inlaid`},
+		{name: "Kelvin sign is not ASCII K", actual: `C:\Temp\Kelp`, requested: `C:\Temp\Kelp`, wantFailure: true},
+		{name: "canonical forms stay distinct", actual: `C:\Temp\Å`, requested: "C:\\Temp\\A\u030A", wantFailure: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateProgramDirectoryMatch(test.actual, test.requested)
+			if (err != nil) != test.wantFailure {
+				t.Fatalf("validateProgramDirectoryMatch(%q, %q) error = %v, want failure %v", test.actual, test.requested, err, test.wantFailure)
+			}
+		})
+	}
+	if err := validateProgramDirectoryMatch("C:\\Bad\x00Path", `C:\Bad`); err == nil || !strings.Contains(err.Error(), "encode first path") {
+		t.Fatalf("native comparison failure was not propagated: %v", err)
+	}
+}
+
 type fakeRegistryValueKey struct {
 	deleteErr error
 	closeErr  error

@@ -3,6 +3,7 @@
 package pathownership
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -20,6 +21,32 @@ func TestNormalizeSegmentUsesComparisonOnlyRules(t *testing.T) {
 		if got, ok := NormalizeSegment(invalid, testExpand); ok {
 			t.Fatalf("invalid segment %q normalized as %q", invalid, got)
 		}
+	}
+}
+
+func TestEqualOrdinalIgnoreCaseUsesWindowsPathSemantics(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		left, right string
+		want        bool
+	}{
+		{name: "ASCII casing", left: `C:\Programs\Inlaid`, right: `c:\programs\INLAID`, want: true},
+		{name: "non-ASCII casing", left: `C:\TÉST\Inlaid`, right: `c:\tést\inlaid`, want: true},
+		{name: "Kelvin sign is not ASCII K", left: `C:\Temp\Kelp`, right: `C:\Temp\Kelp`, want: false},
+		{name: "canonical forms stay distinct", left: `C:\Temp\Å`, right: "C:\\Temp\\A\u030A", want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := EqualOrdinalIgnoreCase(test.left, test.right)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("EqualOrdinalIgnoreCase(%q, %q) = %v, want %v", test.left, test.right, got, test.want)
+			}
+		})
+	}
+	if _, err := EqualOrdinalIgnoreCase("C:\\Bad\x00Path", `C:\Bad`); err == nil {
+		t.Fatal("embedded NUL was accepted for ordinal path comparison")
 	}
 }
 
@@ -50,6 +77,18 @@ func TestApplyTreatsEquivalentTextAsUserOwned(t *testing.T) {
 	}
 }
 
+func TestApplyDoesNotUseUnicodeSimpleFoldingForWindowsPaths(t *testing.T) {
+	program := `C:\Temp\Kelp`
+	foreign := `C:\Temp\Kelp`
+	plan, err := PlanApply(foreign, true, Marker{}, program, testExpand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Path != foreign+`;`+program || !plan.Marker.Owned || plan.Marker.InsertedSegment != program {
+		t.Fatalf("Kelvin-sign path was treated as equivalent: %+v", plan)
+	}
+}
+
 func TestRepairReappendsMissingOwnedSegmentButYieldsToUserEdit(t *testing.T) {
 	program := `C:\Users\Cody\AppData\Local\Programs\Inlaid`
 	marker := Marker{Present: true, Valid: true, Owned: true, NormalizedProgramDirectory: program, InsertedSegment: program}
@@ -75,6 +114,49 @@ func TestUninstallRemovesOnlyOneProvenOwnedSegment(t *testing.T) {
 	plan, err = PlanUninstall(ambiguous, true, marker, program, testExpand)
 	if err != nil || plan.Path != ambiguous || plan.Warn == "" {
 		t.Fatalf("ambiguous uninstall = %+v, %v", plan, err)
+	}
+}
+
+func TestUninstallDoesNotTreatKelvinSignAsOwnedPath(t *testing.T) {
+	program := `C:\Temp\Kelp`
+	foreign := `C:\Temp\Kelp`
+	marker := Marker{Present: true, Valid: true, Owned: true, NormalizedProgramDirectory: program, InsertedSegment: program}
+	plan, err := PlanUninstall(foreign+`;`+program, true, marker, program, testExpand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Path != foreign || plan.Warn != "" {
+		t.Fatalf("uninstall did not remove only the ordinally equivalent owned segment: %+v", plan)
+	}
+}
+
+func TestKelvinSignMarkerDoesNotValidateAsASCIIK(t *testing.T) {
+	program := `C:\Temp\Kelp`
+	marker := Marker{
+		Present: true, Valid: true, Owned: true,
+		NormalizedProgramDirectory: `C:\Temp\Kelp`,
+		InsertedSegment:            `C:\Temp\Kelp`,
+	}
+	if _, err := PlanApply(program, true, marker, program, testExpand); err == nil {
+		t.Fatal("marker using the Kelvin sign validated as an ASCII-K program directory")
+	}
+	plan, err := PlanUninstall(program, true, marker, program, testExpand)
+	if err != nil || plan.Path != program || plan.Warn == "" {
+		t.Fatalf("uninstall did not preserve PATH for a stale Unicode marker: %+v, %v", plan, err)
+	}
+}
+
+func TestUninstallPropagatesOrdinalComparisonFailure(t *testing.T) {
+	original := compareOrdinalIgnoreCase
+	compareOrdinalIgnoreCase = func(string, string) (bool, error) {
+		return false, errors.New("injected ordinal comparison failure")
+	}
+	t.Cleanup(func() { compareOrdinalIgnoreCase = original })
+
+	program := `C:\Temp\Inlaid`
+	marker := Marker{Present: true, Valid: true, Owned: true, NormalizedProgramDirectory: program, InsertedSegment: program}
+	if _, err := PlanUninstall(program, true, marker, program, testExpand); err == nil || !strings.Contains(err.Error(), "injected ordinal comparison failure") {
+		t.Fatalf("ordinal comparison failure was not propagated: %v", err)
 	}
 }
 

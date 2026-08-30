@@ -199,8 +199,9 @@ creation][chocolatey] and [Scoop manifests][scoop].
   resolving `.` and `..` with the Windows full-path rules, and removing trailing
   `\` or `/` except at a volume root. Relative, empty, or invalid segments are
   foreign. Comparison with the fully resolved
-  `FOLDERID_UserProgramFiles\Inlaid` path uses
-  `StringComparison.OrdinalIgnoreCase`; normalization is never written back.
+  `FOLDERID_UserProgramFiles\Inlaid` path uses native Windows
+  `CompareStringOrdinal(..., TRUE)` semantics; normalization is never written
+  back. Unicode simple case folding is not used.
 - The fully resolved program directory must not contain the PATH delimiter `;`.
   If it does, install, repair, or upgrade fails closed and the Windows Installer
   transaction rolls back before committing any PATH or provenance-marker
