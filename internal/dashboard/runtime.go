@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Melty1000/inlaid/internal/applayout"
 	"github.com/Melty1000/inlaid/internal/capture"
 	"github.com/Melty1000/inlaid/internal/cellframe"
 	"github.com/Melty1000/inlaid/internal/celllive"
@@ -46,9 +47,9 @@ func (s *cellLiveCameraSession) update(view celllive.ViewConfig) { s.session.Upd
 // It is deliberately independent from Bubble Tea: all public actions return
 // immediately and report completion through Events or Previews.
 type Runtime struct {
-	ctx                context.Context
-	cancel             context.CancelFunc
-	root, settingsPath string
+	ctx    context.Context
+	cancel context.CancelFunc
+	layout applayout.Layout
 
 	previews             chan PreviewUpdate
 	events               chan RuntimeEvent
@@ -176,21 +177,46 @@ func NewRuntime(cfg Settings, settingsPath, root string) *Runtime {
 }
 
 func NewRuntimeWithBuild(cfg Settings, settingsPath, root string, build supportreport.BuildFacts) *Runtime {
-	ctx, cancel := context.WithCancel(context.Background())
-	if strings.TrimSpace(root) == "" {
-		root, _ = os.Getwd()
+	layout, err := applayout.Local(root, applayout.ExplicitTest)
+	if err != nil {
+		panic(fmt.Sprintf("dashboard test layout: %v", err))
 	}
+	if strings.TrimSpace(settingsPath) != "" {
+		layout.SettingsFile, err = filepath.Abs(settingsPath)
+		if err != nil {
+			panic(fmt.Sprintf("dashboard test settings path: %v", err))
+		}
+	}
+	runtime, err := NewRuntimeWithLayout(cfg, layout, build)
+	if err != nil {
+		panic(fmt.Sprintf("dashboard test runtime: %v", err))
+	}
+	return runtime
+}
+
+// NewRuntimeWithLayout consumes locations already resolved at the application
+// boundary. The dashboard never decides whether a run is installed, portable,
+// source, or a test fixture.
+func NewRuntimeWithLayout(cfg Settings, layout applayout.Layout, build supportreport.BuildFacts) (*Runtime, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := layout.Validate(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("dashboard layout: %w", err)
+	}
+	localFFmpegRoot := layoutFFmpegRoot(layout)
 	runtime := &Runtime{
-		ctx: ctx, cancel: cancel, root: root, settingsPath: settingsPath, settings: cfg,
+		ctx: ctx, cancel: cancel, layout: layout, settings: cfg,
 		// Keep exactly one composed frame waiting for Bubble Tea. A zero-capacity
 		// channel discarded a camera frame whenever Bubble Tea was between its
 		// one-shot receive commands, turning a healthy 29.8 FPS source into a
 		// roughly 27 FPS preview. One latest-wins slot removes that scheduling race
 		// without allowing latency to accumulate.
 		previews: make(chan PreviewUpdate, 1), events: make(chan RuntimeEvent, 64),
-		deviceIDs:        make(map[string]string),
-		looks:            builtInLookCatalog(),
-		findFFmpeg:       ffmpegexe.FindContext,
+		deviceIDs: make(map[string]string),
+		looks:     builtInLookCatalog(),
+		findFFmpeg: func(ctx context.Context, explicit string) (string, error) {
+			return ffmpegexe.FindContext(ctx, explicit, localFFmpegRoot)
+		},
 		openFolder:       openFolder,
 		enumerateCameras: capture.Enumerate,
 		startCamera:      celllive.StartCamera,
@@ -202,7 +228,16 @@ func NewRuntimeWithBuild(cfg Settings, settingsPath, root string, build supportr
 		defer runtime.wg.Done()
 		runtime.runSettingsSaver()
 	}()
-	return runtime
+	return runtime, nil
+}
+
+func layoutFFmpegRoot(layout applayout.Layout) string {
+	switch layout.Mode {
+	case applayout.Portable, applayout.Source, applayout.ExplicitTest:
+		return layout.ProgramRoot
+	default:
+		return ""
+	}
 }
 
 func (r *Runtime) Start(view ViewOptions) {
@@ -298,7 +333,7 @@ func (r *Runtime) discoverRecovery() {
 }
 
 func (r *Runtime) discoverLooks() {
-	catalog, err := loadLookCatalog(filepath.Join(r.root, "filters"))
+	catalog, err := loadLookCatalog(r.layout.FiltersDir)
 	if r.closed.Load() {
 		return
 	}
@@ -841,7 +876,7 @@ func (r *Runtime) startRecording(options RecordOptions) {
 	}
 	defer firstFrame.Release()
 	format := recording.Format(strings.ToLower(options.Format))
-	output, err := r.nextOutput("recordings", string(format))
+	output, err := r.nextOutput(r.layout.RecordingsDir, string(format))
 	if err != nil {
 		r.recordStartFailed(options.Format, err)
 		return
@@ -859,7 +894,7 @@ func (r *Runtime) startRecording(options RecordOptions) {
 	r.ffmpegMu.Lock()
 	r.ffmpeg = ffmpeg // validated now; the actual encoder starts only after Stop.
 	r.ffmpegMu.Unlock()
-	recoveryDirectory := filepath.Join(r.root, "recordings", ".recovery")
+	recoveryDirectory := r.layout.RecoveryDir
 	tapeFinal := filepath.Join(recoveryDirectory, strings.TrimSuffix(filepath.Base(output), filepath.Ext(output))+".celltape")
 	r.viewMu.RLock()
 	displayFPS := r.view.TargetFPS
@@ -1066,7 +1101,7 @@ func retainedTapePath(staging, published string) string {
 // still owned by another live process. Every failure retains the canonical
 // tape for a later retry.
 func (r *Runtime) recoverRecordings(ffmpeg string, ffmpegErr error) {
-	recoveryDirectory := filepath.Join(r.root, "recordings", ".recovery")
+	recoveryDirectory := r.layout.RecoveryDir
 	engine, err := taperecovery.New(recoveryDirectory, taperecovery.Options{
 		MaxConfigBytes: int(canonicalTapeLimits.MaxConfigBytes),
 		TapeLimits:     canonicalTapeLimits,
@@ -1214,13 +1249,13 @@ func (r *Runtime) recoverClaimedTape(tape taperecovery.Tape, ffmpeg string, ffmp
 
 func (r *Runtime) recoveryOutput(tapePath, format string) (string, error) {
 	name := strings.TrimSuffix(filepath.Base(tapePath), filepath.Ext(tapePath)) + "." + format
-	preferred := filepath.Join(r.root, "recordings", name)
+	preferred := filepath.Join(r.layout.RecordingsDir, name)
 	if _, err := os.Lstat(preferred); errors.Is(err, os.ErrNotExist) {
 		return preferred, nil
 	} else if err != nil {
 		return "", err
 	}
-	output, err := r.nextOutput("recordings", format)
+	output, err := r.nextOutput(r.layout.RecordingsDir, format)
 	return output, err
 }
 
@@ -1268,7 +1303,7 @@ func (r *Runtime) Snapshot(options RecordOptions) {
 		frame.Release()
 		return
 	}
-	path, err := r.nextOutput("snapshots", "png")
+	path, err := r.nextOutput(r.layout.SnapshotsDir, "png")
 	if err == nil {
 		r.snapshotSaving = true
 	}
@@ -1313,7 +1348,7 @@ func (r *Runtime) OpenFolder() {
 	r.recordMu.Lock()
 	last := r.lastSaved
 	r.recordMu.Unlock()
-	directory := filepath.Join(r.root, "recordings")
+	directory := r.layout.RecordingsDir
 	if last != "" {
 		directory = filepath.Dir(last)
 	}
@@ -1341,7 +1376,7 @@ func (r *Runtime) CreateSupportReport() {
 		prepared, _, err := r.support.Prepare(r.currentSupportFacts(), supportreport.Include{})
 		if err == nil {
 			var saved supportreport.Saved
-			saved, err = r.support.Save(r.root, prepared)
+			saved, err = r.support.SaveDirectory(r.layout.SupportReportsDir, prepared)
 			if err == nil {
 				r.recordMu.Lock()
 				r.lastSaved = saved.Path
@@ -1428,6 +1463,7 @@ func (r *Runtime) currentSupportFacts() supportreport.Current {
 		pixelLayout = "unknown"
 	}
 	return supportreport.Current{
+		DistributionMode: string(r.layout.Mode),
 		Camera: supportreport.CameraFacts{
 			Model: cameraName, Backend: backend, DeviceCount: deviceCount,
 			Requested: supportreport.ModeFacts{
@@ -1596,7 +1632,7 @@ func (r *Runtime) writePendingSettings(final bool) {
 	r.savePendingSet = false
 	r.saveMu.Unlock()
 
-	err := SaveSettings(r.settingsPath, settings)
+	err := SaveSettings(r.layout.SettingsFile, settings)
 	if final {
 		r.saveMu.Lock()
 		r.saveErr = err
@@ -1813,10 +1849,9 @@ func (r *Runtime) recordSupportEvent(event RuntimeEvent) {
 	r.support.Record(record)
 }
 
-func (r *Runtime) nextOutput(folder, extension string) (string, error) {
-	directory := filepath.Join(r.root, folder)
+func (r *Runtime) nextOutput(directory, extension string) (string, error) {
 	if err := os.MkdirAll(directory, 0o755); err != nil {
-		return "", fmt.Errorf("create %s folder: %w", folder, err)
+		return "", fmt.Errorf("create output folder: %w", err)
 	}
 	base := "Inlaid_" + time.Now().Format("2006-01-02_15-04-05-000")
 	for suffix := 1; suffix < 1000; suffix++ {

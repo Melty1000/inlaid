@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Inlaid"
+           Manufacturer="Melty1000"
+           Version="$(var.MsiVersion)"
+           UpgradeCode="E1D7019B-07CD-4A8E-8D65-C6FA20B7F07D"
+           Scope="perUser"
+           Compressed="yes">
+    <MajorUpgrade Schedule="afterInstallFinalize"
+                  IgnoreRemoveFailure="no"
+                  DowngradeErrorMessage="A newer version of Inlaid is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Launch Condition="NOT RollbackDisabled"
+            Message="Inlaid requires Windows Installer rollback to protect the current-user PATH." />
+    <Property Id="INLAID_PATH_PROGRAM_DIR" Secure="yes" />
+    <CustomAction Id="SetINLAID_PATH_PROGRAM_DIR"
+                  Property="INLAID_PATH_PROGRAM_DIR"
+                  Value="[INSTALLFOLDER]" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="PerUserProgramFilesFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Inlaid">
+          <Component Id="InlaidExecutable" Guid="{882B8192-1A62-4B36-884A-4227DBA1DD7B}">
+            <File Id="inlaidExe" Source="$(var.PayloadRoot)\inlaid.exe" />
+            <RegistryValue Root="HKCU" Key="Software\Inlaid\Installer\Components" Name="InlaidExecutable"
+                           Type="integer" Value="1" KeyPath="yes" />
+          </Component>
+          <Component Id="InlaidReadme" Guid="{F2503590-7052-453B-A7DA-D31BD1426CC7}">
+            <File Id="inlaidReadme" Source="$(var.PayloadRoot)\README.md" />
+            <RegistryValue Root="HKCU" Key="Software\Inlaid\Installer\Components" Name="InlaidReadme"
+                           Type="integer" Value="1" KeyPath="yes" />
+          </Component>
+          <Component Id="InlaidLicense" Guid="{B1132EB7-D31B-40E1-BBC3-04F0E1AB4BF4}">
+            <File Id="inlaidLicense" Source="$(var.PayloadRoot)\LICENSE" />
+            <RegistryValue Root="HKCU" Key="Software\Inlaid\Installer\Components" Name="InlaidLicense"
+                           Type="integer" Value="1" KeyPath="yes" />
+          </Component>
+          <Component Id="InlaidNotices" Guid="{873F13DF-4A0F-4EA3-A09C-8D22BFE35667}">
+            <File Id="inlaidNotices" Source="$(var.PayloadRoot)\THIRD_PARTY_NOTICES.md" />
+            <RegistryValue Root="HKCU" Key="Software\Inlaid\Installer\Components" Name="InlaidNotices"
+                           Type="integer" Value="1" KeyPath="yes" />
+          </Component>
+          <Directory Id="InlaidDocsFolder" Name="docs">
+            <Component Id="InlaidFilterDocumentation" Guid="{55C8F27E-9D2F-4DDD-AE65-1EFAB7B43B42}">
+              <File Id="inlaidFiltersDoc" Source="$(var.PayloadRoot)\docs\FILTERS.md" />
+              <RegistryValue Root="HKCU" Key="Software\Inlaid\Installer\Components" Name="InlaidFilterDocumentation"
+                             Type="integer" Value="1" KeyPath="yes" />
+              <RemoveFolder Id="RemoveInlaidDocsFolder" On="uninstall" />
+            </Component>
+          </Directory>
+          <Directory Id="InlaidFiltersFolder" Name="filters">
+            <Component Id="InlaidFilterReadme" Guid="{12CF70D6-D308-4D00-A2A1-1F818A67ED75}">
+              <File Id="inlaidFiltersReadme" Source="$(var.PayloadRoot)\filters\README.md" />
+              <RegistryValue Root="HKCU" Key="Software\Inlaid\Installer\Components" Name="InlaidFilterReadme"
+                             Type="integer" Value="1" KeyPath="yes" />
+              <RemoveFolder Id="RemoveInlaidFiltersFolder" On="uninstall" />
+            </Component>
+          </Directory>
+          <Component Id="InlaidPathProvenance" Guid="{BA72C6B8-2ECE-4908-8D38-D17959D78636}">
+            <RegistryValue Root="HKCU" Key="Software\Inlaid\Installer" Name="Component"
+                           Type="integer" Value="1" KeyPath="yes" />
+            <RemoveFolder Id="RemoveInlaidInstallFolder" On="uninstall" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Binary Id="InlaidPathHelper" SourceFile="$(var.PathHelper)" />
+    <CustomAction Id="PreflightUserPathState" BinaryRef="InlaidPathHelper"
+                  ExeCommand='--action preflight --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
+                  Execute="immediate" Impersonate="yes" Return="check" />
+    <SetProperty Id="InlaidPathTransactionActive"
+                 Value="1"
+                 After="PreflightUserPathState" Sequence="execute"
+                 Condition="NOT UPGRADINGPRODUCTCODE" />
+    <CustomAction Id="RollbackUserPath" BinaryRef="InlaidPathHelper"
+                  ExeCommand='--action rollback --program-dir &quot;[INLAID_PATH_PROGRAM_DIR].&quot; --install-dir &quot;[INSTALLFOLDER].&quot; --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
+                  Execute="rollback" Impersonate="yes" Return="check" />
+    <CustomAction Id="ApplyUserPath" BinaryRef="InlaidPathHelper"
+                  ExeCommand='--action apply --program-dir &quot;[INLAID_PATH_PROGRAM_DIR].&quot; --install-dir &quot;[INSTALLFOLDER].&quot; --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot; --user-sid &quot;[UserSID]&quot;'
+                  Execute="deferred" Impersonate="yes" Return="check" />
+    <CustomAction Id="UninstallUserPath" BinaryRef="InlaidPathHelper"
+                  ExeCommand='--action uninstall --program-dir &quot;[INLAID_PATH_PROGRAM_DIR].&quot; --install-dir &quot;[INSTALLFOLDER].&quot; --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot; --user-sid &quot;[UserSID]&quot;'
+                  Execute="deferred" Impersonate="yes" Return="check" />
+    <CustomAction Id="FinalizeUserPathMarker" BinaryRef="InlaidPathHelper"
+                  ExeCommand='--action finalize --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
+                  Execute="deferred" Impersonate="yes" Return="check" />
+    <CustomAction Id="FailAfterUserPath" BinaryRef="InlaidPathHelper"
+                  ExeCommand='--action fail --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
+                  Execute="deferred" Impersonate="yes" Return="check" />
+    <CustomAction Id="CommitUserPath" BinaryRef="InlaidPathHelper"
+                  ExeCommand='--action commit --state-file &quot;[TempFolder]inlaid-path-[ProductCode].json&quot;'
+                  Execute="commit" Impersonate="yes" Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom Action="SetINLAID_PATH_PROGRAM_DIR" After="CostFinalize"
+              Condition="NOT INLAID_PATH_PROGRAM_DIR" />
+      <Custom Action="PreflightUserPathState" After="InstallInitialize"
+              Condition="NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RollbackUserPath" After="SetInlaidPathTransactionActive"
+              Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot;" />
+      <Custom Action="ApplyUserPath" After="InstallFiles"
+              Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot; AND NOT (REMOVE~=&quot;ALL&quot;)" />
+      <Custom Action="FailAfterUserPath" After="ApplyUserPath"
+              Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot; AND INLAID_TEST_INJECT_FAILURE=&quot;1&quot; AND NOT (REMOVE~=&quot;ALL&quot;)" />
+      <Custom Action="UninstallUserPath" Before="RemoveRegistryValues"
+              Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot; AND (REMOVE~=&quot;ALL&quot;)" />
+      <Custom Action="FinalizeUserPathMarker" After="RemoveRegistryValues"
+              Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot; AND (REMOVE~=&quot;ALL&quot;)" />
+      <Custom Action="CommitUserPath" Before="InstallFinalize"
+              Condition="NOT UPGRADINGPRODUCTCODE AND InlaidPathTransactionActive=&quot;1&quot;" />
+    </InstallExecuteSequence>
+
+    <Feature Id="MainFeature" Title="Inlaid" Level="1">
+      <ComponentRef Id="InlaidExecutable" />
+      <ComponentRef Id="InlaidReadme" />
+      <ComponentRef Id="InlaidLicense" />
+      <ComponentRef Id="InlaidNotices" />
+      <ComponentRef Id="InlaidFilterDocumentation" />
+      <ComponentRef Id="InlaidFilterReadme" />
+      <ComponentRef Id="InlaidPathProvenance" />
+    </Feature>
+  </Package>
+</Wix>

@@ -1,0 +1,37 @@
+{
+  "schema": 3,
+  "logicalInputs": {
+    "application": { "source": "@executable" },
+    "readme": { "source": "README.md" },
+    "license": { "source": "LICENSE" },
+    "third-party-notices": { "source": "THIRD_PARTY_NOTICES.md" },
+    "filter-documentation": { "source": "docs/FILTERS.md" },
+    "filter-directory-readme": { "source": "filters/README.md" },
+    "portable-updater": { "source": "scripts/update-portable.ps1" },
+    "portable-manifest": { "source": "@generated-portable-manifest" }
+  },
+  "logicalPayloads": {
+    "windows-common": [
+      { "role": "application", "destination": "inlaid.exe" },
+      { "role": "readme", "destination": "README.md" },
+      { "role": "license", "destination": "LICENSE" },
+      { "role": "third-party-notices", "destination": "THIRD_PARTY_NOTICES.md" },
+      { "role": "filter-documentation", "destination": "docs/FILTERS.md" },
+      { "role": "filter-directory-readme", "destination": "filters/README.md" }
+    ]
+  },
+  "channels": {
+    "windows": {
+      "msi": { "payload": "windows-common", "additions": [] },
+      "portable": {
+        "payload": "windows-common",
+        "additions": [
+          { "role": "portable-updater", "destination": "update-portable.ps1" },
+          { "role": "portable-manifest", "destination": "inlaid-portable.json" }
+        ]
+      }
+    },
+    "linux": { "status": "contract-only" },
+    "macos": { "status": "contract-only" }
+  }
+}

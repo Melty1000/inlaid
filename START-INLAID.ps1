@@ -7,108 +7,9 @@ $ErrorActionPreference = 'Stop'
 $ProjectRoot = $PSScriptRoot
 $SourcePackage = Join-Path $ProjectRoot 'cmd\inlaid'
 $Executable = Join-Path $ProjectRoot 'bin\inlaid.exe'
-$SettingsPath = Join-Path $ProjectRoot 'inlaid-settings.json'
 $SetupScript = Join-Path $ProjectRoot 'scripts\setup.ps1'
 $MediaInstaller = Join-Path $ProjectRoot 'scripts\install-ffmpeg.ps1'
 $WindowTitle = 'Inlaid'
-
-function ConvertTo-WindowsProcessArgument {
-    param([AllowEmptyString()][string]$Argument)
-
-    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') {
-        return $Argument
-    }
-
-    $builder = [System.Text.StringBuilder]::new()
-    [void]$builder.Append('"')
-    $backslashes = 0
-    foreach ($character in $Argument.ToCharArray()) {
-        if ($character -eq '\') {
-            $backslashes++
-            continue
-        }
-        if ($character -eq '"') {
-            [void]$builder.Append(('\' * (($backslashes * 2) + 1)))
-            [void]$builder.Append('"')
-            $backslashes = 0
-            continue
-        }
-        if ($backslashes -gt 0) {
-            [void]$builder.Append(('\' * $backslashes))
-            $backslashes = 0
-        }
-        [void]$builder.Append($character)
-    }
-    if ($backslashes -gt 0) {
-        [void]$builder.Append(('\' * ($backslashes * 2)))
-    }
-    [void]$builder.Append('"')
-    return $builder.ToString()
-}
-
-function New-SafeProcessStartInfo {
-    param(
-        [Parameter(Mandatory)][string]$FilePath,
-        [Parameter(Mandatory)][string[]]$Arguments
-    )
-
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $FilePath
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-
-    if ($null -ne $startInfo.PSObject.Properties['ArgumentList']) {
-        foreach ($argument in $Arguments) {
-            [void]$startInfo.ArgumentList.Add($argument)
-        }
-    }
-    else {
-        $startInfo.Arguments = (($Arguments | ForEach-Object {
-                    ConvertTo-WindowsProcessArgument -Argument $_
-                }) -join ' ')
-    }
-    return $startInfo
-}
-
-function Test-WindowsTerminalHost {
-    return -not [string]::IsNullOrWhiteSpace($env:WT_SESSION)
-}
-
-function Start-WindowsTerminalHost {
-    if (Test-WindowsTerminalHost) {
-        return $false
-    }
-
-    $terminal = Get-Command -Name 'wt.exe' -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($null -eq $terminal) {
-        throw 'Windows Terminal (wt.exe) was not found. Install Windows Terminal, then double-click START-INLAID.cmd again.'
-    }
-
-    $terminalArguments = @(
-        '-w', 'new',
-        'new-tab',
-        '-d', $ProjectRoot,
-        '--',
-        $Executable,
-        '--settings', $SettingsPath
-    )
-
-    $startInfo = New-SafeProcessStartInfo -FilePath $terminal.Source -Arguments $terminalArguments
-    $startInfo.EnvironmentVariables['INLAID_LAUNCHER'] = $(if (Test-Path -LiteralPath $SourcePackage -PathType Container) { 'source' } else { 'package' })
-
-    $process = [System.Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    try {
-        if (-not $process.Start()) {
-            throw 'Windows Terminal could not be started.'
-        }
-    }
-    finally {
-        $process.Dispose()
-    }
-    return $true
-}
 
 function Resolve-GoExecutable {
     $localGo = Join-Path $ProjectRoot '.tools\go\bin\go.exe'
@@ -210,18 +111,8 @@ try {
         }
     }
 
-    if (Start-WindowsTerminalHost) {
-        exit 0
-    }
-
-    Push-Location -LiteralPath $ProjectRoot
-    try {
-        & $Executable '--settings' $SettingsPath
-        $appExitCode = $LASTEXITCODE
-    }
-    finally {
-        Pop-Location
-    }
+    & $Executable '--source-root' $ProjectRoot
+    $appExitCode = $LASTEXITCODE
     if ($appExitCode -ne 0) {
         throw "Inlaid stopped unexpectedly with exit code $appExitCode."
     }

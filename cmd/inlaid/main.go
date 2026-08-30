@@ -6,14 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/Melty1000/inlaid/internal/applayout"
 	"github.com/Melty1000/inlaid/internal/dashboard"
-	"github.com/Melty1000/inlaid/internal/startup"
 	"github.com/Melty1000/inlaid/internal/supportreport"
 	"github.com/charmbracelet/colorprofile"
 )
@@ -23,51 +22,75 @@ import (
 var version = "dev"
 
 func main() {
-	relaunched, err := startup.RelaunchFromExplorer()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Inlaid:", err)
-		os.Exit(1)
-	}
-	if relaunched {
-		return
-	}
-
 	renderPreview := flag.String("render-preview", "", "render one deterministic page at WIDTHxHEIGHT")
 	settingsPath := flag.String("settings", "", "path to inlaid-settings.json")
+	sourceRoot := flag.String("source-root", "", "source checkout data root")
+	explicitRoot := flag.String("data-root", "", "explicit test data root")
+	portableImport := flag.String("import-portable", "", "portable Inlaid folder to import into an installed copy")
 	showVersion := flag.Bool("version", false, "print the Inlaid version")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println("Inlaid " + version)
 		return
 	}
-
-	path := strings.TrimSpace(*settingsPath)
-	loadPath := path
-	if path == "" {
-		path, loadPath = defaultSettingsPaths()
-	} else {
-		loadPath = compatibleSettingsLoadPath(path)
-	}
-	settings, settingsErr := dashboard.LoadSettings(loadPath)
-
 	if strings.TrimSpace(*renderPreview) != "" {
 		width, height, err := parseSize(*renderPreview)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
-		model := dashboard.New(settings)
+		model := dashboard.New(dashboard.DefaultSettings())
 		model.SetSize(width, height)
 		fmt.Println(model.RenderPreview())
 		return
 	}
+
+	workingDirectory, workingDirectoryErr := os.Getwd()
+	if workingDirectoryErr != nil {
+		fmt.Fprintln(os.Stderr, "Inlaid:", workingDirectoryErr)
+		os.Exit(1)
+	}
+	executable, executableErr := os.Executable()
+	if executableErr != nil {
+		fmt.Fprintln(os.Stderr, "Inlaid:", executableErr)
+		os.Exit(1)
+	}
+	layout, layoutErr := applayout.Resolve(applayout.ResolveOptions{
+		Executable: executable, SourceRoot: *sourceRoot, ExplicitRoot: *explicitRoot, WorkingDir: workingDirectory,
+	})
+	if layoutErr != nil {
+		fmt.Fprintln(os.Stderr, "Inlaid:", layoutErr)
+		os.Exit(1)
+	}
+	if portableRoot := strings.TrimSpace(*portableImport); portableRoot != "" {
+		report, err := applayout.ImportPortable(portableRoot, layout)
+		for _, item := range report.Items {
+			fmt.Printf("%s: %s (%s)\n", item.Action, item.Path, item.Detail)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Inlaid:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	path := strings.TrimSpace(*settingsPath)
+	if path == "" {
+		path = layout.SettingsFile
+	}
+	loadPath := compatibleSettingsLoadPath(path)
+	settings, settingsErr := dashboard.LoadSettings(loadPath)
 
 	absoluteSettings, err := filepath.Abs(path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Inlaid:", err)
 		os.Exit(1)
 	}
-	appRuntime := dashboard.NewRuntimeWithBuild(settings, absoluteSettings, filepath.Dir(absoluteSettings), currentBuildFacts())
+	layout.SettingsFile = absoluteSettings
+	appRuntime, runtimeErr := dashboard.NewRuntimeWithLayout(settings, layout, currentBuildFacts())
+	if runtimeErr != nil {
+		fmt.Fprintln(os.Stderr, "Inlaid:", runtimeErr)
+		os.Exit(1)
+	}
 	model := dashboard.NewLive(settings, appRuntime, settingsErr)
 	_, runErr := tea.NewProgram(model, uiProgramOptions()...).Run()
 	closeErr := appRuntime.Close()
@@ -119,57 +142,11 @@ func parseSize(value string) (int, int, error) {
 	return width, height, nil
 }
 
-func defaultSettingsPaths() (savePath, loadPath string) {
-	cwd, _ := os.Getwd()
-	executable, _ := os.Executable()
-	return settingsPathsForRoots(settingsRoots(cwd, executable))
-}
-
-func settingsRoots(cwd, executable string) []string {
-	roots := make([]string, 0, 2)
-	executableDirectory := filepath.Dir(strings.TrimSpace(executable))
-	if strings.EqualFold(filepath.Base(executableDirectory), "bin") {
-		roots = append(roots, filepath.Dir(executableDirectory))
-	}
-	if cwd = strings.TrimSpace(cwd); cwd != "" && (len(roots) == 0 || !pathEqual(runtime.GOOS, roots[0], cwd)) {
-		roots = append(roots, cwd)
-	}
-	if len(roots) == 0 && executableDirectory != "." {
-		roots = append(roots, executableDirectory)
-	}
-	return roots
-}
-
-func settingsPathsForRoots(roots []string) (savePath, loadPath string) {
-	const currentName = "inlaid-settings.json"
-	const legacyName = "webcam-settings.json"
-
-	for _, root := range roots {
-		candidate := filepath.Join(root, currentName)
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-			return candidate, candidate
-		}
-	}
-	// Compatibility read for pre-Inlaid local installs. Runtime saves use the
-	// new filename, so the old file is never copied, overwritten, or removed.
-	for _, root := range roots {
-		candidate := filepath.Join(root, legacyName)
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-			return filepath.Join(root, currentName), candidate
-		}
-	}
-	if len(roots) > 0 {
-		candidate := filepath.Join(roots[0], currentName)
-		return candidate, candidate
-	}
-	return currentName, currentName
-}
-
 func compatibleSettingsLoadPath(savePath string) string {
 	if info, err := os.Stat(savePath); err == nil && !info.IsDir() {
 		return savePath
 	}
-	if !pathEqual(runtime.GOOS, filepath.Base(savePath), "inlaid-settings.json") {
+	if !strings.EqualFold(filepath.Base(savePath), "inlaid-settings.json") {
 		return savePath
 	}
 	legacy := filepath.Join(filepath.Dir(savePath), "webcam-settings.json")
@@ -177,11 +154,4 @@ func compatibleSettingsLoadPath(savePath string) string {
 		return legacy
 	}
 	return savePath
-}
-
-func pathEqual(goos, left, right string) bool {
-	if goos == "windows" {
-		return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
-	}
-	return filepath.Clean(left) == filepath.Clean(right)
 }

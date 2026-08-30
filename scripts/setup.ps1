@@ -90,4 +90,4 @@ finally {
 Write-Host ''
 Write-Host "Ready: $Executable" -ForegroundColor Green
 Write-Host "FFmpeg: $ffmpeg" -ForegroundColor DarkGray
-Write-Host 'Next: double-click START-INLAID.cmd.'
+Write-Host 'Next: from the terminal you want Inlaid to use, run .\START-INLAID.cmd.'

@@ -21,13 +21,15 @@ const (
 )
 
 // FindContext resolves and verifies FFmpeg within a bounded caller lifetime.
-func FindContext(parent context.Context, explicit string) (string, error) {
+// localToolsRoot is the active portable, source, or explicit-test root. An
+// empty value disables colocated .tools discovery for installed layouts.
+func FindContext(parent context.Context, explicit, localToolsRoot string) (string, error) {
 	if parent == nil {
 		parent = context.Background()
 	}
 	ctx, cancel := context.WithTimeout(parent, findTimeout)
 	defer cancel()
-	return find(ctx, explicit, probeExecutable)
+	return find(ctx, explicit, localToolsRoot, probeExecutable)
 }
 
 // BundledPath returns the platform-native FFmpeg location under an Inlaid
@@ -36,7 +38,7 @@ func BundledPath(root string) string {
 	return filepath.Join(root, ".tools", "ffmpeg", "bin", executableName())
 }
 
-func find(ctx context.Context, explicit string, probe func(context.Context, string) error) (string, error) {
+func find(ctx context.Context, explicit, localToolsRoot string, probe func(context.Context, string) error) (string, error) {
 	choices := make([]string, 0, 8)
 	if strings.TrimSpace(explicit) != "" {
 		choices = append(choices, explicit)
@@ -44,8 +46,8 @@ func find(ctx context.Context, explicit string, probe func(context.Context, stri
 	if fromEnv := strings.TrimSpace(os.Getenv("INLAID_FFMPEG")); fromEnv != "" {
 		choices = append(choices, fromEnv)
 	}
-	if executable, err := os.Executable(); err == nil {
-		choices = append(choices, BundledPath(executableRoot(executable)))
+	if localToolsRoot = strings.TrimSpace(localToolsRoot); localToolsRoot != "" {
+		choices = append(choices, BundledPath(localToolsRoot))
 	}
 	if fromPath, err := exec.LookPath("ffmpeg"); err == nil {
 		choices = append(choices, fromPath)
@@ -92,15 +94,6 @@ func find(ctx context.Context, explicit string, probe func(context.Context, stri
 		return "", errors.New("FFmpeg was found but could not run; replace it, install FFmpeg, or set INLAID_FFMPEG")
 	}
 	return "", errors.New("FFmpeg was not found; install FFmpeg or set INLAID_FFMPEG")
-}
-
-func executableRoot(executable string) string {
-	directory := filepath.Dir(filepath.Clean(executable))
-	base := filepath.Base(directory)
-	if base == "bin" || runtime.GOOS == "windows" && strings.EqualFold(base, "bin") {
-		return filepath.Dir(directory)
-	}
-	return directory
 }
 
 func executableName() string {

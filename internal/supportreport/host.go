@@ -18,7 +18,6 @@ type platformFacts struct {
 }
 
 type launchFacts struct {
-	Launcher        string `json:"launcher"`
 	Terminal        string `json:"terminal"`
 	TerminalVersion string `json:"terminal_version"`
 	ShellHint       string `json:"shell_hint"`
@@ -61,13 +60,6 @@ func collectLaunchFacts() launchFacts {
 		}
 	}
 
-	launcher := "direct-or-unknown"
-	if value, ok := os.LookupEnv("INLAID_LAUNCHER"); ok {
-		launcher = recognizedLauncher(value)
-	} else if value, ok := os.LookupEnv("INLAID_TERMINAL_RELAUNCHED"); ok && value == "1" {
-		launcher = "windows-terminal-direct"
-	}
-
 	version := ""
 	if value, ok := os.LookupEnv("TERM_PROGRAM_VERSION"); ok && terminal != "unknown" {
 		version = safeDottedVersion(value, 32)
@@ -78,7 +70,7 @@ func collectLaunchFacts() launchFacts {
 		color = color || value == "truecolor" || value == "24bit"
 	}
 	return launchFacts{
-		Launcher: launcher, Terminal: terminal, TerminalVersion: version,
+		Terminal: terminal, TerminalVersion: version,
 		ShellHint: recognizedShell(), TrueColorHint: color,
 	}
 }
@@ -104,15 +96,6 @@ func recognizedTerminal(value string) string {
 		return "rio"
 	default:
 		return "unknown"
-	}
-}
-
-func recognizedLauncher(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "windows-terminal-direct", "direct", "source", "package":
-		return strings.ToLower(strings.TrimSpace(value))
-	default:
-		return "direct-or-unknown"
 	}
 }
 

@@ -192,7 +192,10 @@ func safeCurrent(value Current, include Include) currentV1 {
 			ExitCode:    boundedInt(value.Recording.FFmpeg.ExitCode, -1<<20, 1<<20),
 		},
 	}
-	return currentV1{Camera: camera, View: view, Recording: recording}
+	return currentV1{
+		DistributionMode: safeChoice(value.DistributionMode, "unknown", "installed", "portable", "source", "explicit-test"),
+		Camera:           camera, View: view, Recording: recording,
+	}
 }
 
 func safeSample(value Sample) Sample {

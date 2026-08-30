@@ -9,6 +9,7 @@ import (
 
 const (
 	SchemaV1          = "inlaid.support-report.v1"
+	SchemaV2          = "inlaid.support-report.v2"
 	MaxReportBytes    = 256 << 10
 	MaxRecentEvents   = 128
 	MaxRecentSamples  = 120
@@ -176,9 +177,10 @@ type RecordingFacts struct {
 }
 
 type Current struct {
-	Camera    CameraFacts
-	View      ViewFacts
-	Recording RecordingFacts
+	DistributionMode string
+	Camera           CameraFacts
+	View             ViewFacts
+	Recording        RecordingFacts
 }
 
 type Review struct {

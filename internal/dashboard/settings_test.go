@@ -94,6 +94,68 @@ func TestSaveSettingsPreservesUnknownFieldsAndReplacesFile(t *testing.T) {
 	}
 }
 
+func TestSaveSettingsPersistsClearedDeviceID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "inlaid-settings.json")
+	initial := []byte(`{"Device":"Old Camera","DeviceID":"old-stable-id","FutureSetting":true}`)
+	if err := os.WriteFile(path, initial, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultSettings()
+	cfg.Device = ""
+	cfg.DeviceID = ""
+	if err := SaveSettings(path, cfg); err != nil {
+		t.Fatalf("SaveSettings() error = %v", err)
+	}
+
+	reloaded, err := LoadSettings(path)
+	if err != nil {
+		t.Fatalf("LoadSettings(saved) error = %v", err)
+	}
+	if reloaded.DeviceID != "" {
+		t.Fatalf("cleared DeviceID reloaded as %q", reloaded.DeviceID)
+	}
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(written, &document); err != nil {
+		t.Fatal(err)
+	}
+	if string(document["DeviceID"]) != `""` {
+		t.Fatalf("DeviceID was not explicitly persisted empty: %s", document["DeviceID"])
+	}
+	if string(document["FutureSetting"]) != "true" {
+		t.Fatalf("unknown field was not preserved: %s", document["FutureSetting"])
+	}
+}
+
+func TestSaveSettingsCreatesMissingParentBeforeAtomicSave(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "first-run", "settings")
+	path := filepath.Join(parent, "inlaid-settings.json")
+	if err := SaveSettings(path, DefaultSettings()); err != nil {
+		t.Fatalf("SaveSettings() error = %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("settings file was not created: %v", err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("settings path is not a regular file: %v", info.Mode())
+	}
+	if _, err := os.Stat(parent); err != nil {
+		t.Fatalf("settings parent was not created: %v", err)
+	}
+	temps, err := filepath.Glob(filepath.Join(parent, ".inlaid-settings.json.*.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(temps) != 0 {
+		t.Fatalf("temporary settings files remain: %v", temps)
+	}
+}
+
 func TestSaveSettingsRefusesToOverwriteMalformedJSON(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "inlaid-settings.json")
 	malformed := []byte(`{"Device":`)

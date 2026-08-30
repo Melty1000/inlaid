@@ -12,19 +12,38 @@ Inlaid shows a live webcam as full-color block cells in a terminal. It can save 
 
 [Compatibility](docs/COMPATIBILITY.md) keeps build claims separate from real hardware evidence. See the [roadmap](docs/ROADMAP.md), [testing guide](docs/TESTING.md), [changelog](CHANGELOG.md), and [security policy](SECURITY.md), or [report a problem or hardware result](https://github.com/Melty1000/inlaid/issues/new/choose).
 
-## Download and run
+## Windows install and updates
 
-You need Windows Terminal. The double-click launcher also needs PowerShell 7.
+The currently published `v0.2.0-beta.1` ZIP is the legacy distribution described by that release's notes. The next Windows distribution is terminal-first and is not published until its MSI, terminal, signing, and release gates are accepted.
 
-1. Download the Windows ZIP from [Releases](https://github.com/Melty1000/inlaid/releases).
-2. Extract the whole ZIP.
-3. Double-click `START-INLAID.cmd`.
+The terminal-first artifact is a per-user x64 MSI. It installs to `%LOCALAPPDATA%\Programs\Inlaid`, registers uninstall, and adds that directory to the current user's `PATH` only when no equivalent user-owned segment exists. It creates no Start-menu or desktop shortcut and needs no administrator rights. After install, repair, upgrade, or uninstall, close every process of the terminal host you are testing, open a fresh host and native Windows shell, then run `inlaid`. A new tab in an old host may still have the inherited pre-install environment.
 
-Use the `.cmd` file for double-clicking; Windows often opens `.ps1` files in an editor. The executable is not signed yet, so Windows SmartScreen may show a warning on first launch. `SHA256SUMS.txt` on the release page contains the ZIP checksum.
+Inlaid uses the terminal and working directory from which it was invoked. It never selects or launches Windows Terminal, another terminal host, or a shell. Explorer double-click and Start-menu activation are not supported entry points. A different `inlaid` earlier on `PATH` remains user-owned; use `where.exe inlaid` and the shell's command lookup to identify and resolve that collision.
 
-Double-clicking `bin\inlaid.exe` also redirects that process into Windows Terminal. To use another truecolor terminal or shell, open it first and run `bin\inlaid.exe` there. The shell is not part of capture, rendering, or recording after the executable starts.
+Run a newer MSI to upgrade or the same MSI to repair. The newer version commits before Windows removes the older one. If an upgrade reports an error during old-version cleanup, first open a fresh terminal and run `inlaid --version`: the newer version may already be installed while an older Apps entry remains. Rerun the same newer MSI if the newer copy needs repair. Do not run the older MSI over the newer installation or force-delete the older entry; retain both installers and the upgrade log, then follow the affected release's version-specific cleanup guidance. Do not assume the original upgrade error rolled the newer version back. Uninstall removes program files, Windows Installer registration, every known installer-private PATH-provenance value, and only the exact PATH segment that provenance proves the MSI added. Empty `Installer` or `Components` registry keys may remain because deleting a key after checking that it is empty would race with foreign content. Settings, recovery tapes, recordings, snapshots, filters, support reports, foreign registry content, and ambiguous or pre-existing PATH text are retained.
 
-MP4 and GIF files need FFmpeg. It is not bundled with Inlaid. If no working FFmpeg is found, the launcher makes one attempt to download a pinned, checksum-verified copy into `.tools\ffmpeg`. A failed download does not block the live view or PNG snapshots; run the launcher again while online to retry. You can also run:
+WinGet is the intended discovery and update channel once its separately authorized public manifest is available. It will download that same immutable release MSI rather than a second installer build. Inlaid has no in-app updater.
+
+The portable ZIP is for removable, isolated, and package-manager-free use:
+
+1. Download and verify the ZIP checksum from its release.
+2. Extract the whole archive.
+3. Open a terminal in the extracted directory and run `.\inlaid.exe`.
+
+Portable updates are manual and manifest-scoped. Keep the existing portable folder, close Inlaid, download and verify the newer ZIP, then extract that ZIP into a separate temporary directory and run the new package's root-level update helper:
+
+```powershell
+$package = 'C:\Downloads\inlaid-vNEXT-windows-amd64.zip'
+$staging = Join-Path ([System.IO.Path]::GetTempPath()) ('inlaid-update-' + [Guid]::NewGuid().ToString('N'))
+Expand-Archive -LiteralPath $package -DestinationPath $staging
+& powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $staging 'inlaid-vNEXT-windows-amd64\update-portable.ps1') -Package $package -PortableRoot 'D:\Portable Apps\Inlaid'
+```
+
+The helper is included at the portable ZIP root and is compatible with the Windows PowerShell 5.1 already present on supported Windows systems. The command applies `ExecutionPolicy Bypass` only to that verified package-helper process; it does not change the user's or machine's policy. Running the new copy keeps the updater forward-compatible even when the old portable folder lacks a newer helper. It stages only release-owned files, uses the prior portable manifest to prove any obsolete file it removes, and keeps a rollback snapshot until the new manifest commits last. Re-running it validates and recovers an interrupted update before retrying. It never replaces the whole portable root. It preserves the portable marker's authority and presence by atomically advancing `inlaid-portable.json` to the exact new versioned manifest; settings, recovery, recordings, snapshots, custom filters, support reports, and optional `.tools` remain byte-identical. The ZIP does not contain the source-only `START-INLAID.cmd`, `START-INLAID.ps1`, or `scripts\install-ffmpeg.ps1`.
+
+WSL is a separate opt-in Windows-executable interoperability route. When WSL interoperability and Windows PATH import are already enabled, invoke `inlaid.exe`; bare `inlaid` searches for a Linux program and is not Windows installed-command evidence.
+
+MP4 and GIF files need FFmpeg. It is not bundled with Inlaid. Installed and portable builds discover FFmpeg through `INLAID_FFMPEG`, the portable `.tools\ffmpeg\bin\ffmpeg.exe` location, or `PATH`; they never download it. For a portable copy, install a trusted FFmpeg yourself and either set `INLAID_FFMPEG`, put it on `PATH`, or place `ffmpeg.exe` at `.tools\ffmpeg\bin\ffmpeg.exe` below the portable root. The source checkout includes the pinned helper:
 
 ```powershell
 pwsh -File .\scripts\install-ffmpeg.ps1
@@ -67,7 +86,7 @@ These are separate:
 - **Terminal grid** is the detail you can actually see, measured in character cells. `177×50` means 177 columns by 50 rows. The dashboard needs at least 80×24. In Windows Terminal, `Ctrl+-` makes the text smaller and creates more cells; `Ctrl++` makes it larger and creates fewer.
 - **Saved size** is the 720p or 1080p canvas chosen under **Size**. The current terminal cells are enlarged to fit that canvas. A 1080p file does not add detail that was not visible in the terminal grid.
 
-The live view aims for 30 FPS. There is no artificial 24 FPS cap or minimum. The result depends on the camera mode, terminal grid, Windows Terminal, and the machine. A camera reporting 29.97 FPS is normal. If a saved file uses a higher FPS than the number of unique displayed states, states are repeated so the timing stays correct.
+The live view aims for 30 FPS. There is no artificial 24 FPS cap or minimum. The result depends on the camera mode, terminal grid, terminal host, and the machine. A camera reporting 29.97 FPS is normal. If a saved file uses a higher FPS than the number of unique displayed states, states are repeated so the timing stays correct.
 
 ## Camera support
 
@@ -79,17 +98,20 @@ Current source builds have separate experimental V4L2 and AVFoundation backends.
 
 ## Color Looks
 
-None, Warm, Cool, and Mono are built in. For a custom look, put a trusted Adobe/IRIDAS or DaVinci Resolve `.cube` file directly in `filters\`, then restart the app.
+None, Warm, Cool, and Mono are built in. For a custom look, put a trusted Adobe/IRIDAS or DaVinci Resolve `.cube` file directly in the active filters directory, then restart the app. Installed Windows builds use `Inlaid\Filters` below the Windows Documents known folder; `%USERPROFILE%\Documents\Inlaid\Filters` is the ordinary default, but Windows may redirect that known folder. Portable and source runs use `filters\` below their own root.
 
 Looks are applied to the finished cell colors. The terminal, snapshot, and recording therefore use the same colors, but a look cannot add image detail. See [docs/FILTERS.md](docs/FILTERS.md) for the supported `.cube` syntax and limits.
 
-## Saved files and recovery
+## Saved files, recovery, and portable import
 
-- PNG snapshots: `snapshots\`
-- MP4 and GIF recordings: `recordings\`
-- Settings: `inlaid-settings.json`
-- Recording recovery data: `recordings\.recovery\`
-- Optional support reports: `support-reports\`
+Documents, Videos, and Pictures below are Windows known folders. The `%USERPROFILE%` paths shown are ordinary defaults; Windows folder redirection can place them elsewhere.
+
+| Data | Installed Windows location | Portable/source location |
+|---|---|---|
+| Settings and recovery | `%LOCALAPPDATA%\Inlaid\inlaid-settings.json`; `%LOCALAPPDATA%\Inlaid\Recovery` | beside the executable/root |
+| Recordings | Windows Videos known folder under `Inlaid` (ordinary default `%USERPROFILE%\Videos\Inlaid`) | `recordings\` |
+| Snapshots | Windows Pictures known folder under `Inlaid` (ordinary default `%USERPROFILE%\Pictures\Inlaid`) | `snapshots\` |
+| Filters and support reports | Windows Documents known folder under `Inlaid\Filters` and `Inlaid\Support Reports` (ordinary defaults `%USERPROFILE%\Documents\Inlaid\Filters` and `%USERPROFILE%\Documents\Inlaid\Support Reports`) | `filters\`; `support-reports\` |
 
 Recording has no preset time limit. While it runs, Inlaid writes the displayed cell states to a recoverable CellTape on disk. MP4 or GIF conversion begins after you press Stop, so a long recording can take time to finish. Disk use continues until you stop recording or the drive reports an error.
 
@@ -97,13 +119,21 @@ If the app closes or conversion fails, it keeps the CellTape and tries the expor
 
 Saved media uses the same crop, mirror, detail, terminal grid, and Color Look as the live view. PNG keeps the cell raster directly. MP4 uses lossy H.264, and GIF is limited to a color palette. No audio is recorded.
 
-The packaged Windows app keeps settings, recovery data, saved files, and support reports in its extracted folder. The app has no telemetry or upload feature. A support report is written only after two deliberate button presses, and it excludes camera media and machine-specific identifiers. Review it before manually attaching it to a public issue. Network access is used only to fetch FFmpeg when needed and, in a source checkout, Go modules.
+To import settings and custom filters from a portable folder into an installed copy, choose that folder explicitly:
 
-If this folder already contains `webcam-settings.json` from a pre-Inlaid build, Inlaid uses it as the starting settings and saves later changes to `inlaid-settings.json`. The old file is not copied, overwritten, or deleted.
+```powershell
+inlaid --import-portable 'D:\Portable Apps\Inlaid'
+```
+
+Import accepts current portable installs that carry their direct regular `inlaid-portable.json` marker. The only markerless exception is the exactly pinned release-owned file and directory shape of the published `v0.2.0-beta.1` ZIP; arbitrary, ambiguous, source-tree, and current-layout markerless folders are refused before anything is copied. Accepted imports prefer `inlaid-settings.json`; when it is absent, a direct regular legacy `webcam-settings.json` is copied to the installed `inlaid-settings.json` name. The source file remains unchanged. Imports otherwise copy without deleting or overwriting, report copied, skipped, and conflicting items, leave recordings/snapshots/reports where they are, and refuse a folder containing live recovery tapes. Finish or abandon recovery in the portable copy first.
+
+The app has no telemetry or upload feature. A support report is written only after two deliberate button presses, and it excludes camera media and machine-specific identifiers. Review it before manually attaching it to a public issue.
+
+When Inlaid runs directly from a folder containing only `webcam-settings.json` from a pre-Inlaid build, it uses that file as the starting settings and saves later changes to `inlaid-settings.json`. The old file is not overwritten or deleted.
 
 ## Build from source
 
-For the published Windows path, install Windows Terminal, PowerShell 7, and Go 1.26 or newer, then run:
+For a Windows source checkout, install PowerShell 7 and Go 1.26 or newer, open the truecolor terminal you want Inlaid to use, then run:
 
 ```powershell
 git clone https://github.com/Melty1000/inlaid.git
@@ -112,7 +142,7 @@ Set-Location .\inlaid
 .\START-INLAID.cmd
 ```
 
-`setup.ps1` downloads the Go modules, checks or installs FFmpeg, runs the tests and `go vet`, and builds `bin\inlaid.exe`. It uses Go from `PATH` or `.tools\go\bin\go.exe`; it does not download Go.
+`START-INLAID.cmd` invokes the PowerShell source launcher in that same terminal. It passes the checkout as the explicit source data root and never opens or hands off to another terminal. `setup.ps1` downloads the Go modules, checks or installs FFmpeg, runs the tests and `go vet`, and builds `bin\inlaid.exe`. It uses Go from `PATH` or `.tools\go\bin\go.exe`; it does not download Go.
 
 Linux source builds additionally need a C toolchain, `pkg-config`, and libturbojpeg 2.0 or newer development files. macOS source builds need Apple Clang and the macOS SDK. Both are experimental and currently use normal Go build commands rather than a finished installer or launcher. See [Compatibility](docs/COMPATIBILITY.md) before treating either one as supported.
 

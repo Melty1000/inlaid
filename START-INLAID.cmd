@@ -1,8 +1,8 @@
 @echo off
 setlocal
 
-rem This is the file to double-click. PowerShell performs the Windows Terminal
-rem launch with structured arguments so spaces in the project path stay intact.
+rem Source-development convenience only. PowerShell runs in this terminal and
+rem receives the checkout path through START-INLAID.ps1.
 set "ROOT=%~dp0"
 set "SCRIPT=%ROOT%START-INLAID.ps1"
 
@@ -20,9 +20,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-start "" /b pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" %*
+pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" %*
 if errorlevel 1 (
-    echo PowerShell 7 could not be started.
+    echo The Inlaid source launcher failed.
     pause
     exit /b 1
 )

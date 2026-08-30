@@ -78,9 +78,10 @@ type recordingV1 struct {
 }
 
 type currentV1 struct {
-	Camera    cameraV1
-	View      viewV1
-	Recording recordingV1
+	DistributionMode string `json:"distribution_mode"`
+	Camera           cameraV1
+	View             viewV1
+	Recording        recordingV1
 }
 
 type eventV1 struct {
@@ -113,18 +114,19 @@ type privacyV1 struct {
 	UploadsData         bool `json:"uploads_data"`
 }
 
-type reportV1 struct {
-	Schema        string        `json:"schema"`
-	CreatedUTC    string        `json:"created_utc"`
-	App           buildV1       `json:"app"`
-	Platform      platformFacts `json:"platform"`
-	Launch        launchFacts   `json:"launch"`
-	Camera        cameraV1      `json:"camera"`
-	View          viewV1        `json:"view"`
-	Recording     recordingV1   `json:"last_recording"`
-	RecentEvents  []eventV1     `json:"recent_events"`
-	RecentSamples []sampleV1    `json:"recent_samples"`
-	Privacy       privacyV1     `json:"privacy"`
+type reportV2 struct {
+	Schema           string        `json:"schema"`
+	CreatedUTC       string        `json:"created_utc"`
+	App              buildV1       `json:"app"`
+	Platform         platformFacts `json:"platform"`
+	Launch           launchFacts   `json:"launch"`
+	DistributionMode string        `json:"distribution_mode"`
+	Camera           cameraV1      `json:"camera"`
+	View             viewV1        `json:"view"`
+	Recording        recordingV1   `json:"last_recording"`
+	RecentEvents     []eventV1     `json:"recent_events"`
+	RecentSamples    []sampleV1    `json:"recent_samples"`
+	Privacy          privacyV1     `json:"privacy"`
 }
 
 func New(build BuildFacts) *Collector {
@@ -213,9 +215,9 @@ func (c *Collector) Prepare(current Current, include Include) (Prepared, Review,
 	c.mu.RUnlock()
 
 	safe := safeCurrent(current, include)
-	report := reportV1{
-		Schema: SchemaV1, CreatedUTC: now.Format(time.RFC3339), App: build,
-		Platform: host.Platform, Launch: host.Launch,
+	report := reportV2{
+		Schema: SchemaV2, CreatedUTC: now.Format(time.RFC3339), App: build,
+		Platform: host.Platform, Launch: host.Launch, DistributionMode: safe.DistributionMode,
 		Camera: safe.Camera, View: safe.View, Recording: safe.Recording,
 		RecentEvents: make([]eventV1, 0, len(events)), RecentSamples: make([]sampleV1, 0, len(samples)),
 		Privacy: privacyV1{},
@@ -252,7 +254,7 @@ func (c *Collector) Prepare(current Current, include Include) (Prepared, Review,
 	digestText := hex.EncodeToString(digest[:])
 	prepared := Prepared{data: append([]byte(nil), data...), createdAt: now, digest: digest}
 	review := Review{
-		Schema: SchemaV1, Bytes: len(data), SHA256: digestText,
+		Schema: SchemaV2, Bytes: len(data), SHA256: digestText,
 		CameraModelIncluded: safe.Camera.ModelIncluded,
 		Includes:            []string{"app build", "operating system", "terminal and shell hints", "camera mode", "view settings", "performance counters", "recent typed events"},
 		Excludes:            []string{"camera media", "filesystem paths", "camera IDs and serials", "environment dump", "raw errors", "uploads"},
@@ -276,7 +278,6 @@ func sanitizeHost(host hostFacts) hostFacts {
 	host.Platform.Kernel = safeToken(host.Platform.Kernel, 64)
 	host.Platform.GoVersion = safeToken(host.Platform.GoVersion, 32)
 	host.Platform.LogicalCPUs = boundedInt(host.Platform.LogicalCPUs, 1, 4096)
-	host.Launch.Launcher = safeChoice(host.Launch.Launcher, "direct-or-unknown", "direct-or-unknown", "windows-terminal-direct", "direct", "source", "package")
 	host.Launch.Terminal = safeChoice(host.Launch.Terminal, "unknown", "unknown", "windows-terminal", "wezterm", "kitty", "alacritty", "vscode", "apple-terminal", "iterm2", "hyper", "rio")
 	host.Launch.TerminalVersion = safeToken(host.Launch.TerminalVersion, 32)
 	host.Launch.ShellHint = safeChoice(host.Launch.ShellHint, "unknown", "unknown", "sh", "bash", "zsh", "fish", "pwsh", "powershell", "cmd", "nu", "xonsh", "tcsh")
